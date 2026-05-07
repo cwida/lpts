@@ -331,8 +331,8 @@ class TopNNode : public CteNode {
 
 public:
 	~TopNNode() override = default;
-	TopNNode(const size_t index, vector<string> cte_column_names, string _child_cte_name,
-	         vector<string> _order_items, idx_t _limit, idx_t _offset)
+	TopNNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _order_items,
+	         idx_t _limit, idx_t _offset)
 	    : CteNode(index, "topn_" + std::to_string(index), std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)), limit(_limit),
 	      offset(_offset) {
