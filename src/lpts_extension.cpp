@@ -40,15 +40,18 @@ static SqlDialect ReadDialect(ClientContext &context) {
 /// that LPTS cannot yet convert back to SQL:
 ///   - COLUMN_LIFETIME: changes column bindings in ways that break CTE references
 ///   - STATISTICS_PROPAGATION: triggers DUMMY_SCAN for constant-foldable queries
-///   - REORDER_FILTER: introduces optional filter prefixes in scan filters
-///   - TOP_N: fuses ORDER+LIMIT into a single node LPTS can't serialize
-///   - JOIN_FILTER_PUSHDOWN: wraps pushed-down filters in OptionalFilter ("optional:" prefix)
-///   - CTE_INLINING: introduces CTE_SCAN nodes
-///   - MATERIALIZED_CTE: introduces CTE_SCAN nodes
-///   - COMMON_SUBPLAN: introduces CTE_SCAN nodes
+///   - CTE_INLINING: introduces LogicalCTEScan nodes
+///   - MATERIALIZED_CTE: introduces LogicalCTEScan nodes
+///   - COMMON_SUBPLAN: introduces LogicalCTEScan nodes
 ///
-/// TODO: research whether these can be re-enabled by adding support for the
-/// plan structures they produce (EMPTY_RESULT node, optional filters, CTE_SCAN, etc.)
+/// REORDER_FILTER and JOIN_FILTER_PUSHDOWN are safe: REORDER_FILTER only reorders
+/// expressions inside LogicalFilter nodes (order doesn't affect SQL correctness),
+/// and JOIN_FILTER_PUSHDOWN only attaches runtime JoinFilterPushdownInfo metadata
+/// to join nodes and DynamicTableFilterSet to scans — neither is read by LPTS.
+///
+/// TODO: research whether the remaining disabled optimizers can be re-enabled by
+/// adding support for the plan structures they produce (DUMMY_SCAN, LogicalTopN,
+/// LogicalCTEScan).
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
 	Parser parser;
 	parser.ParseQuery(query);
@@ -63,9 +66,6 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	auto saved = config.options.disabled_optimizers;
 	config.options.disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
 	config.options.disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
-	config.options.disabled_optimizers.insert(OptimizerType::REORDER_FILTER);
-	config.options.disabled_optimizers.insert(OptimizerType::TOP_N);
-	config.options.disabled_optimizers.insert(OptimizerType::JOIN_FILTER_PUSHDOWN);
 	config.options.disabled_optimizers.insert(OptimizerType::CTE_INLINING);
 	config.options.disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
 	config.options.disabled_optimizers.insert(OptimizerType::COMMON_SUBPLAN);

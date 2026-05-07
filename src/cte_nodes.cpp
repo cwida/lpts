@@ -320,6 +320,21 @@ string LimitNode::ToQuery() {
 	return limit_str_stream.str();
 }
 
+string TopNNode::ToQuery() {
+	std::ostringstream ss;
+	ss << "SELECT * FROM " << child_cte_name;
+	if (!order_items.empty()) {
+		ss << " ORDER BY " << VecToSeparatedList(order_items);
+	}
+	if (limit > 0) {
+		ss << " LIMIT " << limit;
+	}
+	if (offset > 0) {
+		ss << " OFFSET " << offset;
+	}
+	return ss.str();
+}
+
 string DistinctNode::ToQuery() {
 	std::ostringstream distinct_str;
 	distinct_str << "SELECT DISTINCT * FROM " << child_cte_name;

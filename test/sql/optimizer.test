@@ -91,6 +91,98 @@ statement ok
 SET disabled_optimizers = '';
 
 # ============================================================
+# REORDER_FILTER enabled
+# ExpressionHeuristics reorders filter expressions by cost.
+# LPTS serializes all conditions regardless of order, so
+# correctness must be unaffected.
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 10 AND label = ''x'' AND id < 5');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT label, sum(val) FROM t WHERE val > 10 AND label <> ''z'' GROUP BY label HAVING sum(val) > 20');
+----
+true
+
+statement ok
+SET disabled_optimizers = 'REORDER_FILTER';
+
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 10 AND label = ''x'' AND id < 5');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT label, sum(val) FROM t WHERE val > 10 AND label <> ''z'' GROUP BY label HAVING sum(val) > 20');
+----
+true
+
+statement ok
+SET disabled_optimizers = '';
+
+# ============================================================
+# JOIN_FILTER_PUSHDOWN enabled
+# Attaches runtime JoinFilterPushdownInfo to join nodes and
+# DynamicTableFilterSet to scan nodes. LPTS does not read
+# either field, so the logical plan conversion is unaffected.
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.label, sum(t.val), max(t2.score) FROM t JOIN t2 ON t.id = t2.id GROUP BY t.label');
+----
+true
+
+statement ok
+SET disabled_optimizers = 'JOIN_FILTER_PUSHDOWN';
+
+query I
+PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300');
+----
+true
+
+statement ok
+SET disabled_optimizers = '';
+
+# ============================================================
+# TOP_N enabled (default)
+# ORDER BY + constant LIMIT fused into LogicalTopN by DuckDB.
+# LPTS serializes it as ORDER BY ... LIMIT in the CTE body.
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT id, val FROM t ORDER BY val DESC LIMIT 3');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT id, val FROM t ORDER BY val LIMIT 2 OFFSET 1');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT label, sum(val) AS s FROM t GROUP BY label ORDER BY s DESC LIMIT 2');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score LIMIT 2');
+----
+true
+
+# ============================================================
 # Optimizer re-enabled: same queries must still pass
 # ============================================================
 

@@ -287,6 +287,28 @@ public:
 	}
 };
 
+/// TOP_N node — ORDER BY + constant LIMIT/OFFSET fused by the TOP_N optimizer.
+class AstTopNNode : public AstNode {
+public:
+	vector<string> order_items;      ///< e.g. "t1_age DESC", "t0_name ASC"
+	idx_t limit;                     ///< always constant (TopN only fires for constant limits)
+	idx_t offset;                    ///< 0 if no offset
+	vector<string> cte_column_names; ///< passthrough from child.
+
+	AstTopNNode(vector<string> order_items, idx_t limit, idx_t offset, vector<string> cte_column_names)
+	    : order_items(std::move(order_items)), limit(limit), offset(offset),
+	      cte_column_names(std::move(cte_column_names)) {
+	}
+
+	string ToString(int indent = 0) const override;
+	string NodeType() const override {
+		return "TopN";
+	}
+	vector<string> OutputColumnNames() const override {
+		return cte_column_names;
+	}
+};
+
 /// SELECT DISTINCT node.
 class AstDistinctNode : public AstNode {
 public:

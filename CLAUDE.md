@@ -14,6 +14,12 @@ When you're stuck — either unable to fix a bug after 2-3 attempts, or tempted 
 
 Always test your changes with real queries (e.g., create a table, run `PRAGMA lpts(...)`, check the SQL output, then run `PRAGMA lpts_exec(...)` to verify results) before declaring success, not just unit tests.
 
+**Only run the SQLStorm benchmark when a feature is fully done or before pushing.** Do not run it during iterative development — it takes several minutes even at the smallest scale factor. Run it like this:
+```bash
+build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10
+```
+The benchmark runs all 17036 SQLStorm TPC-H queries through `lpts_check` and prints a summary (success %, not-implemented breakdown, etc.). A regression — fewer `SUCCESS` results than the previous baseline — must be investigated before pushing.
+
 Never execute git commands that could lose code. Always ask the user for permission on those.
 
 ## Development rules

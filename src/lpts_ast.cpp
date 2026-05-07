@@ -315,6 +315,26 @@ string AstLimitNode::ToString(int indent) const {
 // AstDistinctNode
 //------------------------------------------------------------------------------
 
+string AstTopNNode::ToString(int indent) const {
+	string result = Indent(indent) + "TopN";
+	result += " (" + std::to_string(order_items.size()) + " order items, LIMIT=" + std::to_string(limit);
+	if (offset > 0) {
+		result += " OFFSET=" + std::to_string(offset);
+	}
+	result += ")";
+	for (auto &item : order_items) {
+		result += "\n" + Indent(indent + 2) + "by: " + item;
+	}
+	for (auto &child : children) {
+		result += "\n" + child->ToString(indent + 2);
+	}
+	return result;
+}
+
+//------------------------------------------------------------------------------
+// AstDistinctNode
+//------------------------------------------------------------------------------
+
 string AstDistinctNode::ToString(int indent) const {
 	string result = Indent(indent) + "Distinct";
 	result += " (columns=" + std::to_string(cte_column_names.size()) + ")";
