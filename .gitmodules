@@ -15,3 +15,6 @@
 [submodule "benchmark/sqlstorm/SQLStorm"]
 	path = benchmark/sqlstorm/SQLStorm
 	url = https://github.com/SQL-Storm/SQLStorm.git
+[submodule "third_party/duckdb-delta"]
+	path = third_party/duckdb-delta
+	url = https://github.com/duckdb/duckdb-delta.git
