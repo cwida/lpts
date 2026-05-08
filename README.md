@@ -8,6 +8,9 @@ The conversion pipeline is: **Logical Plan → CTE List → SQL String**. There 
 
 ## Building
 
+LPTS builds the DuckDB Delta extension for Delta Lake coverage. Make sure Rust/Cargo is installed and available on
+`PATH` before building. Delta Kernel `0.21.0` requires Rust `1.88` or newer.
+
 ```sh
 GEN=ninja make
 ```

@@ -122,10 +122,11 @@ string GetNode::ToQuery() {
 		// Unqualified: table function or simple table name
 		get_str << table_name;
 		// For table functions, add column aliases so renamed columns resolve correctly.
-		// Skip for DuckLake functions — the _tf alias mismatches when virtual columns
-		// (snapshot_id, rowid) are in the SELECT but not in the function's output schema.
+		// Skip for table functions that already expose stable output names or whose
+		// hidden/virtual columns make a positional alias list invalid.
 		if (table_name.find('(') != string::npos && table_name != "(SELECT 1)" && !column_names.empty() &&
-		    table_name.find("ducklake_table_") == string::npos) {
+		    table_name.find(" AT (") == string::npos && table_name.find("ducklake_table_") == string::npos &&
+		    table_name.find("delta_scan(") == string::npos) {
 			idx_t alias_count = table_function_output_count == DConstants::INVALID_INDEX ? column_names.size()
 			                                                                             : table_function_output_count;
 			vector<string> table_function_columns;

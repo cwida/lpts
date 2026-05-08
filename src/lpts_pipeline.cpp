@@ -1,4 +1,5 @@
 #include "storage/ducklake_scan.hpp"
+#include "functions/delta_scan/delta_scan.hpp"
 
 //==============================================================================
 // lpts_pipeline.cpp
@@ -146,6 +147,10 @@ private:
 	/// Populated lazily on first DuckLake scan per catalog.
 	unordered_map<string, idx_t> ducklake_current_snapshots;
 
+	/// Cache: Delta table root path → current snapshot version.
+	/// Used to distinguish explicit AT VERSION scans from ordinary current-version scans.
+	unordered_map<string, idx_t> delta_current_versions;
+
 	/// Query the current snapshot_id for a DuckLake catalog.
 	idx_t GetDuckLakeCurrentSnapshot(const string &catalog_name) {
 		auto it = ducklake_current_snapshots.find(catalog_name);
@@ -161,6 +166,17 @@ private:
 		}
 		ducklake_current_snapshots[catalog_name] = snap_id;
 		return snap_id;
+	}
+
+	idx_t GetDeltaCurrentVersion(const string &delta_path) {
+		auto it = delta_current_versions.find(delta_path);
+		if (it != delta_current_versions.end()) {
+			return it->second;
+		}
+		auto current_snapshot = make_uniq<DeltaMultiFileList>(context, delta_path, DConstants::INVALID_INDEX);
+		idx_t version = current_snapshot->GetVersion();
+		delta_current_versions[delta_path] = version;
+		return version;
 	}
 
 	/// Global map: ColumnBinding → ColStruct.
@@ -1026,6 +1042,10 @@ private:
 			bool is_ducklake_change_scan = false;
 			bool is_ducklake_time_travel = false;
 			idx_t ducklake_snapshot_id = 0;
+			bool is_delta_catalog_scan = false;
+			bool is_delta_time_travel = false;
+			idx_t delta_snapshot_version = 0;
+			string delta_catalog_table_name;
 			if (get.function.name == "ducklake_scan" && get.function.function_info) {
 				auto &func_info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
 				// AT VERSION: only emit for explicit time-travel scans, NOT for
@@ -1069,9 +1089,33 @@ private:
 					LPTS_DEBUG_PRINT("[LPTS-AST] GET: DuckLake change scan -> " + table_name);
 				}
 			}
+			if (get.function.name == "delta_scan" && get.function.function_info) {
+				auto &func_info = get.function.function_info->Cast<DeltaFunctionInfo>();
+				if (func_info.snapshot && !func_info.table_name.empty()) {
+					// Delta catalog scans bind through the delta_scan table function, but
+					// re-emitting the default table name is brittle. The attached catalog
+					// name is the stable SQL surface: SELECT * FROM delta_catalog.
+					is_delta_catalog_scan = true;
+					delta_catalog_table_name = func_info.table_name;
+					const string delta_path = func_info.snapshot->GetPath();
+					const idx_t scan_version = func_info.snapshot->GetVersion();
+					const idx_t current_version = GetDeltaCurrentVersion(delta_path);
+					if (scan_version != current_version) {
+						is_delta_time_travel = true;
+						delta_snapshot_version = scan_version;
+					}
+					LPTS_DEBUG_PRINT("[LPTS-AST] GET: Delta catalog scan -> " + delta_catalog_table_name + " version=" +
+					                 std::to_string(scan_version) + " current=" + std::to_string(current_version));
+				}
+			}
 
 			if (!is_ducklake_change_scan) {
-				if (catalog_entry) {
+				if (is_delta_catalog_scan) {
+					table_name = KeywordHelper::WriteOptionallyQuoted(delta_catalog_table_name);
+					if (is_delta_time_travel) {
+						table_name += " AT (VERSION => " + std::to_string(delta_snapshot_version) + ")";
+					}
+				} else if (catalog_entry) {
 					catalog_name = catalog_entry->schema.ParentCatalog().GetName();
 					schema_name = catalog_entry->schema.name;
 					table_name = catalog_entry.get()->name;

@@ -1,0 +1,1 @@
+{"add":{"path":"part-00001.parquet","partitionValues":{},"size":305,"modificationTime":1778226614000,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"id\":3,\"name\":\"carol\"},\"maxValues\":{\"id\":3,\"name\":\"carol\"},\"nullCount\":{\"id\":0,\"name\":0}}"}}
