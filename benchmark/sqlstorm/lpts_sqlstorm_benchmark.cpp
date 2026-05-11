@@ -427,7 +427,7 @@ static void LoadExtension(Connection &con, const string &name) {
 }
 
 static void ConfigureConnection(Connection &con) {
-	con.Query("PRAGMA threads=16");
+	con.Query("PRAGMA threads=1");
 	con.Query("PRAGMA memory_limit='16GB'");
 	con.Query("SET temp_directory='/tmp/duckdb_temp'");
 	LoadExtension(con, "tpch");
