@@ -322,6 +322,24 @@ public:
 	string ToQuery() override;
 };
 
+/// TOP_N node — ORDER BY + LIMIT/OFFSET fused into one CTE by the TOP_N optimizer.
+class TopNNode : public CteNode {
+	string child_cte_name;
+	vector<string> order_items;
+	idx_t limit;
+	idx_t offset;
+
+public:
+	~TopNNode() override = default;
+	TopNNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _order_items,
+	         idx_t _limit, idx_t _offset)
+	    : CteNode(index, "topn_" + std::to_string(index), std::move(cte_column_names)),
+	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)), limit(_limit),
+	      offset(_offset) {
+	}
+	string ToQuery() override;
+};
+
 /// DISTINCT node — wraps the child CTE with SELECT DISTINCT.
 class DistinctNode : public CteNode {
 	string child_cte_name;

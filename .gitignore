@@ -10,3 +10,4 @@ test.db.wal
 test.db
 tpch-umbra-flat-cte-list.txt
 .cache/
+benchmark/sqlstorm/lpts_sqlstorm_tpch_sf*.csv

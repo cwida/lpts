@@ -10,9 +10,20 @@ git pull                                      # pull latest commits
 git submodule update --init --recursive       # update submodules to pinned commits
 ```
 
+The `--recursive` flag also initializes `.claude/skills/shared` (the shared Claude Code skills submodule from `github.com/ila/duckdb-claude-skills`). If that submodule fails to initialize on its own, run:
+```bash
+git submodule update --init .claude/skills/shared
+```
+
 When you're stuck — either unable to fix a bug after 2-3 attempts, or tempted to work around the actual problem by redefining the objective — **stop and ask the user for directions**. Explain clearly what the specific problem is (e.g., "AstToCteList produces wrong column names for a 3-way join — should I fix the AstJoinNode output ordering or adjust the CTE binding map?"). The user knows this codebase deeply and can often point you to the right solution in one sentence. Do not silently change the goal, declare something impossible, or add bloated workarounds without consulting first. We work as a team.
 
 Always test your changes with real queries (e.g., create a table, run `PRAGMA lpts(...)`, check the SQL output, then run `PRAGMA lpts_exec(...)` to verify results) before declaring success, not just unit tests.
+
+**Only run the SQLStorm benchmark when a feature is fully done or before pushing.** Do not run it during iterative development — it takes several minutes even at the smallest scale factor. Run it like this:
+```bash
+build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10
+```
+The benchmark runs all 17036 SQLStorm TPC-H queries through `lpts_check` and prints a summary (success %, not-implemented breakdown, etc.). A regression — fewer `SUCCESS` results than the previous baseline — must be investigated before pushing.
 
 Never execute git commands that could lose code. Always ask the user for permission on those.
 

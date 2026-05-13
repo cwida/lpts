@@ -53,6 +53,7 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
@@ -1182,12 +1183,19 @@ private:
 			// FILTER_PUSHDOWN wraps pushed-down conditions in OptionalFilter, whose
 			// ToString() prepends "optional: ". Strip that prefix so the condition
 			// is valid SQL when embedded in a WHERE clause.
+			// JOIN_FILTER_PUSHDOWN attaches runtime-only dynamic filters whose
+			// ToString() starts with "Dynamic Filter" — skip those entirely since
+			// they are not valid SQL expressions.
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
 					string filter_str = entry.second->ToString(get.names[entry.first]);
 					static const string kOptionalPrefix = "optional: ";
 					if (filter_str.substr(0, kOptionalPrefix.size()) == kOptionalPrefix) {
 						filter_str = filter_str.substr(kOptionalPrefix.size());
+					}
+					static const string kDynamicFilterPrefix = "Dynamic Filter";
+					if (filter_str.substr(0, kDynamicFilterPrefix.size()) == kDynamicFilterPrefix) {
+						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
 				}
@@ -1729,6 +1737,32 @@ private:
 			}
 			return make_uniq<AstLimitNode>(std::move(limit_str), std::move(offset_str), limit_needs_child_scalar,
 			                               offset_needs_child_scalar, std::move(cte_column_names));
+		}
+
+		//----------------------------------------------------------------------
+		case LogicalOperatorType::LOGICAL_TOP_N: {
+			const LogicalTopN &topn_op = op->Cast<LogicalTopN>();
+			vector<string> order_items;
+			for (const BoundOrderByNode &order : topn_op.orders) {
+				string col_str = ExpressionToAliasedString(order.expression);
+				switch (order.type) {
+				case OrderType::DESCENDING:
+					col_str += " DESC";
+					break;
+				case OrderType::ASCENDING:
+					col_str += " ASC";
+					break;
+				default:
+					break;
+				}
+				order_items.push_back(std::move(col_str));
+			}
+			vector<string> cte_column_names;
+			for (const ColumnBinding &cb : op->GetColumnBindings()) {
+				cte_column_names.push_back(FindColumnBinding(cb, "top_n output")->ToUniqueColumnName());
+			}
+			return make_uniq<AstTopNNode>(std::move(order_items), topn_op.limit, topn_op.offset,
+			                              std::move(cte_column_names));
 		}
 
 		//----------------------------------------------------------------------
@@ -2415,6 +2449,12 @@ private:
 			const AstLimitNode &l = static_cast<const AstLimitNode &>(ast_node);
 			return make_uniq<LimitNode>(my_index, l.cte_column_names, children_names[0], l.limit_str, l.offset_str,
 			                            l.limit_needs_child_scalar, l.offset_needs_child_scalar);
+		}
+
+		if (type == "TopN") {
+			const AstTopNNode &t = static_cast<const AstTopNNode &>(ast_node);
+			return make_uniq<TopNNode>(my_index, t.cte_column_names, children_names[0], t.order_items, t.limit,
+			                           t.offset);
 		}
 
 		if (type == "Distinct") {
