@@ -143,6 +143,16 @@ PRAGMA lpts_check('SELECT * FROM users WHERE name = ''Alice'' OR name = ''Carol'
 ----
 true
 
+query I
+PRAGMA lpts_check('SELECT id, name FROM users WHERE id = 1 OR id = 2');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT * FROM users WHERE id IN (SELECT id FROM users WHERE id < 3)');
+----
+true
+
 # --- SELECT with filter that matches no rows: empty result ---
 
 query III

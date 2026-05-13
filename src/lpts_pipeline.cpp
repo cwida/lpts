@@ -2356,9 +2356,11 @@ private:
 		//    cte_nodes; once that happens, a child's idx no longer equals its vector
 		//    position, and `cte_nodes[idx]` silently picks up the wrong CTE.
 		vector<string> children_names;
+		vector<vector<string>> children_column_lists;
 		for (const auto &child : ast_node.children) {
 			unique_ptr<CteNode> child_cte = FlattenNode(*child);
 			children_names.push_back(child_cte->cte_name);
+			children_column_lists.push_back(child_cte->cte_column_list);
 			cte_nodes.push_back(std::move(child_cte));
 		}
 
@@ -2381,8 +2383,10 @@ private:
 
 		if (type == "Filter") {
 			const AstFilterNode &filter = static_cast<const AstFilterNode &>(ast_node);
-			// FilterNode has no explicit CTE column list (it does SELECT * FROM child).
-			return make_uniq<FilterNode>(my_index, vector<string>(), children_names[0], filter.conditions);
+			// Filters are pass-through operators: SELECT * keeps the child's column
+			// layout. Preserve it so a filter-rooted subtree can produce a valid
+			// FinalReadNode instead of an empty SELECT list.
+			return make_uniq<FilterNode>(my_index, children_column_lists[0], children_names[0], filter.conditions);
 		}
 
 		if (type == "Project") {
@@ -2442,12 +2446,14 @@ private:
 
 		if (type == "Order") {
 			const AstOrderNode &o = static_cast<const AstOrderNode &>(ast_node);
-			return make_uniq<OrderNode>(my_index, o.cte_column_names, children_names[0], o.order_items);
+			const auto &cols = o.cte_column_names.empty() ? children_column_lists[0] : o.cte_column_names;
+			return make_uniq<OrderNode>(my_index, cols, children_names[0], o.order_items);
 		}
 
 		if (type == "Limit") {
 			const AstLimitNode &l = static_cast<const AstLimitNode &>(ast_node);
-			return make_uniq<LimitNode>(my_index, l.cte_column_names, children_names[0], l.limit_str, l.offset_str,
+			const auto &cols = l.cte_column_names.empty() ? children_column_lists[0] : l.cte_column_names;
+			return make_uniq<LimitNode>(my_index, cols, children_names[0], l.limit_str, l.offset_str,
 			                            l.limit_needs_child_scalar, l.offset_needs_child_scalar);
 		}
 
@@ -2459,7 +2465,8 @@ private:
 
 		if (type == "Distinct") {
 			const AstDistinctNode &d = static_cast<const AstDistinctNode &>(ast_node);
-			return make_uniq<DistinctNode>(my_index, d.cte_column_names, children_names[0]);
+			const auto &cols = d.cte_column_names.empty() ? children_column_lists[0] : d.cte_column_names;
+			return make_uniq<DistinctNode>(my_index, cols, children_names[0]);
 		}
 
 		// Operators not yet implemented.
