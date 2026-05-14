@@ -1136,16 +1136,18 @@ private:
 				const idx_t col_id_idx = cb.column_index;
 				if (col_id_idx >= col_ids.size()) {
 					string col_name = "rowid";
+					string cte_col_name = "rowid";
 					if (!op->children.empty() && get.parameters.empty()) {
 						const auto child_bindings = op->children[0]->GetColumnBindings();
 						idx_t child_col_idx = get.function.arguments.size() + table_function_passthrough_idx;
 						if (child_col_idx < child_bindings.size()) {
-							col_name = FindColumnBinding(child_bindings[child_col_idx], "table function passthrough")
-							               ->ToUniqueColumnName();
+							auto &src = FindColumnBinding(child_bindings[child_col_idx], "table function passthrough");
+							col_name = src->ToUniqueColumnName();
+							cte_col_name = col_name;
 						}
 					}
 					table_function_passthrough_idx++;
-					auto col_struct = make_uniq<ColStruct>(table_index, "rowid", "");
+					auto col_struct = make_uniq<ColStruct>(table_index, cte_col_name, "");
 					column_names.push_back(col_name);
 					cte_column_names.push_back(col_struct->ToUniqueColumnName());
 					column_map[MappableColumnBinding(cb)] = std::move(col_struct);
