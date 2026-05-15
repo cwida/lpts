@@ -39,10 +39,18 @@ static SqlDialect ReadDialect(ClientContext &context) {
 /// Some optimizers are disabled because they produce plan nodes or structures
 /// that LPTS cannot yet convert back to SQL:
 ///   - COLUMN_LIFETIME: changes column bindings in ways that break CTE references
-///   - STATISTICS_PROPAGATION: triggers DUMMY_SCAN for constant-foldable queries
 ///   - CTE_INLINING: introduces LogicalCTEScan nodes
 ///   - MATERIALIZED_CTE: introduces LogicalCTEScan nodes
 ///   - COMMON_SUBPLAN: introduces LogicalCTEScan nodes
+///
+/// STATISTICS_PROPAGATION is now enabled: LPTS handles LOGICAL_DUMMY_SCAN (single-row
+/// scalar input), LOGICAL_EMPTY_RESULT (impossible-predicate pruning), and the
+/// LogicalExpressionGet+DummyScan pattern emitted by TryExecuteAggregates.
+/// COMPRESSED_MATERIALIZATION is also enabled: it is a sub-pass inside
+/// StatisticsPropagator::PropagateStatistics() that injects __internal_compress_* and
+/// __internal_decompress_* projection nodes. AstToCteList detects these via
+/// IsCompressedMaterializationProjection() and transparently skips them, remapping
+/// bindings to point to the source columns.
 ///
 /// REORDER_FILTER and JOIN_FILTER_PUSHDOWN are safe: REORDER_FILTER only reorders
 /// expressions inside LogicalFilter nodes (order doesn't affect SQL correctness),
@@ -50,8 +58,7 @@ static SqlDialect ReadDialect(ClientContext &context) {
 /// to join nodes and DynamicTableFilterSet to scans — neither is read by LPTS.
 ///
 /// TODO: research whether the remaining disabled optimizers can be re-enabled by
-/// adding support for the plan structures they produce (DUMMY_SCAN, LogicalTopN,
-/// LogicalCTEScan).
+/// adding support for the plan structures they produce (LogicalTopN, LogicalCTEScan).
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
 	Parser parser;
 	parser.ParseQuery(query);
@@ -65,7 +72,6 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	auto &config = DBConfig::GetConfig(context);
 	auto saved = config.options.disabled_optimizers;
 	config.options.disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
-	config.options.disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
 	config.options.disabled_optimizers.insert(OptimizerType::CTE_INLINING);
 	config.options.disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
 	config.options.disabled_optimizers.insert(OptimizerType::COMMON_SUBPLAN);

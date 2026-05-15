@@ -683,6 +683,17 @@ private:
 		}
 		case ExpressionClass::BOUND_FUNCTION: {
 			const BoundFunctionExpression &func_expr = expression->Cast<BoundFunctionExpression>();
+			// Strip internal compress/decompress wrappers injected by COMPRESSED_MATERIALIZATION.
+			// For non-BOUND_COLUMN_REF GROUP BY keys (e.g. COALESCE), the optimizer inlines
+			// __internal_compress_* directly into the aggregate's group expression instead of
+			// creating a separate projection. Render the first argument (the original expression)
+			// so the generated SQL stays valid and binder-accepted.
+			if (!func_expr.children.empty() &&
+			    (func_expr.function.name.rfind("__internal_compress_", 0) == 0 ||
+			     func_expr.function.name.rfind("__internal_decompress_", 0) == 0)) {
+				expr_str << ExpressionToAliasedString(func_expr.children[0]);
+				break;
+			}
 			// Dialect-specific function name remapping.
 			string func_name = func_expr.function.name;
 			if (dialect == SqlDialect::POSTGRES) {

@@ -1,0 +1,196 @@
+# name: test/sql/statistics_propagation.test
+# description: STATISTICS_PROPAGATION is now enabled for LPTS. Tests cover the three
+#   plan transformations it can introduce: EMPTY_RESULT (impossible predicate pruning),
+#   always-true filter removal, and join stats adding a scan filter from the join partner.
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE t (id INTEGER, val INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'x'), (3, 30, 'y'), (4, 40, 'y'), (5, 50, 'z');
+
+statement ok
+CREATE TABLE t2 (id INTEGER, score INTEGER);
+
+statement ok
+INSERT INTO t2 VALUES (1, 100), (2, 200), (3, 300);
+
+# ============================================================
+# Impossible-predicate pruning → LOGICAL_EMPTY_RESULT
+#
+# When a filter can never be satisfied given the column
+# statistics, STATISTICS_PROPAGATION replaces the subtree
+# with an EMPTY_RESULT node.  LPTS serialises it as a
+# "(SELECT 1) WHERE false" subquery so the generated SQL
+# also returns zero rows.
+# ============================================================
+
+# Constant-false predicate: WHERE 1 = 0
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE 1 = 0');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 0');
+----
+
+# Column out-of-range: val ∈ [10, 50], so val < 0 is impossible
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 0');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 0');
+----
+
+# Boundary: val > 50 is impossible (max = 50)
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 50');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val > 50');
+----
+
+# Impossible range: val < 10 AND val > 50 — contradictory, pruned to EMPTY_RESULT
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 10 AND val > 50');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 10 AND val > 50');
+----
+
+# ============================================================
+# Always-true filter removal
+#
+# When statistics prove a filter always passes, it is removed
+# from the scan entirely.  The LPTS-generated SQL must still
+# return all rows.
+# ============================================================
+
+# Constant-true predicate: WHERE 1 = 1
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE 1 = 1');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 1');
+----
+1	10
+2	20
+3	30
+4	40
+5	50
+
+# Column always in range: val ∈ [10, 50], so val >= 10 is always true
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val >= 10');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val >= 10');
+----
+1	10
+2	20
+3	30
+4	40
+5	50
+
+# ============================================================
+# Join stats: scan filter added from join partner statistics
+#
+# After propagating the join partner's column stats onto the
+# probe side, STATISTICS_PROPAGATION can add a tight range
+# filter to the probe scan.  Here t2.id ∈ [1, 3] so it adds
+# t.id <= 3 to the t scan, pruning rows 4 and 5.
+# The generated SQL must still produce exactly the joined rows.
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+1	100
+2	200
+3	300
+
+query I
+PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
+----
+true
+
+query III
+PRAGMA lpts_exec('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
+----
+2	20	200
+3	30	300
+
+# ============================================================
+# Impossible predicate on a join — EMPTY_RESULT propagates up
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100');
+----
+
+# ============================================================
+# Aggregates on pruned input → zero-row aggregate result
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT count(*), sum(val) FROM t WHERE val > 50');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT count(*), sum(val) FROM t WHERE val > 50');
+----
+0	NULL
+
+# ============================================================
+# STATISTICS_PROPAGATION deliberately disabled by the user
+# When the user sets disabled_optimizers, LPTS must respect it
+# and still produce a correct round-trip.
+# ============================================================
+
+statement ok
+SET disabled_optimizers = 'STATISTICS_PROPAGATION';
+
+# Without stats propagation the impossible filter is NOT pruned,
+# so the plan contains a real scan + filter node — still correct.
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 0');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 0');
+----
+
+# Join without stats-injected filter — join produces all matching rows.
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+true
+
+statement ok
+SET disabled_optimizers = '';
