@@ -353,6 +353,11 @@ string DelimGetNode::ToQuery() {
 	return s.str();
 }
 
+string RecursiveCteNode::ToQuery() {
+	string union_kw = union_all ? "\nUNION ALL\n" : "\nUNION\n";
+	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + recursive_step_sql;
+}
+
 /// Serialize the entire CTE list into a SQL string.
 /// Output format: WITH cte_0(...) AS (...), cte_1(...) AS (...), ... SELECT ...;
 string CteList::ToQuery(const bool use_newlines, const vector<string> &output_names) {
@@ -370,7 +375,7 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 
 	std::ostringstream sql_str;
 	if (!nodes.empty()) {
-		sql_str << "WITH ";
+		sql_str << (has_recursive_cte ? "WITH RECURSIVE " : "WITH ");
 		for (size_t i = 0; i < nodes.size(); ++i) {
 			sql_str << nodes[i]->ToCteQuery();
 			if (i != nodes.size() - 1) {

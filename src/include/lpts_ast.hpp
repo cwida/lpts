@@ -366,6 +366,31 @@ public:
 	}
 };
 
+/// Recursive CTE node: wraps the anchor and recursive-step subtrees.
+/// children[0] = anchor AST subtree, children[1] = recursive step AST subtree.
+/// The self-referencing CTE_REF nodes inside the recursive step have cte_table_index
+/// matching this node's cte_table_index.
+class AstRecursiveCteNode : public AstNode {
+public:
+	idx_t cte_table_index;           ///< table_index from LogicalRecursiveCTE.
+	string ctename;                  ///< User-given CTE name (informational only).
+	bool union_all;                  ///< True → UNION ALL, false → UNION.
+	vector<string> output_col_names; ///< LPTS-prefixed output names (e.g. ["t1_n"]) for parent nodes.
+
+	AstRecursiveCteNode(idx_t cte_table_index_p, string ctename_p, bool union_all_p, vector<string> output_col_names_p)
+	    : cte_table_index(cte_table_index_p), ctename(std::move(ctename_p)), union_all(union_all_p),
+	      output_col_names(std::move(output_col_names_p)) {
+	}
+
+	string ToString(int indent = 0) const override;
+	string NodeType() const override {
+		return "RecursiveCte";
+	}
+	vector<string> OutputColumnNames() const override {
+		return output_col_names;
+	}
+};
+
 /// DELIM_GET node: a duplicate-eliminated scan driven by a parent DELIM_JOIN.
 /// In SQL: SELECT DISTINCT {source_col_names} FROM {left_cte}.
 /// Has no children. The source CTE name is registered by the parent AstDelimJoinNode in Phase 2.

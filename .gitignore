@@ -6,8 +6,8 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
-test.db.wal
-test.db
+*.db
+*.db.wal
 tpch-umbra-flat-cte-list.txt
 .cache/
 benchmark/sqlstorm/lpts_sqlstorm_tpch_sf*.csv

@@ -1,5 +1,5 @@
 # name: test/sql/cte.test
-# description: test lpts with CHUNK_GET (large IN literal list), CTE_REF, and MATERIALIZED_CTE (WITH clause referenced twice)
+# description: test lpts with CHUNK_GET, CTE_REF, MATERIALIZED_CTE, CTE_INLINING, NOT MATERIALIZED, nested CTEs, and WITH RECURSIVE
 # group: [sql]
 
 require lpts
@@ -99,5 +99,109 @@ true
 # CTE with aggregation used twice
 query I
 PRAGMA lpts_check('WITH agg AS (SELECT label, count(*) AS cnt FROM t GROUP BY label) SELECT a1.label FROM agg a1 JOIN agg a2 ON a1.label = a2.label ORDER BY a1.label');
+----
+true
+
+# ============================================================
+# CTE_INLINING: single-reference CTE is inlined by the optimizer
+# DuckDB inlines the CTE body directly since it is referenced only once.
+# ============================================================
+
+query II
+PRAGMA lpts_exec('WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id');
+----
+3	30
+4	40
+5	50
+
+query I
+PRAGMA lpts_check('WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id');
+----
+true
+
+# ============================================================
+# WITH NOT MATERIALIZED: explicitly prevents materialization, always inlined
+# ============================================================
+
+query II
+PRAGMA lpts_exec('WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id');
+----
+1	10
+2	20
+
+query I
+PRAGMA lpts_check('WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id');
+----
+true
+
+# ============================================================
+# WITH MATERIALIZED: explicitly forces materialization
+# DuckDB keeps the CTE as a LogicalMaterializedCTE + LogicalCTERef pair.
+# ============================================================
+
+query II
+PRAGMA lpts_exec('WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id');
+----
+1	10
+2	20
+
+query I
+PRAGMA lpts_check('WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id');
+----
+true
+
+# MATERIALIZED CTE referenced twice (the typical reason to force materialization)
+query I
+PRAGMA lpts_check('WITH m AS MATERIALIZED (SELECT id, val FROM t) SELECT m1.id, m2.val FROM m m1 JOIN m m2 ON m1.id = m2.id WHERE m1.val > 10 ORDER BY m1.id');
+----
+true
+
+# ============================================================
+# Nested CTEs: a CTE that itself references another CTE
+# ============================================================
+
+query II
+PRAGMA lpts_exec('WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id');
+----
+2	60
+3	90
+4	120
+
+query I
+PRAGMA lpts_check('WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id');
+----
+true
+
+# ============================================================
+# WITH RECURSIVE
+# ============================================================
+
+# Simple counter: 1 to 5
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cnt WHERE n<5) SELECT n FROM cnt');
+----
+true
+
+# Counter with outer filter
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cnt WHERE n<10) SELECT n FROM cnt WHERE n % 2 = 0');
+----
+true
+
+# Fibonacci sequence
+query I
+PRAGMA lpts_check('WITH RECURSIVE fib(a,b) AS (SELECT 0,1 UNION ALL SELECT b, a+b FROM fib WHERE a<100) SELECT a FROM fib');
+----
+true
+
+# Tree traversal with JOIN
+statement ok
+CREATE TABLE nodes (id INT, parent INT);
+
+statement ok
+INSERT INTO nodes VALUES (1,NULL),(2,1),(3,1),(4,2);
+
+query I
+PRAGMA lpts_check('WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM nodes WHERE parent IS NULL UNION ALL SELECT n.id, t.depth+1 FROM nodes n JOIN tree t ON n.parent=t.id) SELECT id,depth FROM tree ORDER BY id');
 ----
 true

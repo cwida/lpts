@@ -433,6 +433,30 @@ string AstDelimJoinNode::ToString(int indent) const {
 }
 
 //------------------------------------------------------------------------------
+// AstRecursiveCteNode
+//------------------------------------------------------------------------------
+
+string AstRecursiveCteNode::ToString(int indent) const {
+	string result = Indent(indent) + "RecursiveCte (cte_table_index=" + std::to_string(cte_table_index) + " ctename='" +
+	                ctename + "' union_all=" + (union_all ? "true" : "false") + ")";
+	result += "\n" + Indent(indent + 2) + "output_cols: [";
+	for (size_t i = 0; i < output_col_names.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += output_col_names[i];
+	}
+	result += "]";
+	if (children.size() >= 1) {
+		result += "\n" + Indent(indent + 2) + "anchor:\n" + children[0]->ToString(indent + 4);
+	}
+	if (children.size() >= 2) {
+		result += "\n" + Indent(indent + 2) + "recursive_step:\n" + children[1]->ToString(indent + 4);
+	}
+	return result;
+}
+
+//------------------------------------------------------------------------------
 // PrintAst — free function
 //------------------------------------------------------------------------------
 

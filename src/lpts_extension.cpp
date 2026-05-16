@@ -36,29 +36,29 @@ static SqlDialect ReadDialect(ClientContext &context) {
 /// Plan a query and run it through the optimizer, returning the optimized
 /// logical plan. This ensures LPTS sees the same plan DuckDB would execute.
 ///
-/// Some optimizers are disabled because they produce plan nodes or structures
-/// that LPTS cannot yet convert back to SQL:
+/// Only one optimizer is disabled:
 ///   - COLUMN_LIFETIME: changes column bindings in ways that break CTE references
-///   - CTE_INLINING: introduces LogicalCTEScan nodes
-///   - MATERIALIZED_CTE: introduces LogicalCTEScan nodes
-///   - COMMON_SUBPLAN: introduces LogicalCTEScan nodes
 ///
-/// STATISTICS_PROPAGATION is now enabled: LPTS handles LOGICAL_DUMMY_SCAN (single-row
+/// All CTE-related optimizers are now enabled and handled:
+///   - CTE_INLINING: inlines CTEs into the query body; produces ordinary LogicalProjection
+///     nodes (no new node types needed).
+///   - MATERIALIZED_CTE: converts default CTEs to LogicalMaterializedCTE + LogicalCTERef;
+///     both are handled by AstMaterializedCteNode / AstCteRefNode.
+///   - COMMON_SUBPLAN: detects identical subplans and materializes them as
+///     LogicalMaterializedCTE + LogicalCTERef; handled by the same nodes above.
+///
+/// STATISTICS_PROPAGATION is enabled: LPTS handles LOGICAL_DUMMY_SCAN (single-row
 /// scalar input), LOGICAL_EMPTY_RESULT (impossible-predicate pruning), and the
 /// LogicalExpressionGet+DummyScan pattern emitted by TryExecuteAggregates.
 /// COMPRESSED_MATERIALIZATION is also enabled: it is a sub-pass inside
 /// StatisticsPropagator::PropagateStatistics() that injects __internal_compress_* and
-/// __internal_decompress_* projection nodes. AstToCteList detects these via
-/// IsCompressedMaterializationProjection() and transparently skips them, remapping
-/// bindings to point to the source columns.
+/// __internal_decompress_* function calls. ExpressionToAliasedString() detects these
+/// by function name prefix and transparently renders the wrapped expression instead.
 ///
 /// REORDER_FILTER and JOIN_FILTER_PUSHDOWN are safe: REORDER_FILTER only reorders
 /// expressions inside LogicalFilter nodes (order doesn't affect SQL correctness),
 /// and JOIN_FILTER_PUSHDOWN only attaches runtime JoinFilterPushdownInfo metadata
 /// to join nodes and DynamicTableFilterSet to scans — neither is read by LPTS.
-///
-/// TODO: research whether the remaining disabled optimizers can be re-enabled by
-/// adding support for the plan structures they produce (LogicalTopN, LogicalCTEScan).
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
 	Parser parser;
 	parser.ParseQuery(query);
@@ -72,9 +72,6 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	auto &config = DBConfig::GetConfig(context);
 	auto saved = config.options.disabled_optimizers;
 	config.options.disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
-	config.options.disabled_optimizers.insert(OptimizerType::CTE_INLINING);
-	config.options.disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
-	config.options.disabled_optimizers.insert(OptimizerType::COMMON_SUBPLAN);
 
 #if LPTS_DEBUG
 	{
