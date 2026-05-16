@@ -144,7 +144,9 @@ string GetNode::ToQuery() {
 
 string FilterNode::ToQuery() {
 	std::ostringstream get_str;
-	get_str << "SELECT * FROM ";
+	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
+	// respected: SELECT * would expose more columns than the CTE header declares.
+	get_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM ";
 	get_str << child_cte_name;
 	if (!conditions.empty()) {
 		get_str << " WHERE ";
@@ -291,7 +293,9 @@ string CteSetOperationNode::ToQuery() {
 
 string OrderNode::ToQuery() {
 	std::ostringstream order_str;
-	order_str << "SELECT * FROM " << child_cte_name;
+	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
+	// respected: SELECT * would expose more columns than the CTE header declares.
+	order_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!order_items.empty()) {
 		order_str << " ORDER BY " << VecToSeparatedList(order_items);
 	}

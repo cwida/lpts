@@ -356,3 +356,69 @@ true
 
 statement ok
 SET disabled_optimizers = '';
+
+# ============================================================
+# COLUMN_LIFETIME
+# Prunes unused output columns from LogicalFilter, LogicalOrder,
+# and LogicalComparisonJoin via projection_map. FilterNode and
+# OrderNode emit an explicit SELECT column list so the CTE
+# header column count always matches the body — even when
+# COLUMN_LIFETIME removes sort/filter keys from the output.
+# ============================================================
+
+# ORDER BY on a column that is NOT in the SELECT list.
+# COLUMN_LIFETIME prunes the sort key (val) from the ORDER CTE output.
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val DESC');
+----
+true
+
+# ORDER BY on multiple non-selected columns.
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val DESC, label ASC');
+----
+true
+
+# Filter where the condition column is not in the SELECT list.
+query I
+PRAGMA lpts_check('SELECT id FROM t WHERE val > 20');
+----
+true
+
+# Join: sort key from the right side pruned from ORDER CTE output.
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+# COLUMN_LIFETIME disabled: same queries must still round-trip correctly.
+statement ok
+SET disabled_optimizers = 'COLUMN_LIFETIME';
+
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT id FROM t WHERE val > 20');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+statement ok
+SET disabled_optimizers = '';
