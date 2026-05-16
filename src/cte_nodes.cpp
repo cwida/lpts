@@ -23,18 +23,18 @@ namespace duckdb {
 
 namespace {
 
-string QuoteTableWithOptionalSuffix(const string &table_name) {
+string QuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect) {
 	static const string at_suffix = " AT (";
 	auto suffix_pos = table_name.find(at_suffix);
 	if (suffix_pos == string::npos) {
-		return KeywordHelper::WriteOptionallyQuoted(table_name);
+		return DialectQuoteIdent(table_name, dialect);
 	}
-	return KeywordHelper::WriteOptionallyQuoted(table_name.substr(0, suffix_pos)) + table_name.substr(suffix_pos);
+	return DialectQuoteIdent(table_name.substr(0, suffix_pos), dialect) + table_name.substr(suffix_pos);
 }
 
-string QualifiedTableName(const string &catalog, const string &schema, const string &table_name) {
-	return KeywordHelper::WriteOptionallyQuoted(catalog) + "." + KeywordHelper::WriteOptionallyQuoted(schema) + "." +
-	       QuoteTableWithOptionalSuffix(table_name);
+string QualifiedTableName(const string &catalog, const string &schema, const string &table_name, SqlDialect dialect) {
+	return DialectQuoteIdent(catalog, dialect) + "." + DialectQuoteIdent(schema, dialect) + "." +
+	       QuoteTableWithOptionalSuffix(table_name, dialect);
 }
 
 } // namespace
@@ -55,7 +55,7 @@ string FinalReadNode::ToQuery() {
 	// Assign the final column names to the CTE column names. Format: "cte_col AS final_col".
 	merged_list.reserve(col_count);
 	for (size_t i = 0; i < final_column_list.size(); ++i) {
-		string final_name = KeywordHelper::WriteOptionallyQuoted(final_column_list[i]);
+		string final_name = DialectQuoteIdent(final_column_list[i], dialect);
 		merged_list.emplace_back(child_cte_column_list[i] + " AS " + final_name);
 	}
 	std::ostringstream sql_str;
@@ -113,8 +113,8 @@ string GetNode::ToQuery() {
 	}
 	get_str << " FROM ";
 	if (!catalog.empty()) {
-		// Fully-qualified: catalog.schema.table (DuckDB dialect)
-		get_str << QualifiedTableName(catalog, schema, table_name);
+		// Fully-qualified: catalog.schema.table (DuckDB / Spark dialect)
+		get_str << QualifiedTableName(catalog, schema, table_name, dialect);
 	} else {
 		if (!input_cte_name.empty()) {
 			get_str << input_cte_name << ", ";

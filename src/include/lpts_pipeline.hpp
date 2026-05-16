@@ -5,20 +5,7 @@
 
 namespace duckdb {
 
-//==============================================================================
-// SqlDialect
-//
-// Selects the SQL dialect used for CTE/SQL generation.
-// Set via: SET lpts_dialect = 'postgres';
-//==============================================================================
-enum class SqlDialect {
-	DUCKDB,  ///< Default. Uses DuckDB-specific syntax (fully-qualified table refs, etc.)
-	POSTGRES ///< PostgreSQL-compatible syntax (unqualified table refs, etc.)
-};
-
-/// Parse a dialect string ("duckdb" or "postgres") into the enum.
-/// Throws InvalidInputException on unrecognised values.
-SqlDialect ParseSqlDialect(const string &value);
+// (SqlDialect lives in sql_dialect.hpp — included via cte_nodes.hpp)
 
 /// Phase 1: Convert a DuckDB LogicalOperator tree into a dialect-agnostic AST.
 /// `dialect` is forwarded to expression serialization for dialect-specific function renaming.

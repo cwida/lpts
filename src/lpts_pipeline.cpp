@@ -588,6 +588,11 @@ private:
 			}
 		}
 		if (!frame_start.empty() || !frame_end.empty()) {
+			if (dialect == SqlDialect::SPARK && units == "GROUPS") {
+				throw NotImplementedException(
+				    "LPTS SPARK dialect: window frame units 'GROUPS' are not supported by Spark SQL "
+				    "(only ROWS and RANGE). Rewrite the window to use a ROWS/RANGE frame.");
+			}
 			result << separator << units;
 			if (!frame_start.empty() && !frame_end.empty()) {
 				result << " BETWEEN " << frame_start << " AND " << frame_end;
@@ -597,6 +602,11 @@ private:
 				result << " " << frame_end;
 			}
 			separator = " ";
+		}
+		if (dialect == SqlDialect::SPARK && window.exclude_clause != WindowExcludeMode::NO_OTHER) {
+			throw NotImplementedException(
+			    "LPTS SPARK dialect: window EXCLUDE clauses are not supported by Spark SQL. "
+			    "Remove the EXCLUDE clause or restructure the window expression.");
 		}
 		switch (window.exclude_clause) {
 		case WindowExcludeMode::NO_OTHER:
@@ -690,6 +700,31 @@ private:
 					func_name = "to_timestamp";
 				} else if (func_name == "strftime") {
 					func_name = "to_char";
+				}
+			} else if (dialect == SqlDialect::SPARK) {
+				// Spark SQL: closest semantic equivalents for the DuckDB function names
+				// OpenIVM-emitted plans actually exercise. Functions Spark already has
+				// with identical signatures (e.g. `coalesce`, `greatest`, `least`,
+				// arithmetic operators, `length`, `lower`, `upper`, `cast`, etc.) pass
+				// through unchanged. Unsupported functions surface as a Spark-side error
+				// rather than being silently mistranslated.
+				if (func_name == "strftime") {
+					func_name = "date_format";
+				} else if (func_name == "strptime") {
+					func_name = "to_timestamp";
+				} else if (func_name == "list_transform" || func_name == "array_transform") {
+					func_name = "transform";
+				} else if (func_name == "list_aggregate" || func_name == "array_aggregate") {
+					func_name = "aggregate";
+				} else if (func_name == "list_filter" || func_name == "array_filter") {
+					func_name = "filter";
+				} else if (func_name == "list_value") {
+					func_name = "array";
+				} else if (func_name == "list_contains" || func_name == "array_contains") {
+					func_name = "array_contains";
+				} else if (func_name == "list_extract" || func_name == "array_extract") {
+					// Spark's element_at is 1-indexed (matches DuckDB list semantics).
+					func_name = "element_at";
 				}
 			}
 			// For lambda functions, only serialize non-lambda, non-capture children
@@ -2214,7 +2249,10 @@ SqlDialect ParseSqlDialect(const string &value) {
 	if (value == "postgres" || value == "POSTGRES" || value == "postgresql" || value == "POSTGRESQL") {
 		return SqlDialect::POSTGRES;
 	}
-	throw InvalidInputException("Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres'", value);
+	if (value == "spark" || value == "SPARK") {
+		return SqlDialect::SPARK;
+	}
+	throw InvalidInputException("Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark'", value);
 }
 
 //==============================================================================
@@ -2493,6 +2531,7 @@ public:
 			auto insert_node =
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
+			StampDialect(cte_nodes, *insert_node);
 			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node));
 		}
 
@@ -2519,7 +2558,20 @@ public:
 		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, last_cte->cte_column_list,
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
+		StampDialect(cte_nodes, *final_node);
 		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node));
+	}
+
+private:
+	/// Propagate the flattener's dialect onto every node so dialect-aware
+	/// serialization (identifier quoting, etc.) works at ToQuery() time.
+	void StampDialect(vector<unique_ptr<CteNode>> &nodes, CteBaseNode &root) const {
+		for (auto &node : nodes) {
+			if (node) {
+				node->dialect = dialect;
+			}
+		}
+		root.dialect = dialect;
 	}
 };
 

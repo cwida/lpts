@@ -1,8 +1,31 @@
 #include "lpts_helpers.hpp"
+#include "sql_dialect.hpp"
+
+#include "duckdb/parser/keyword_helper.hpp"
 
 #include <regex>
 
 namespace duckdb {
+
+string DialectQuoteIdent(const string &name, SqlDialect dialect) {
+	if (dialect == SqlDialect::SPARK) {
+		// Spark always uses backticks; embedded backticks must be doubled.
+		std::ostringstream out;
+		out << '`';
+		for (char c : name) {
+			if (c == '`') {
+				out << '`' << '`';
+			} else {
+				out << c;
+			}
+		}
+		out << '`';
+		return out.str();
+	}
+	// DUCKDB / POSTGRES — fall back to DuckDB's helper, which only quotes when
+	// the identifier is a reserved keyword or contains special chars.
+	return KeywordHelper::WriteOptionallyQuoted(name);
+}
 
 string VecToSeparatedList(vector<string> input_list, const string &separator) {
 	std::ostringstream ret_str;

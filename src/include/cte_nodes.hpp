@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "sql_dialect.hpp"
 
 namespace duckdb {
 
@@ -51,6 +52,8 @@ public:
 	explicit CteBaseNode(const size_t index) : idx(index) {
 	}
 	const size_t idx; // Unique index used for naming (e.g. scan_0, filter_1).
+	/// SQL dialect used when serializing this node. Set by AstFlattener post-construction.
+	SqlDialect dialect = SqlDialect::DUCKDB;
 };
 
 /// Virtual class for terminal/root nodes (SELECT result or INSERT).
