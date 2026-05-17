@@ -144,7 +144,9 @@ string GetNode::ToQuery() {
 
 string FilterNode::ToQuery() {
 	std::ostringstream get_str;
-	get_str << "SELECT * FROM ";
+	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
+	// respected: SELECT * would expose more columns than the CTE header declares.
+	get_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM ";
 	get_str << child_cte_name;
 	if (!conditions.empty()) {
 		get_str << " WHERE ";
@@ -291,7 +293,9 @@ string CteSetOperationNode::ToQuery() {
 
 string OrderNode::ToQuery() {
 	std::ostringstream order_str;
-	order_str << "SELECT * FROM " << child_cte_name;
+	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
+	// respected: SELECT * would expose more columns than the CTE header declares.
+	order_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!order_items.empty()) {
 		order_str << " ORDER BY " << VecToSeparatedList(order_items);
 	}
@@ -353,6 +357,11 @@ string DelimGetNode::ToQuery() {
 	return s.str();
 }
 
+string RecursiveCteNode::ToQuery() {
+	string union_kw = union_all ? "\nUNION ALL\n" : "\nUNION\n";
+	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + recursive_step_sql;
+}
+
 /// Serialize the entire CTE list into a SQL string.
 /// Output format: WITH cte_0(...) AS (...), cte_1(...) AS (...), ... SELECT ...;
 string CteList::ToQuery(const bool use_newlines, const vector<string> &output_names) {
@@ -370,7 +379,7 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 
 	std::ostringstream sql_str;
 	if (!nodes.empty()) {
-		sql_str << "WITH ";
+		sql_str << (has_recursive_cte ? "WITH RECURSIVE " : "WITH ");
 		for (size_t i = 0; i < nodes.size(); ++i) {
 			sql_str << nodes[i]->ToCteQuery();
 			if (i != nodes.size() - 1) {

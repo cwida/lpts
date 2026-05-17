@@ -61,6 +61,7 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_recursive_cte.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -683,6 +684,16 @@ private:
 		}
 		case ExpressionClass::BOUND_FUNCTION: {
 			const BoundFunctionExpression &func_expr = expression->Cast<BoundFunctionExpression>();
+			// Strip internal compress/decompress wrappers injected by COMPRESSED_MATERIALIZATION.
+			// For non-BOUND_COLUMN_REF GROUP BY keys (e.g. COALESCE), the optimizer inlines
+			// __internal_compress_* directly into the aggregate's group expression instead of
+			// creating a separate projection. Render the first argument (the original expression)
+			// so the generated SQL stays valid and binder-accepted.
+			if (!func_expr.children.empty() && (func_expr.function.name.rfind("__internal_compress_", 0) == 0 ||
+			                                    func_expr.function.name.rfind("__internal_decompress_", 0) == 0)) {
+				expr_str << ExpressionToAliasedString(func_expr.children[0]);
+				break;
+			}
 			// Dialect-specific function name remapping.
 			string func_name = func_expr.function.name;
 			if (dialect == SqlDialect::POSTGRES) {
@@ -2165,6 +2176,38 @@ private:
 			child_nodes[0] = RecursiveTraversal(op->children[0]);
 			materialized_cte_body_column_names[mat_cte.table_index] = child_nodes[0]->OutputColumnNames();
 			child_nodes[1] = RecursiveTraversal(op->children[1]);
+		} else if (op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+			const LogicalRecursiveCTE &rec_cte = op->Cast<LogicalRecursiveCTE>();
+			LPTS_DEBUG_PRINT("[LPTS-AST] RECURSIVE_CTE: table_index=" + std::to_string(rec_cte.table_index) +
+			                 " ctename='" + rec_cte.ctename + "' union_all=" + std::to_string(rec_cte.union_all));
+			child_nodes.resize(2);
+
+			// Traverse anchor first to learn the actual output column names.
+			child_nodes[0] = RecursiveTraversal(op->children[0]);
+			const auto anchor_cols = child_nodes[0]->OutputColumnNames();
+
+			// Register the recursive CTE's output columns in column_map so parent nodes
+			// (Projections, Filters above the RecursiveCTE) can reference them.
+			// Also pre-register them in materialized_cte_body_column_names so that
+			// self-referencing LogicalCTERef nodes in the recursive step resolve correctly.
+			vector<string> output_col_names;
+			for (idx_t i = 0; i < anchor_cols.size(); i++) {
+				string col_name = StripTablePrefix(anchor_cols[i]);
+				auto col_struct = make_uniq<ColStruct>(rec_cte.table_index, col_name, "");
+				output_col_names.push_back(col_struct->ToUniqueColumnName());
+				column_map[MappableColumnBinding(ColumnBinding(rec_cte.table_index, i))] = std::move(col_struct);
+			}
+			materialized_cte_body_column_names[rec_cte.table_index] = anchor_cols;
+
+			// Traverse recursive step; self-referencing CteRef nodes will use the registered names.
+			child_nodes[1] = RecursiveTraversal(op->children[1]);
+
+			// Build the AstRecursiveCteNode directly (bypass the generic BuildNode path).
+			auto rec_node = make_uniq<AstRecursiveCteNode>(rec_cte.table_index, rec_cte.ctename, rec_cte.union_all,
+			                                               std::move(output_col_names));
+			rec_node->children.push_back(std::move(child_nodes[0]));
+			rec_node->children.push_back(std::move(child_nodes[1]));
+			return rec_node;
 		} else {
 			for (auto &child : op->children) {
 				child_nodes.push_back(RecursiveTraversal(child));
@@ -2231,11 +2274,14 @@ class AstFlattener {
 private:
 	size_t node_count = 0;
 	vector<unique_ptr<CteNode>> cte_nodes;
-	SqlDialect dialect; // Controls dialect-specific SQL rendering.
+	SqlDialect dialect;             // Controls dialect-specific SQL rendering.
+	bool has_recursive_cte = false; // True when a RecursiveCteNode has been pushed.
 
 	/// Maps LogicalMaterializedCTE::table_index → (lpts_cte_name, lpts_cte_column_list)
 	/// of the last CTE generated for the body. Populated when flattening AstMaterializedCteNode;
 	/// consumed when flattening AstCteRefNode.
+	/// For RecursiveCteNode: stores {recursive_cte_name, stripped_col_names} so that
+	/// self-referencing CteRef nodes inside the recursive step resolve to the recursive CTE.
 	unordered_map<idx_t, pair<string, vector<string>>> cte_index_to_body_info;
 
 	/// Maps AstDelimGetNode::table_index → name of the outer left CTE to SELECT DISTINCT from.
@@ -2260,6 +2306,179 @@ private:
 		} else {
 			return "node_" + std::to_string(index);
 		}
+	}
+
+	//--------------------------------------------------------------------------
+	// AstToInlineSQL: generate inline (non-CTE) SQL for a subtree.
+	//
+	// Used for the recursive step of WITH RECURSIVE: the recursive step may
+	// contain self-referencing CteRef nodes that would create forward references
+	// if expressed as flat CTEs. Instead, the entire step is serialized as a
+	// nested subquery with all column aliases expressed inline.
+	//--------------------------------------------------------------------------
+	string AstToInlineSQL(const AstNode &ast_node) const {
+		const string &type = ast_node.NodeType();
+
+		if (type == "Get") {
+			const AstGetNode &get = static_cast<const AstGetNode &>(ast_node);
+			string sql = "SELECT ";
+			if (get.column_names.empty()) {
+				sql += "*";
+			} else {
+				for (size_t i = 0; i < get.column_names.size(); i++) {
+					if (i > 0) {
+						sql += ", ";
+					}
+					sql += get.column_names[i] + " AS " + get.cte_column_names[i];
+				}
+			}
+			sql += " FROM ";
+			if (!get.catalog.empty()) {
+				sql += get.catalog + "." + get.schema + "." + get.table_name;
+			} else {
+				sql += get.table_name;
+			}
+			if (!get.table_filters.empty()) {
+				sql += " WHERE " + VecToSeparatedList(get.table_filters, " AND ");
+			}
+			return sql;
+		}
+
+		if (type == "CteRef") {
+			// Self-reference (cte_index = rec CTE table_index) or reference to a flat CTE.
+			const AstCteRefNode &cte_ref = static_cast<const AstCteRefNode &>(ast_node);
+			auto it = cte_index_to_body_info.find(cte_ref.cte_table_index);
+			if (it == cte_index_to_body_info.end()) {
+				throw InternalException("AstToInlineSQL: CteRef references unknown CTE index %llu",
+				                        (unsigned long long)cte_ref.cte_table_index);
+			}
+			const string &src_name = it->second.first;
+			const vector<string> &src_cols = it->second.second;
+			string sql = "SELECT ";
+			for (size_t i = 0; i < src_cols.size(); i++) {
+				if (i > 0) {
+					sql += ", ";
+				}
+				sql += src_cols[i] + " AS " + cte_ref.cte_column_names[i];
+			}
+			return sql + " FROM " + src_name;
+		}
+
+		if (type == "Filter") {
+			const AstFilterNode &filter = static_cast<const AstFilterNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			if (!filter.conditions.empty()) {
+				sql += " WHERE ";
+				for (size_t i = 0; i < filter.conditions.size(); i++) {
+					if (i > 0) {
+						sql += " AND ";
+					}
+					sql += "(" + filter.conditions[i] + ")";
+				}
+			}
+			return sql;
+		}
+
+		if (type == "Project") {
+			const AstProjectNode &proj = static_cast<const AstProjectNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT ";
+			for (size_t i = 0; i < proj.expressions.size(); i++) {
+				if (i > 0) {
+					sql += ", ";
+				}
+				sql += proj.expressions[i] + " AS " + proj.cte_column_names[i];
+			}
+			return sql + " FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+		}
+
+		if (type == "Join") {
+			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string left_sql = AstToInlineSQL(*ast_node.children[0]);
+			string right_sql = AstToInlineSQL(*ast_node.children[1]);
+			string join_kw;
+			switch (join.join_type) {
+			case JoinType::INNER:
+				join_kw = "INNER";
+				break;
+			case JoinType::LEFT:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT:
+				join_kw = "RIGHT";
+				break;
+			case JoinType::OUTER:
+				join_kw = "FULL OUTER";
+				break;
+			default:
+				throw NotImplementedException("AstToInlineSQL: JOIN type %s not supported in recursive CTE step",
+				                              EnumUtil::ToString(join.join_type));
+			}
+			string sql = "SELECT " + VecToSeparatedList(join.cte_column_names) + " FROM (" + left_sql + ") " + join_kw +
+			             " JOIN (" + right_sql + ")";
+			if (!join.conditions.empty()) {
+				sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+			}
+			return sql;
+		}
+
+		if (type == "Aggregate") {
+			const AstAggregateNode &agg = static_cast<const AstAggregateNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT ";
+			if (!agg.group_by_columns.empty()) {
+				sql += VecToSeparatedList(agg.group_by_columns) + ", ";
+			}
+			sql += VecToSeparatedList(agg.aggregate_expressions);
+			sql += " FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			if (!agg.group_by_clause.empty()) {
+				sql += " GROUP BY " + agg.group_by_clause;
+			}
+			return sql;
+		}
+
+		if (type == "Distinct") {
+			D_ASSERT(ast_node.children.size() == 1);
+			const AstDistinctNode &d = static_cast<const AstDistinctNode &>(ast_node);
+			const auto &cols =
+			    d.cte_column_names.empty() ? ast_node.children[0]->OutputColumnNames() : d.cte_column_names;
+			return "SELECT DISTINCT " + VecToSeparatedList(cols) + " FROM (" + AstToInlineSQL(*ast_node.children[0]) +
+			       ")";
+		}
+
+		if (type == "Order") {
+			const AstOrderNode &o = static_cast<const AstOrderNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			return "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0]) + ") ORDER BY " +
+			       VecToSeparatedList(o.order_items);
+		}
+
+		if (type == "Limit") {
+			const AstLimitNode &l = static_cast<const AstLimitNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			if (!l.limit_str.empty()) {
+				sql += " LIMIT " + l.limit_str;
+			}
+			if (!l.offset_str.empty()) {
+				sql += " OFFSET " + l.offset_str;
+			}
+			return sql;
+		}
+
+		if (type == "Union") {
+			const AstUnionNode &u = static_cast<const AstUnionNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string union_kw = u.is_union_all ? " UNION ALL " : " UNION ";
+			return "(" + AstToInlineSQL(*ast_node.children[0]) + ")" + union_kw + "(" +
+			       AstToInlineSQL(*ast_node.children[1]) + ")";
+		}
+
+		throw NotImplementedException(
+		    "AstToInlineSQL: node type '%s' is not supported in a recursive CTE step — cannot serialize as inline SQL",
+		    type);
 	}
 
 	//--------------------------------------------------------------------------
@@ -2350,6 +2569,53 @@ private:
 			LPTS_DEBUG_PRINT("[LPTS-CTE] DelimGet: scan_" + std::to_string(my_index) + " SELECT DISTINCT FROM '" +
 			                 source_cte_name + "'");
 			return make_uniq<DelimGetNode>(my_index, dg.cte_column_names, source_cte_name, dg.source_col_names);
+		}
+
+		// RecursiveCte: flatten anchor first (as flat CTEs), then generate inline SQL for the
+		// recursive step (to avoid forward references to the recursive CTE name), then create
+		// the RecursiveCteNode. Returns a GetNode that maps the recursive CTE's exposed columns
+		// to the LPTS-prefixed names expected by parent operators.
+		if (type == "RecursiveCte") {
+			const AstRecursiveCteNode &rec = static_cast<const AstRecursiveCteNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+
+			// 1. Flatten anchor: push all anchor flat CTEs; anchor_tail is the last one.
+			unique_ptr<CteNode> anchor_tail = FlattenNode(*ast_node.children[0]);
+			const string anchor_cte_name = anchor_tail->cte_name;
+			const vector<string> anchor_lpts_cols = anchor_tail->cte_column_list;
+			cte_nodes.push_back(std::move(anchor_tail));
+
+			// 2. Derive the stripped column names (user-visible, e.g. "n") for the CTE header.
+			vector<string> stripped_cols;
+			for (const string &c : anchor_lpts_cols) {
+				const size_t pos = c.find('_');
+				stripped_cols.push_back((pos != string::npos && pos + 1 < c.size()) ? c.substr(pos + 1) : c);
+			}
+
+			// 3. Assign the recursive CTE's index and name; register in cte_index_to_body_info
+			//    so self-referencing CteRef nodes inside the recursive step can resolve to it.
+			const size_t rec_index = node_count++;
+			const string rec_name = "recursive_cte_" + std::to_string(rec_index);
+			cte_index_to_body_info[rec.cte_table_index] = {rec_name, stripped_cols};
+			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: " + rec_name + " anchor='" + anchor_cte_name +
+			                 "' stripped_cols=[" + VecToSeparatedList(stripped_cols) + "]");
+
+			// 4. Generate inline SQL for the recursive step.
+			const string recursive_step_sql = AstToInlineSQL(*ast_node.children[1]);
+			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: recursive_step_sql='" + recursive_step_sql + "'");
+
+			// 5. Push the RecursiveCteNode and mark the list as recursive.
+			cte_nodes.push_back(make_uniq<RecursiveCteNode>(rec_index, stripped_cols, anchor_cte_name, anchor_lpts_cols,
+			                                                recursive_step_sql, rec.union_all));
+			has_recursive_cte = true;
+
+			// 6. Return a GetNode that maps the recursive CTE's exposed column names (stripped)
+			//    to the LPTS-prefixed names (output_col_names) that parent nodes expect.
+			const size_t scan_index = node_count++;
+			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: scan_" + std::to_string(scan_index) + " -> SELECT FROM '" +
+			                 rec_name + "'");
+			return make_uniq<GetNode>(scan_index, rec.output_col_names, "", "", rec_name, 0, vector<string>(),
+			                          stripped_cols);
 		}
 
 		// 1. Recurse into children first (post-order), remembering each child's CTE
@@ -2493,7 +2759,7 @@ public:
 			auto insert_node =
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
-			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node));
+			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte);
 		}
 
 		// Regular SELECT: FlattenNode handles the entire subtree bottom-up.
@@ -2519,7 +2785,7 @@ public:
 		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, last_cte->cte_column_list,
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
-		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node));
+		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte);
 	}
 };
 
