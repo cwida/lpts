@@ -291,12 +291,15 @@ private:
 			result = VecToSeparatedList(children, " OR ");
 			return true;
 		}
-		default: {
+		case TableFilterType::EXPRESSION_FILTER: {
 			auto column_expr = make_uniq<BoundReferenceExpression>(column_name, LogicalType::INVALID, 0);
 			auto filter_expr = filter.ToExpression(*column_expr);
 			result = ExpressionToAliasedString(filter_expr);
 			return true;
 		}
+		default:
+			result = filter.ToString(column_name);
+			return true;
 		}
 	}
 
