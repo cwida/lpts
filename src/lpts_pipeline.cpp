@@ -140,6 +140,21 @@ private:
 		}
 	}
 
+	static bool HasBinding(const vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
+		for (const auto &candidate : bindings) {
+			if (candidate == binding) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static void AddUniqueBinding(vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
+		if (!HasBinding(bindings, binding)) {
+			bindings.push_back(binding);
+		}
+	}
+
 	/// SQL dialect for expression serialization (function renaming, etc.)
 	SqlDialect dialect = SqlDialect::DUCKDB;
 
@@ -180,6 +195,12 @@ private:
 	/// carries the original user-visible names, so CTE refs must follow the body output arity.
 	unordered_map<idx_t, vector<string>> materialized_cte_body_column_names;
 
+	/// Maps LogicalProjection nodes to lower-scope bindings that must be carried through
+	/// as hidden pass-through columns. Some optimizer/extension rewrites leave aggregate
+	/// arguments bound to a pre-projection column; without carrying that binding upward, LPTS
+	/// can emit a stale CTE column name in the aggregate SELECT list.
+	unordered_map<const LogicalOperator *, vector<ColumnBinding>> extra_projection_outputs;
+
 	const unique_ptr<ColStruct> &FindColumnBinding(const ColumnBinding &binding, const char *context) const {
 		auto it = column_map.find(MappableColumnBinding(binding));
 		if (it != column_map.end()) {
@@ -206,6 +227,69 @@ private:
 				RegisterChildBindingFallbacks(*child, child_bindings);
 			}
 		});
+	}
+
+	static void CollectColumnRefs(const Expression &expr, vector<ColumnBinding> &refs) {
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			const auto &bcr = expr.Cast<BoundColumnRefExpression>();
+			AddUniqueBinding(refs, bcr.binding);
+		}
+		ExpressionIterator::EnumerateChildren(const_cast<Expression &>(expr),
+		                                      [&](Expression &child) { CollectColumnRefs(child, refs); });
+	}
+
+	bool EnsureBindingAvailableFrom(LogicalOperator *op, const ColumnBinding &binding) {
+		if (!op) {
+			return false;
+		}
+		if (HasBinding(op->GetColumnBindings(), binding)) {
+			return true;
+		}
+		if (op->type != LogicalOperatorType::LOGICAL_PROJECTION || op->children.empty()) {
+			return false;
+		}
+		if (!EnsureBindingAvailableFrom(op->children[0].get(), binding)) {
+			return false;
+		}
+		AddUniqueBinding(extra_projection_outputs[op], binding);
+		return true;
+	}
+
+	void MarkAggregateReferencedBindings(LogicalOperator *op) {
+		if (!op) {
+			return;
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && !op->children.empty()) {
+			auto &agg = op->Cast<LogicalAggregate>();
+			vector<ColumnBinding> refs;
+			for (const auto &group : agg.groups) {
+				CollectColumnRefs(*group, refs);
+			}
+			for (const auto &expr : agg.expressions) {
+				CollectColumnRefs(*expr, refs);
+				if (expr->type == ExpressionType::BOUND_AGGREGATE) {
+					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+					if (bound_agg.filter) {
+						CollectColumnRefs(*bound_agg.filter, refs);
+					}
+					if (bound_agg.order_bys) {
+						for (auto &order : bound_agg.order_bys->orders) {
+							CollectColumnRefs(*order.expression, refs);
+						}
+					}
+				}
+			}
+			auto *child = op->children[0].get();
+			const auto child_bindings = child->GetColumnBindings();
+			for (const auto &ref : refs) {
+				if (!HasBinding(child_bindings, ref)) {
+					EnsureBindingAvailableFrom(child, ref);
+				}
+			}
+		}
+		for (auto &child : op->children) {
+			MarkAggregateReferencedBindings(child.get());
+		}
 	}
 
 	//--------------------------------------------------------------------------
@@ -328,6 +412,44 @@ private:
 			values.push_back(quantile.val.ToSQLString());
 		}
 		return "[" + VecToSeparatedList(values) + "]";
+	}
+
+	static string ApproxQuantileArgument(const BoundAggregateExpression &aggregate) {
+		struct ApproxQuantileBindDataLayout {
+			void *vtable;
+			vector<float> quantiles;
+		};
+		const auto &bind_data = *reinterpret_cast<const ApproxQuantileBindDataLayout *>(aggregate.bind_info.get());
+		if (bind_data.quantiles.size() == 1) {
+			return Value::FLOAT(bind_data.quantiles[0]).ToSQLString();
+		}
+		vector<string> values;
+		for (const auto quantile : bind_data.quantiles) {
+			values.push_back(Value::FLOAT(quantile).ToSQLString());
+		}
+		return "[" + VecToSeparatedList(values) + "]";
+	}
+
+	static string ReservoirQuantileArguments(const BoundAggregateExpression &aggregate) {
+		struct ReservoirQuantileBindDataLayout {
+			void *vtable;
+			vector<double> quantiles;
+			idx_t sample_size;
+		};
+		const auto &bind_data = *reinterpret_cast<const ReservoirQuantileBindDataLayout *>(aggregate.bind_info.get());
+		vector<string> values;
+		for (const auto quantile : bind_data.quantiles) {
+			values.push_back(Value::DOUBLE(quantile).ToSQLString());
+		}
+		string quantile_arg = values.size() == 1 ? values[0] : "[" + VecToSeparatedList(values) + "]";
+		if (bind_data.sample_size == 8192) {
+			return quantile_arg;
+		}
+		return quantile_arg + ", " + to_string(bind_data.sample_size);
+	}
+
+	static bool IsQuantileAggregate(const string &agg_name) {
+		return agg_name == "quantile_cont" || agg_name == "quantile_disc";
 	}
 
 	static string StripTablePrefix(const string &cte_column_name) {
@@ -1418,6 +1540,19 @@ private:
 					column_map[MappableColumnBinding(new_cb)] = std::move(new_col);
 				}
 			}
+			auto extra_it = extra_projection_outputs.find(op.get());
+			if (extra_it != extra_projection_outputs.end()) {
+				for (const auto &binding : extra_it->second) {
+					const unique_ptr<ColStruct> &src = FindColumnBinding(binding, "projection extra output");
+					const string passthrough_name = src->ToUniqueColumnName();
+					if (seen_names.count(passthrough_name)) {
+						continue;
+					}
+					seen_names.insert(passthrough_name);
+					expressions.push_back(passthrough_name);
+					cte_column_names.push_back(passthrough_name);
+				}
+			}
 
 			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index);
 		}
@@ -1463,6 +1598,9 @@ private:
 			// GROUP BY columns
 			for (size_t i = 0; i < agg.groups.size(); ++i) {
 				const unique_ptr<Expression> &g = agg.groups[i];
+				if (!op->children.empty()) {
+					RegisterChildBindingFallbacks(*g, op->children[0]->GetColumnBindings());
+				}
 				if (g->type == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
 					auto it = column_map.find(MappableColumnBinding(bcr.binding));
@@ -1507,6 +1645,9 @@ private:
 				}
 				vector<string> child_exprs;
 				for (const unique_ptr<Expression> &c : ba.children) {
+					if (!op->children.empty()) {
+						RegisterChildBindingFallbacks(*c, op->children[0]->GetColumnBindings());
+					}
 					child_exprs.push_back(ExpressionToAliasedString(c));
 				}
 				// Join child expressions with commas
@@ -1523,9 +1664,12 @@ private:
 						}
 						agg_str << "'" << EscapeSingleQuotes(separator) << "'";
 					}
-				} else if ((agg_name == "quantile_cont" || agg_name == "quantile_disc") && child_exprs.size() == 1 &&
-				           ba.bind_info) {
+				} else if (IsQuantileAggregate(agg_name) && child_exprs.size() == 1 && ba.bind_info) {
 					agg_str << ", " << QuantileArgument(ba);
+				} else if (agg_name == "approx_quantile" && child_exprs.size() == 1 && ba.bind_info) {
+					agg_str << ", " << ApproxQuantileArgument(ba);
+				} else if (agg_name == "reservoir_quantile" && child_exprs.size() == 1 && ba.bind_info) {
+					agg_str << ", " << ReservoirQuantileArguments(ba);
 				}
 				// Preserve intra-aggregate ORDER BY — matters for LIST, STRING_AGG,
 				// and other order-sensitive aggregates. Drop it only for aggregates
@@ -1533,10 +1677,13 @@ private:
 				// rendering ORDER BY for those would change the plan for no reason.
 				if (ba.order_bys && !ba.order_bys->orders.empty() && agg_name != "sum" && agg_name != "count" &&
 				    agg_name != "count_star" && agg_name != "min" && agg_name != "max" && agg_name != "avg" &&
-				    agg_name != "quantile_cont" && agg_name != "quantile_disc") {
+				    !IsQuantileAggregate(agg_name)) {
 					agg_str << " ORDER BY ";
 					for (size_t oi = 0; oi < ba.order_bys->orders.size(); ++oi) {
 						const BoundOrderByNode &ob = ba.order_bys->orders[oi];
+						if (!op->children.empty()) {
+							RegisterChildBindingFallbacks(*ob.expression, op->children[0]->GetColumnBindings());
+						}
 						if (oi > 0)
 							agg_str << ", ";
 						agg_str << ExpressionToAliasedString(ob.expression);
@@ -1557,6 +1704,9 @@ private:
 				// with `COUNT(*) FILTER (WHERE x > 0)` round-trips to `count_star()`,
 				// silently producing a total row count instead of a conditional count.
 				if (ba.filter) {
+					if (!op->children.empty()) {
+						RegisterChildBindingFallbacks(*ba.filter, op->children[0]->GetColumnBindings());
+					}
 					agg_str << " FILTER (WHERE " << ExpressionToAliasedString(ba.filter) << ")";
 				}
 				string agg_alias = "aggregate_" + std::to_string(i);
@@ -2280,6 +2430,7 @@ public:
 
 	/// Entry point: walk the plan and return the AST root.
 	unique_ptr<AstNode> Build(unique_ptr<LogicalOperator> &plan) {
+		MarkAggregateReferencedBindings(plan.get());
 		return RecursiveTraversal(plan);
 	}
 };
