@@ -303,6 +303,16 @@ static bool HasUnorderedAggregateCall(const string &sql, const string &function_
 	return false;
 }
 
+static bool HasFunctionCall(const string &sql, const string &function_name) {
+	string lower_sql = LowerASCII(sql);
+	string needle = LowerASCII(function_name) + "(";
+	return lower_sql.find(needle) != string::npos;
+}
+
+static bool HasWindowFunctionCall(const string &sql, const string &function_name) {
+	return HasFunctionCall(sql, function_name) && ContainsNormalizedPhrase(sql, "over");
+}
+
 static bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 	if (HasUnorderedAggregateCall(sql, "string_agg")) {
 		reason = "unordered string_agg aggregate";
@@ -316,8 +326,26 @@ static bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 		reason = "unordered order-sensitive aggregate";
 		return true;
 	}
+	if (HasFunctionCall(sql, "random")) {
+		reason = "volatile random() expression";
+		return true;
+	}
 	if (ContainsNormalizedPhrase(sql, "row_number() over")) {
 		reason = "row_number over potentially tied ordering keys";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "rank() over")) {
+		reason = "rank over potentially tied ordering keys";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "dense_rank() over")) {
+		reason = "dense_rank over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "lag") || HasWindowFunctionCall(sql, "lead") ||
+	    HasWindowFunctionCall(sql, "first_value") || HasWindowFunctionCall(sql, "last_value") ||
+	    HasWindowFunctionCall(sql, "nth_value")) {
+		reason = "window function over potentially tied ordering keys";
 		return true;
 	}
 	if (ContainsNormalizedPhrase(sql, "limit") && ContainsNormalizedPhrase(sql, "order by")) {
@@ -326,6 +354,20 @@ static bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 	}
 	if (ContainsNormalizedPhrase(sql, "fetch first") && ContainsNormalizedPhrase(sql, "order by")) {
 		reason = "ORDER BY with FETCH FIRST may have tied boundary rows";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "fetch next") && ContainsNormalizedPhrase(sql, "order by")) {
+		reason = "ORDER BY with FETCH NEXT may have tied boundary rows";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "offset") && ContainsNormalizedPhrase(sql, "order by")) {
+		reason = "ORDER BY with OFFSET may have tied boundary rows";
+		return true;
+	}
+	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
+	    HasFunctionCall(sql, "stddev_samp") || HasFunctionCall(sql, "variance") ||
+	    HasFunctionCall(sql, "var_pop") || HasFunctionCall(sql, "var_samp")) {
+		reason = "strict floating aggregate equality may depend on evaluation order";
 		return true;
 	}
 	return false;

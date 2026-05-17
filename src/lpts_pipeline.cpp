@@ -42,6 +42,8 @@
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/function/lambda_functions.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -245,6 +247,57 @@ private:
 			}
 		});
 		return contains_column_ref;
+	}
+
+	bool TableFilterToSql(const TableFilter &filter, const string &column_name, string &result) const {
+		switch (filter.filter_type) {
+		case TableFilterType::DYNAMIC_FILTER:
+			return false;
+		case TableFilterType::OPTIONAL_FILTER: {
+			auto &optional_filter = filter.Cast<OptionalFilter>();
+			if (!optional_filter.child_filter) {
+				return false;
+			}
+			return TableFilterToSql(*optional_filter.child_filter, column_name, result);
+		}
+		case TableFilterType::CONJUNCTION_AND: {
+			auto &and_filter = filter.Cast<ConjunctionAndFilter>();
+			vector<string> children;
+			for (auto &child_filter : and_filter.child_filters) {
+				string child_sql;
+				if (TableFilterToSql(*child_filter, column_name, child_sql)) {
+					children.push_back(std::move(child_sql));
+				}
+			}
+			if (children.empty()) {
+				return false;
+			}
+			result = VecToSeparatedList(children, " AND ");
+			return true;
+		}
+		case TableFilterType::CONJUNCTION_OR: {
+			auto &or_filter = filter.Cast<ConjunctionOrFilter>();
+			vector<string> children;
+			for (auto &child_filter : or_filter.child_filters) {
+				string child_sql;
+				if (!TableFilterToSql(*child_filter, column_name, child_sql)) {
+					return false;
+				}
+				children.push_back(std::move(child_sql));
+			}
+			if (children.empty()) {
+				return false;
+			}
+			result = VecToSeparatedList(children, " OR ");
+			return true;
+		}
+		default: {
+			auto column_expr = make_uniq<BoundReferenceExpression>(column_name, LogicalType::INVALID, 0);
+			auto filter_expr = filter.ToExpression(*column_expr);
+			result = ExpressionToAliasedString(filter_expr);
+			return true;
+		}
+		}
 	}
 
 	static string QuantileArgument(const BoundAggregateExpression &aggregate) {
@@ -1193,21 +1246,10 @@ private:
 			}
 
 			// Pushdown table filters (rare, but present in some plans).
-			// FILTER_PUSHDOWN wraps pushed-down conditions in OptionalFilter, whose
-			// ToString() prepends "optional: ". Strip that prefix so the condition
-			// is valid SQL when embedded in a WHERE clause.
-			// JOIN_FILTER_PUSHDOWN attaches runtime-only dynamic filters whose
-			// ToString() starts with "Dynamic Filter" — skip those entirely since
-			// they are not valid SQL expressions.
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
-					string filter_str = entry.second->ToString(get.names[entry.first]);
-					static const string kOptionalPrefix = "optional: ";
-					if (filter_str.substr(0, kOptionalPrefix.size()) == kOptionalPrefix) {
-						filter_str = filter_str.substr(kOptionalPrefix.size());
-					}
-					static const string kDynamicFilterPrefix = "Dynamic Filter";
-					if (filter_str.substr(0, kDynamicFilterPrefix.size()) == kDynamicFilterPrefix) {
+					string filter_str;
+					if (!TableFilterToSql(*entry.second, get.names[entry.first], filter_str)) {
 						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
