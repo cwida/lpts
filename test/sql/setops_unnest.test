@@ -22,6 +22,16 @@ PRAGMA lpts_check('SELECT id, label FROM left_t EXCEPT SELECT id, label FROM rig
 true
 
 query I
+PRAGMA lpts_check('SELECT rowid FROM left_t WHERE rowid IN (SELECT rowid FROM left_t WHERE id = 1 LIMIT 1)');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT rowid, id, label FROM left_t WHERE rowid IN (SELECT rowid FROM left_t WHERE id = 1 LIMIT 1) ORDER BY rowid');
+----
+true
+
+query I
 PRAGMA lpts_check('SELECT id, label FROM left_t EXCEPT ALL SELECT id, label FROM right_t');
 ----
 true
