@@ -2538,6 +2538,17 @@ private:
 				sql += get.catalog + "." + get.schema + "." + get.table_name;
 			} else {
 				sql += get.table_name;
+				if (get.table_name.find('(') != string::npos && get.table_name != "(SELECT 1)" &&
+				    !get.column_names.empty() && get.table_name.find("ducklake_table_") == string::npos) {
+					idx_t alias_count = get.table_function_output_count == DConstants::INVALID_INDEX
+					                        ? get.column_names.size()
+					                        : get.table_function_output_count;
+					vector<string> table_function_columns;
+					for (idx_t i = 0; i < alias_count && i < get.column_names.size(); i++) {
+						table_function_columns.push_back(get.column_names[i]);
+					}
+					sql += " _tf(" + VecToSeparatedList(table_function_columns) + ")";
+				}
 			}
 			if (!get.table_filters.empty()) {
 				sql += " WHERE " + VecToSeparatedList(get.table_filters, " AND ");
@@ -3012,6 +3023,10 @@ private:
 			if (children_names.size() == 2) {
 				return make_uniq<UnionNode>(my_index, u.cte_column_names, children_names[0], children_names[1],
 				                            u.is_union_all);
+			}
+			if (children_names.size() == 1) {
+				return make_uniq<ProjectNode>(my_index, u.cte_column_names, children_names[0], children_column_lists[0],
+				                              0);
 			}
 			// N-ary UNION: chain as left-deep binary UNIONs
 			// (A UNION B UNION C) → UNION(UNION(A, B), C)

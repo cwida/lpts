@@ -177,3 +177,10 @@ query I
 PRAGMA lpts_check('SELECT user_id, count(*) FROM events GROUP BY user_id');
 ----
 true
+
+# --- lpts_check: original SQL may include a semicolon followed by a trailing comment ---
+
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY id; -- trailing SQLStorm comment');
+----
+true

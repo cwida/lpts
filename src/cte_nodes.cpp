@@ -304,7 +304,7 @@ string OrderNode::ToQuery() {
 
 string LimitNode::ToQuery() {
 	std::ostringstream limit_str_stream;
-	limit_str_stream << "SELECT * FROM " << child_cte_name;
+	limit_str_stream << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!limit_str.empty()) {
 		limit_str_stream << " LIMIT ";
 		if (limit_needs_child_scalar) {
@@ -326,7 +326,7 @@ string LimitNode::ToQuery() {
 
 string TopNNode::ToQuery() {
 	std::ostringstream ss;
-	ss << "SELECT * FROM " << child_cte_name;
+	ss << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!order_items.empty()) {
 		ss << " ORDER BY " << VecToSeparatedList(order_items);
 	}
@@ -341,7 +341,7 @@ string TopNNode::ToQuery() {
 
 string DistinctNode::ToQuery() {
 	std::ostringstream distinct_str;
-	distinct_str << "SELECT DISTINCT * FROM " << child_cte_name;
+	distinct_str << "SELECT DISTINCT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	return distinct_str.str();
 }
 

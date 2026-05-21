@@ -235,3 +235,9 @@ query I
 PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 4 AND n IN (SELECT n FROM recursive_allowed)) SELECT n FROM cnt ORDER BY n');
 ----
 true
+
+# Recursive inline VALUES scans need the same table-function column alias as flat CTE scans.
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < (SELECT max(c0) FROM (VALUES (3)) v(c0))) SELECT n FROM cnt ORDER BY n');
+----
+true
