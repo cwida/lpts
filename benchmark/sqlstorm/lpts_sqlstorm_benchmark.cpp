@@ -40,15 +40,24 @@ enum class QueryState : uint8_t {
 	NOT_IMPLEMENTED = 4,
 	TIMEOUT = 5,
 	CRASH = 6,
-	NONDETERMINISTIC = 7
+	NONDETERMINISTIC = 7,
+	DUCKDB_TIMEOUT = 8,
+	LPTS_TIMEOUT = 9
+};
+
+enum class WorkerMessage : uint8_t {
+	PHASE = 1,
+	RESULT = 2
 };
 
 struct QueryResultSummary {
 	double duckdb_time_ms = 0;
+	double lpts_exec_time_ms = 0;
 	double lpts_check_time_ms = 0;
 	QueryState state = QueryState::SUCCESS;
 	bool strict_check_ran = false;
 	bool strict_match = false;
+	bool perf_comparison_ran = false;
 	string diagnostic_state;
 	string diagnostic_reason;
 	string phase;
@@ -66,14 +75,22 @@ struct PassStats {
 	int lpts_error = 0;
 	int not_implemented = 0;
 	int timed_out = 0;
+	int duckdb_timeout = 0;
+	int lpts_timeout = 0;
 	int crashed = 0;
 	int nondeterministic = 0;
+	int perf_faster = 0;
+	int perf_similar = 0;
+	int perf_slower = 0;
 	double total_duckdb_success_ms = 0;
+	double total_lpts_exec_success_ms = 0;
 	double total_lpts_check_success_ms = 0;
 	std::map<string, int> error_counts;
 	std::map<string, vector<string>> error_queries;
 	vector<string> incorrect_queries;
 	vector<string> timeout_queries;
+	vector<string> duckdb_timeout_queries;
+	vector<string> lpts_timeout_queries;
 	vector<string> crash_queries;
 	vector<string> nondeterministic_queries;
 };
@@ -219,6 +236,10 @@ static string StateToString(QueryState state) {
 		return "crash";
 	case QueryState::NONDETERMINISTIC:
 		return "nondeterministic";
+	case QueryState::DUCKDB_TIMEOUT:
+		return "duckdb_timeout";
+	case QueryState::LPTS_TIMEOUT:
+		return "lpts_timeout";
 	default:
 		return "unknown";
 	}
@@ -453,6 +474,52 @@ static bool ReadAllBytes(int fd, void *buf, size_t n) {
 	return true;
 }
 
+static bool WriteString(int fd, const string &value) {
+	uint32_t len = static_cast<uint32_t>(value.size());
+	if (!WriteAllBytes(fd, &len, sizeof(len))) {
+		return false;
+	}
+	if (len > 0 && !WriteAllBytes(fd, value.data(), len)) {
+		return false;
+	}
+	return true;
+}
+
+static bool ReadString(int fd, string &value) {
+	uint32_t len = 0;
+	if (!ReadAllBytes(fd, &len, sizeof(len))) {
+		return false;
+	}
+	value.clear();
+	if (len > 0) {
+		value.resize(len);
+		if (!ReadAllBytes(fd, &value[0], len)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool WritePhase(int fd, const string &phase) {
+	uint8_t type = static_cast<uint8_t>(WorkerMessage::PHASE);
+	return WriteAllBytes(fd, &type, sizeof(type)) && WriteString(fd, phase);
+}
+
+static bool WriteSummary(int fd, const QueryResultSummary &summary) {
+	uint8_t type = static_cast<uint8_t>(WorkerMessage::RESULT);
+	uint8_t state = static_cast<uint8_t>(summary.state);
+	return WriteAllBytes(fd, &type, sizeof(type)) &&
+	       WriteAllBytes(fd, &summary.duckdb_time_ms, sizeof(summary.duckdb_time_ms)) &&
+	       WriteAllBytes(fd, &summary.lpts_exec_time_ms, sizeof(summary.lpts_exec_time_ms)) &&
+	       WriteAllBytes(fd, &summary.lpts_check_time_ms, sizeof(summary.lpts_check_time_ms)) &&
+	       WriteAllBytes(fd, &state, sizeof(state)) &&
+	       WriteAllBytes(fd, &summary.strict_check_ran, sizeof(summary.strict_check_ran)) &&
+	       WriteAllBytes(fd, &summary.strict_match, sizeof(summary.strict_match)) &&
+	       WriteAllBytes(fd, &summary.perf_comparison_ran, sizeof(summary.perf_comparison_ran)) &&
+	       WriteString(fd, summary.diagnostic_state) && WriteString(fd, summary.diagnostic_reason) &&
+	       WriteString(fd, summary.phase) && WriteString(fd, summary.error);
+}
+
 static void LoadExtension(Connection &con, const string &name) {
 	auto load_result = con.Query("LOAD " + name);
 	if (!load_result->HasError()) {
@@ -495,10 +562,15 @@ static void ConfigureConnection(Connection &con) {
 			if (!ReadAllBytes(read_fd, &sql[0], sql_len)) {
 				break;
 			}
+			bool compare_perf = false;
+			if (!ReadAllBytes(read_fd, &compare_perf, sizeof(compare_perf))) {
+				break;
+			}
 
 			QueryResultSummary summary;
 			string error;
 
+			WritePhase(write_fd, "duckdb");
 			auto duckdb_start = std::chrono::steady_clock::now();
 			unique_ptr<MaterializedQueryResult> duckdb_result;
 			try {
@@ -521,87 +593,128 @@ static void ConfigureConnection(Connection &con) {
 				summary.phase = "duckdb";
 				summary.state = IsCrashError(summary.error) ? QueryState::CRASH : QueryState::DUCKDB_ERROR;
 			} else {
+				if (compare_perf) {
+					string lpts_query_sql = "SELECT sql FROM lpts_query('" + EscapeSQLLiteral(sql) + "')";
+					WritePhase(write_fd, "lpts_generate");
+					unique_ptr<MaterializedQueryResult> lpts_query_result;
+					try {
+						lpts_query_result = con.Query(lpts_query_sql);
+					} catch (std::exception &ex) {
+						error = ex.what();
+					} catch (...) {
+						error = "unknown LPTS exception";
+					}
+
+					if (error.empty() && lpts_query_result && lpts_query_result->HasError()) {
+						error = lpts_query_result->GetError();
+					}
+					if (error.empty() && (!lpts_query_result || lpts_query_result->RowCount() == 0)) {
+						error = "lpts_query returned no rows";
+					}
+					if (!error.empty()) {
+						summary.error = TrimError(error);
+						summary.phase = "lpts_generate";
+						if (IsCrashError(summary.error)) {
+							summary.state = QueryState::CRASH;
+						} else if (IsNotImplementedError(summary.error)) {
+							summary.state = QueryState::NOT_IMPLEMENTED;
+						} else {
+							summary.state = QueryState::LPTS_ERROR;
+						}
+					} else {
+						string lpts_sql = lpts_query_result->GetValue(0, 0).ToString();
+						WritePhase(write_fd, "lpts_exec");
+						auto lpts_exec_start = std::chrono::steady_clock::now();
+						unique_ptr<MaterializedQueryResult> lpts_exec_result;
+						try {
+							lpts_exec_result = con.Query(lpts_sql);
+						} catch (std::exception &ex) {
+							error = ex.what();
+						} catch (...) {
+							error = "unknown LPTS execution exception";
+						}
+						auto lpts_exec_end = std::chrono::steady_clock::now();
+						summary.lpts_exec_time_ms =
+						    std::chrono::duration<double, std::milli>(lpts_exec_end - lpts_exec_start).count();
+						summary.perf_comparison_ran = error.empty();
+
+						if (error.empty() && lpts_exec_result && lpts_exec_result->HasError()) {
+							error = lpts_exec_result->GetError();
+							summary.perf_comparison_ran = false;
+						}
+						if (!error.empty()) {
+							summary.error = TrimError(error);
+							summary.phase = "lpts_exec";
+							if (IsCrashError(summary.error)) {
+								summary.state = QueryState::CRASH;
+							} else if (IsNotImplementedError(summary.error)) {
+								summary.state = QueryState::NOT_IMPLEMENTED;
+							} else {
+								summary.state = QueryState::LPTS_ERROR;
+							}
+						}
+					}
+				}
+
 				string check_sql = "PRAGMA lpts_check('" + EscapeSQLLiteral(sql) + "')";
 				auto lpts_start = std::chrono::steady_clock::now();
 				unique_ptr<MaterializedQueryResult> check_result;
-				try {
-					check_result = con.Query(check_sql);
-				} catch (std::exception &ex) {
-					error = ex.what();
-				} catch (...) {
-					error = "unknown LPTS exception";
-				}
-				auto lpts_end = std::chrono::steady_clock::now();
-				summary.lpts_check_time_ms =
-				    std::chrono::duration<double, std::milli>(lpts_end - lpts_start).count();
-
-				if (error.empty() && check_result && check_result->HasError()) {
-					error = check_result->GetError();
-				}
-				if (!error.empty()) {
-					summary.error = TrimError(error);
-					summary.phase = "lpts_check";
-					if (IsCrashError(summary.error)) {
-						summary.state = QueryState::CRASH;
-					} else if (IsNotImplementedError(summary.error)) {
-						summary.state = QueryState::NOT_IMPLEMENTED;
-					} else {
-						summary.state = QueryState::LPTS_ERROR;
+				if (summary.state == QueryState::SUCCESS) {
+					WritePhase(write_fd, "lpts_check");
+					try {
+						check_result = con.Query(check_sql);
+					} catch (std::exception &ex) {
+						error = ex.what();
+					} catch (...) {
+						error = "unknown LPTS exception";
 					}
-				} else if (!check_result || check_result->RowCount() == 0) {
-					summary.error = "lpts_check returned no rows";
-					summary.phase = "lpts_check";
-					summary.state = QueryState::LPTS_ERROR;
-				} else {
-					auto match_value = check_result->GetValue(0, 0);
-					summary.strict_check_ran = true;
-					summary.strict_match = match_value.ToString() == "true";
-					if (summary.strict_match) {
-						summary.state = QueryState::SUCCESS;
-						summary.diagnostic_state = "strict_match";
-					} else {
+					auto lpts_end = std::chrono::steady_clock::now();
+					summary.lpts_check_time_ms =
+					    std::chrono::duration<double, std::milli>(lpts_end - lpts_start).count();
+
+					if (error.empty() && check_result && check_result->HasError()) {
+						error = check_result->GetError();
+					}
+					if (!error.empty()) {
+						summary.error = TrimError(error);
 						summary.phase = "lpts_check";
-						string diagnostic_reason;
-						if (IsLikelyNondeterministicSQL(sql, diagnostic_reason)) {
-							summary.state = QueryState::NONDETERMINISTIC;
-							summary.diagnostic_state = "nondeterministic";
-							summary.diagnostic_reason = diagnostic_reason;
-							summary.error = diagnostic_reason;
+						if (IsCrashError(summary.error)) {
+							summary.state = QueryState::CRASH;
+						} else if (IsNotImplementedError(summary.error)) {
+							summary.state = QueryState::NOT_IMPLEMENTED;
 						} else {
-							summary.state = QueryState::INCORRECT;
-							summary.diagnostic_state = "strict_mismatch";
-							summary.error = "lpts_check returned false";
+							summary.state = QueryState::LPTS_ERROR;
+						}
+					} else if (!check_result || check_result->RowCount() == 0) {
+						summary.error = "lpts_check returned no rows";
+						summary.phase = "lpts_check";
+						summary.state = QueryState::LPTS_ERROR;
+					} else {
+						auto match_value = check_result->GetValue(0, 0);
+						summary.strict_check_ran = true;
+						summary.strict_match = match_value.ToString() == "true";
+						if (summary.strict_match) {
+							summary.state = QueryState::SUCCESS;
+							summary.diagnostic_state = "strict_match";
+						} else {
+							summary.phase = "lpts_check";
+							string diagnostic_reason;
+							if (IsLikelyNondeterministicSQL(sql, diagnostic_reason)) {
+								summary.state = QueryState::NONDETERMINISTIC;
+								summary.diagnostic_state = "nondeterministic";
+								summary.diagnostic_reason = diagnostic_reason;
+								summary.error = diagnostic_reason;
+							} else {
+								summary.state = QueryState::INCORRECT;
+								summary.diagnostic_state = "strict_mismatch";
+								summary.error = "lpts_check returned false";
+							}
 						}
 					}
 				}
 			}
 
-			uint8_t state = static_cast<uint8_t>(summary.state);
-			WriteAllBytes(write_fd, &summary.duckdb_time_ms, sizeof(summary.duckdb_time_ms));
-			WriteAllBytes(write_fd, &summary.lpts_check_time_ms, sizeof(summary.lpts_check_time_ms));
-			WriteAllBytes(write_fd, &state, sizeof(state));
-			WriteAllBytes(write_fd, &summary.strict_check_ran, sizeof(summary.strict_check_ran));
-			WriteAllBytes(write_fd, &summary.strict_match, sizeof(summary.strict_match));
-			uint32_t diagnostic_state_len = static_cast<uint32_t>(summary.diagnostic_state.size());
-			WriteAllBytes(write_fd, &diagnostic_state_len, sizeof(diagnostic_state_len));
-			if (diagnostic_state_len > 0) {
-				WriteAllBytes(write_fd, summary.diagnostic_state.data(), diagnostic_state_len);
-			}
-			uint32_t diagnostic_reason_len = static_cast<uint32_t>(summary.diagnostic_reason.size());
-			WriteAllBytes(write_fd, &diagnostic_reason_len, sizeof(diagnostic_reason_len));
-			if (diagnostic_reason_len > 0) {
-				WriteAllBytes(write_fd, summary.diagnostic_reason.data(), diagnostic_reason_len);
-			}
-			uint32_t phase_len = static_cast<uint32_t>(summary.phase.size());
-			WriteAllBytes(write_fd, &phase_len, sizeof(phase_len));
-			if (phase_len > 0) {
-				WriteAllBytes(write_fd, summary.phase.data(), phase_len);
-			}
-			uint32_t error_len = static_cast<uint32_t>(summary.error.size());
-			WriteAllBytes(write_fd, &error_len, sizeof(error_len));
-			if (error_len > 0) {
-				WriteAllBytes(write_fd, summary.error.data(), error_len);
-			}
+			WriteSummary(write_fd, summary);
 
 			if (summary.state == QueryState::CRASH) {
 				_exit(1);
@@ -698,15 +811,17 @@ struct ForkWorker {
 		return static_cast<size_t>(rss) * static_cast<size_t>(sysconf(_SC_PAGESIZE));
 	}
 
-	SubmitResult Submit(const string &sql, double timeout_s) {
+	SubmitResult Submit(const string &sql, double timeout_s, bool compare_perf) {
 		result = QueryResultSummary();
 		if (child_pid <= 0) {
 			return SR_CHILD_DIED;
 		}
+		string active_phase = "duckdb";
 
 		uint32_t sql_len = static_cast<uint32_t>(sql.size());
 		if (!WriteAllBytes(to_child_fd, &sql_len, sizeof(sql_len)) ||
-		    !WriteAllBytes(to_child_fd, sql.data(), sql_len)) {
+		    !WriteAllBytes(to_child_fd, sql.data(), sql_len) ||
+		    !WriteAllBytes(to_child_fd, &compare_perf, sizeof(compare_perf))) {
 			int status;
 			waitpid(child_pid, &status, 0);
 			child_pid = -1;
@@ -725,7 +840,8 @@ struct ForkWorker {
 				kill(child_pid, SIGKILL);
 				waitpid(child_pid, nullptr, 0);
 				child_pid = -1;
-				result.state = QueryState::TIMEOUT;
+				result.phase = active_phase;
+				result.state = active_phase == "duckdb" ? QueryState::DUCKDB_TIMEOUT : QueryState::LPTS_TIMEOUT;
 				result.error = "timeout";
 				return SR_TIMEOUT;
 			}
@@ -741,8 +857,30 @@ struct ForkWorker {
 			int ret = poll(&pfd, 1, poll_ms);
 
 			if (ret > 0 && (pfd.revents & POLLIN)) {
+				uint8_t message_type = 0;
+				if (!ReadAllBytes(from_child_fd, &message_type, sizeof(message_type))) {
+					int status;
+					waitpid(child_pid, &status, 0);
+					child_pid = -1;
+					result.state = QueryState::CRASH;
+					result.error = "child process died (read failed)";
+					return SR_CHILD_DIED;
+				}
+				if (message_type == static_cast<uint8_t>(WorkerMessage::PHASE)) {
+					if (!ReadString(from_child_fd, active_phase)) {
+						return SR_CHILD_DIED;
+					}
+					continue;
+				}
+				if (message_type != static_cast<uint8_t>(WorkerMessage::RESULT)) {
+					result.state = QueryState::CRASH;
+					result.error = "unknown child worker message";
+					return SR_CHILD_DIED;
+				}
+
 				uint8_t state = 0;
 				if (!ReadAllBytes(from_child_fd, &result.duckdb_time_ms, sizeof(result.duckdb_time_ms)) ||
+				    !ReadAllBytes(from_child_fd, &result.lpts_exec_time_ms, sizeof(result.lpts_exec_time_ms)) ||
 				    !ReadAllBytes(from_child_fd, &result.lpts_check_time_ms, sizeof(result.lpts_check_time_ms)) ||
 				    !ReadAllBytes(from_child_fd, &state, sizeof(state))) {
 					int status;
@@ -755,49 +893,22 @@ struct ForkWorker {
 				result.state = static_cast<QueryState>(state);
 
 				if (!ReadAllBytes(from_child_fd, &result.strict_check_ran, sizeof(result.strict_check_ran)) ||
-				    !ReadAllBytes(from_child_fd, &result.strict_match, sizeof(result.strict_match))) {
+				    !ReadAllBytes(from_child_fd, &result.strict_match, sizeof(result.strict_match)) ||
+				    !ReadAllBytes(from_child_fd, &result.perf_comparison_ran,
+				                  sizeof(result.perf_comparison_ran))) {
 					return SR_CHILD_DIED;
 				}
-				uint32_t diagnostic_state_len = 0;
-				if (!ReadAllBytes(from_child_fd, &diagnostic_state_len, sizeof(diagnostic_state_len))) {
+				if (!ReadString(from_child_fd, result.diagnostic_state)) {
 					return SR_CHILD_DIED;
 				}
-				if (diagnostic_state_len > 0) {
-					result.diagnostic_state.resize(diagnostic_state_len);
-					if (!ReadAllBytes(from_child_fd, &result.diagnostic_state[0], diagnostic_state_len)) {
-						return SR_CHILD_DIED;
-					}
-				}
-				uint32_t diagnostic_reason_len = 0;
-				if (!ReadAllBytes(from_child_fd, &diagnostic_reason_len, sizeof(diagnostic_reason_len))) {
+				if (!ReadString(from_child_fd, result.diagnostic_reason)) {
 					return SR_CHILD_DIED;
 				}
-				if (diagnostic_reason_len > 0) {
-					result.diagnostic_reason.resize(diagnostic_reason_len);
-					if (!ReadAllBytes(from_child_fd, &result.diagnostic_reason[0], diagnostic_reason_len)) {
-						return SR_CHILD_DIED;
-					}
-				}
-
-				uint32_t phase_len = 0;
-				if (!ReadAllBytes(from_child_fd, &phase_len, sizeof(phase_len))) {
+				if (!ReadString(from_child_fd, result.phase)) {
 					return SR_CHILD_DIED;
 				}
-				if (phase_len > 0) {
-					result.phase.resize(phase_len);
-					if (!ReadAllBytes(from_child_fd, &result.phase[0], phase_len)) {
-						return SR_CHILD_DIED;
-					}
-				}
-				uint32_t error_len = 0;
-				if (!ReadAllBytes(from_child_fd, &error_len, sizeof(error_len))) {
+				if (!ReadString(from_child_fd, result.error)) {
 					return SR_CHILD_DIED;
-				}
-				if (error_len > 0) {
-					result.error.resize(error_len);
-					if (!ReadAllBytes(from_child_fd, &result.error[0], error_len)) {
-						return SR_CHILD_DIED;
-					}
 				}
 
 				if (result.state == QueryState::CRASH) {
@@ -832,7 +943,8 @@ struct ForkWorker {
 				kill(child_pid, SIGKILL);
 				waitpid(child_pid, nullptr, 0);
 				child_pid = -1;
-				result.state = QueryState::TIMEOUT;
+				result.phase = active_phase;
+				result.state = active_phase == "duckdb" ? QueryState::DUCKDB_TIMEOUT : QueryState::LPTS_TIMEOUT;
 				result.error = "memory limit exceeded (RSS > 25GB)";
 				return SR_TIMEOUT;
 			}
@@ -844,9 +956,9 @@ struct ForkWorker {
 	}
 };
 
-static QueryResultSummary RunQuery(ForkWorker &worker, const string &sql, double timeout_s) {
+static QueryResultSummary RunQuery(ForkWorker &worker, const string &sql, double timeout_s, bool compare_perf) {
 	auto start = std::chrono::steady_clock::now();
-	auto submit_result = worker.Submit(sql, timeout_s);
+	auto submit_result = worker.Submit(sql, timeout_s, compare_perf);
 	auto end = std::chrono::steady_clock::now();
 
 	if (submit_result == ForkWorker::SR_OK) {
@@ -855,7 +967,9 @@ static QueryResultSummary RunQuery(ForkWorker &worker, const string &sql, double
 
 	QueryResultSummary summary = worker.result;
 	if (submit_result == ForkWorker::SR_TIMEOUT) {
-		summary.state = QueryState::TIMEOUT;
+		if (summary.state != QueryState::DUCKDB_TIMEOUT && summary.state != QueryState::LPTS_TIMEOUT) {
+			summary.state = QueryState::TIMEOUT;
+		}
 	} else {
 		summary.state = QueryState::CRASH;
 		if (summary.error.empty()) {
@@ -868,12 +982,49 @@ static QueryResultSummary RunQuery(ForkWorker &worker, const string &sql, double
 	return summary;
 }
 
+static bool IsPerfComparable(const QueryResultSummary &summary) {
+	return summary.state == QueryState::SUCCESS && summary.perf_comparison_ran && summary.duckdb_time_ms > 0 &&
+	       summary.lpts_exec_time_ms > 0;
+}
+
+static double PerfRatio(const QueryResultSummary &summary) {
+	if (!IsPerfComparable(summary)) {
+		return 0;
+	}
+	return summary.lpts_exec_time_ms / summary.duckdb_time_ms;
+}
+
+static string PerfBucket(const QueryResultSummary &summary) {
+	if (!IsPerfComparable(summary)) {
+		return "";
+	}
+	double ratio = PerfRatio(summary);
+	if (ratio < 0.80) {
+		return "faster";
+	}
+	if (ratio > 1.20) {
+		return "slower";
+	}
+	return "similar";
+}
+
 static void TrackStats(PassStats &stats, const string &name, const QueryResultSummary &summary) {
 	switch (summary.state) {
 	case QueryState::SUCCESS:
 		stats.success++;
 		stats.total_duckdb_success_ms += summary.duckdb_time_ms;
+		stats.total_lpts_exec_success_ms += summary.lpts_exec_time_ms;
 		stats.total_lpts_check_success_ms += summary.lpts_check_time_ms;
+		if (IsPerfComparable(summary)) {
+			auto bucket = PerfBucket(summary);
+			if (bucket == "faster") {
+				stats.perf_faster++;
+			} else if (bucket == "slower") {
+				stats.perf_slower++;
+			} else {
+				stats.perf_similar++;
+			}
+		}
 		break;
 	case QueryState::INCORRECT:
 		stats.incorrect++;
@@ -891,6 +1042,14 @@ static void TrackStats(PassStats &stats, const string &name, const QueryResultSu
 	case QueryState::TIMEOUT:
 		stats.timed_out++;
 		stats.timeout_queries.push_back(name);
+		break;
+	case QueryState::DUCKDB_TIMEOUT:
+		stats.duckdb_timeout++;
+		stats.duckdb_timeout_queries.push_back(name);
+		break;
+	case QueryState::LPTS_TIMEOUT:
+		stats.lpts_timeout++;
+		stats.lpts_timeout_queries.push_back(name);
 		break;
 	case QueryState::CRASH:
 		stats.crashed++;
@@ -923,7 +1082,8 @@ static string FormatQueryList(const vector<string> &names, size_t max_show = 20)
 	return out;
 }
 
-static void PrintStats(const PassStats &stats, int total) {
+static void PrintStats(const PassStats &stats, int total, bool compare_perf) {
+	int total_timeout = stats.timed_out + stats.duckdb_timeout + stats.lpts_timeout;
 	Log("========================================");
 	Log("=== LPTS SQLStorm TPC-H RESULTS ===");
 	Log("========================================");
@@ -939,13 +1099,29 @@ static void PrintStats(const PassStats &stats, int total) {
 	    FormatNumber(100.0 * stats.lpts_error / total) + "%)");
 	Log("  Not implemented: " + std::to_string(stats.not_implemented) + " (" +
 	    FormatNumber(100.0 * stats.not_implemented / total) + "%)");
-	Log("  Timeout:      " + std::to_string(stats.timed_out) + " (" +
-	    FormatNumber(100.0 * stats.timed_out / total) + "%)");
+	Log("  Timeout:      " + std::to_string(total_timeout) + " (" + FormatNumber(100.0 * total_timeout / total) +
+	    "%)");
+	if (stats.duckdb_timeout > 0 || stats.lpts_timeout > 0) {
+		Log("  DuckDB timeout: " + std::to_string(stats.duckdb_timeout) + " (" +
+		    FormatNumber(100.0 * stats.duckdb_timeout / total) + "%)");
+		Log("  LPTS timeout:   " + std::to_string(stats.lpts_timeout) + " (" +
+		    FormatNumber(100.0 * stats.lpts_timeout / total) + "%)");
+	}
 	Log("  Crash:        " + std::to_string(stats.crashed) + " (" +
 	    FormatNumber(100.0 * stats.crashed / total) + "%)");
 	if (stats.success > 0) {
 		Log("  DuckDB time (successful):     " + FormatNumber(stats.total_duckdb_success_ms) + " ms");
 		Log("  lpts_check time (successful): " + FormatNumber(stats.total_lpts_check_success_ms) + " ms");
+	}
+	if (compare_perf) {
+		int comparable = stats.perf_faster + stats.perf_similar + stats.perf_slower;
+		Log("=== Performance Comparison ===");
+		Log("  Comparable:        " + std::to_string(comparable));
+		Log("  LPTS faster:       " + std::to_string(stats.perf_faster));
+		Log("  Similar (+/-20%):  " + std::to_string(stats.perf_similar));
+		Log("  LPTS slower:       " + std::to_string(stats.perf_slower));
+		Log("  DuckDB exec time:  " + FormatNumber(stats.total_duckdb_success_ms) + " ms");
+		Log("  LPTS exec time:    " + FormatNumber(stats.total_lpts_exec_success_ms) + " ms");
 	}
 	if (!stats.incorrect_queries.empty()) {
 		Log("=== Incorrect queries (" + std::to_string(stats.incorrect_queries.size()) + ") ===");
@@ -958,6 +1134,14 @@ static void PrintStats(const PassStats &stats, int total) {
 	if (!stats.timeout_queries.empty()) {
 		Log("=== Timeouts (" + std::to_string(stats.timeout_queries.size()) + ") ===");
 		Log("  queries: " + FormatQueryList(stats.timeout_queries));
+	}
+	if (!stats.duckdb_timeout_queries.empty()) {
+		Log("=== DuckDB timeouts (" + std::to_string(stats.duckdb_timeout_queries.size()) + ") ===");
+		Log("  queries: " + FormatQueryList(stats.duckdb_timeout_queries));
+	}
+	if (!stats.lpts_timeout_queries.empty()) {
+		Log("=== LPTS timeouts (" + std::to_string(stats.lpts_timeout_queries.size()) + ") ===");
+		Log("  queries: " + FormatQueryList(stats.lpts_timeout_queries));
 	}
 	if (!stats.crash_queries.empty()) {
 		Log("=== Crashes (" + std::to_string(stats.crash_queries.size()) + ") ===");
@@ -985,29 +1169,40 @@ static void PrintStats(const PassStats &stats, int total) {
 }
 
 static bool WriteCSV(const string &out_csv, const vector<string> &query_files,
-                     const vector<QueryResultSummary> &summaries) {
+                     const vector<QueryResultSummary> &summaries, bool compare_perf) {
 	std::ofstream out(out_csv);
 	if (!out.is_open()) {
 		Log("ERROR: Cannot open CSV for writing: " + out_csv);
 		return false;
 	}
-	out << "query_index,query,duckdb_time_ms,lpts_check_time_ms,state,strict_match,diagnostic_state,"
-	       "diagnostic_reason,phase,error\n";
+	out << "query_index,query,duckdb_time_ms,lpts_check_time_ms";
+	if (compare_perf) {
+		out << ",lpts_exec_time_ms,perf_ratio,perf_bucket";
+	}
+	out << ",state,strict_match,diagnostic_state,diagnostic_reason,phase,error\n";
 	for (size_t i = 0; i < query_files.size() && i < summaries.size(); ++i) {
 		const auto &summary = summaries[i];
 		string strict_match =
 		    summary.strict_check_ran ? (summary.strict_match ? "true" : "false") : string();
 		out << (i + 1) << "," << EscapeCSV(QueryName(query_files[i])) << "," << std::fixed << std::setprecision(3)
-		    << summary.duckdb_time_ms << "," << summary.lpts_check_time_ms << ","
-		    << StateToString(summary.state) << "," << strict_match << "," << EscapeCSV(summary.diagnostic_state)
-		    << "," << EscapeCSV(summary.diagnostic_reason) << "," << EscapeCSV(summary.phase) << ","
-		    << EscapeCSV(summary.error) << "\n";
+		    << summary.duckdb_time_ms << "," << summary.lpts_check_time_ms;
+		if (compare_perf) {
+			out << "," << summary.lpts_exec_time_ms << ",";
+			if (IsPerfComparable(summary)) {
+				out << std::fixed << std::setprecision(5) << PerfRatio(summary);
+			}
+			out << "," << PerfBucket(summary);
+		}
+		out << "," << StateToString(summary.state) << "," << strict_match << ","
+		    << EscapeCSV(summary.diagnostic_state) << "," << EscapeCSV(summary.diagnostic_reason) << ","
+		    << EscapeCSV(summary.phase) << "," << EscapeCSV(summary.error) << "\n";
 	}
 	Log("CSV written to: " + out_csv);
 	return true;
 }
 
-int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, double timeout_s, double tpch_sf) {
+int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, double timeout_s, double tpch_sf,
+                         bool compare_perf) {
 	try {
 		string sf_str = FormatSF(tpch_sf);
 		string qdir = queries_dir.empty() ? FindQueriesDir() : queries_dir;
@@ -1032,6 +1227,9 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 		Log("Found " + std::to_string(query_files.size()) + " queries");
 		Log("TPC-H scale factor: " + sf_str);
 		Log("Timeout: " + FormatNumber(timeout_s) + "s");
+		if (compare_perf) {
+			Log("Performance comparison: enabled");
+		}
 
 		{
 			DuckDB setup_db(db_path);
@@ -1077,10 +1275,11 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 				summary.phase = "duckdb";
 				summary.error = "empty query file";
 			} else {
-				summary = RunQuery(worker, sql, timeout_s);
+				summary = RunQuery(worker, sql, timeout_s, compare_perf);
 			}
 
-			if (summary.state == QueryState::TIMEOUT || summary.state == QueryState::CRASH) {
+			if (summary.state == QueryState::TIMEOUT || summary.state == QueryState::DUCKDB_TIMEOUT ||
+			    summary.state == QueryState::LPTS_TIMEOUT || summary.state == QueryState::CRASH) {
 				worker.Stop();
 			}
 
@@ -1094,13 +1293,14 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 				    " duckdb_error=" + std::to_string(stats.duckdb_error) +
 				    " lpts_error=" + std::to_string(stats.lpts_error) +
 				    " not_implemented=" + std::to_string(stats.not_implemented) + " timeout=" +
-				    std::to_string(stats.timed_out) + " crash=" + std::to_string(stats.crashed));
+				    std::to_string(stats.timed_out + stats.duckdb_timeout + stats.lpts_timeout) + " crash=" +
+				    std::to_string(stats.crashed));
 			}
 		}
 
 		worker.Stop();
-		PrintStats(stats, total);
-		if (!WriteCSV(csv_path, query_files, summaries)) {
+		PrintStats(stats, total, compare_perf);
+		if (!WriteCSV(csv_path, query_files, summaries, compare_perf)) {
 			return 1;
 		}
 		return 0;
@@ -1120,6 +1320,7 @@ static void PrintUsage() {
 	          << "  --out <csv>        Output CSV path (default: benchmark/sqlstorm/lpts_sqlstorm_tpch_sf*.csv)\n"
 	          << "  --timeout <sec>    Per-query timeout in seconds (default: 10)\n"
 	          << "  --tpch_sf <float>  TPC-H scale factor (default: 1.0)\n"
+	          << "  --compare_perf     Compare DuckDB execution against generated LPTS SQL execution\n"
 	          << "  -h, --help         Show this help message\n";
 }
 
@@ -1130,6 +1331,7 @@ int main(int argc, char **argv) {
 	std::string out_csv;
 	double timeout_s = 10.0;
 	double tpch_sf = 1.0;
+	bool compare_perf = false;
 
 	for (int i = 1; i < argc; ++i) {
 		std::string arg = argv[i];
@@ -1144,6 +1346,8 @@ int main(int argc, char **argv) {
 			timeout_s = std::stod(argv[++i]);
 		} else if (arg == "--tpch_sf" && i + 1 < argc) {
 			tpch_sf = std::stod(argv[++i]);
+		} else if (arg == "--compare_perf") {
+			compare_perf = true;
 		} else {
 			std::cerr << "Unknown option: " << arg << "\n";
 			PrintUsage();
@@ -1151,5 +1355,5 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, timeout_s, tpch_sf);
+	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, timeout_s, tpch_sf, compare_perf);
 }
