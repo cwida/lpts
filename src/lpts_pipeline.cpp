@@ -292,6 +292,29 @@ private:
 		}
 	}
 
+	void MarkProjectionReferencedBindings(LogicalOperator *op) {
+		if (!op) {
+			return;
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_PROJECTION && !op->children.empty()) {
+			auto &proj = op->Cast<LogicalProjection>();
+			vector<ColumnBinding> refs;
+			for (const auto &expr : proj.expressions) {
+				CollectColumnRefs(*expr, refs);
+			}
+			auto *child = op->children[0].get();
+			const auto child_bindings = child->GetColumnBindings();
+			for (const auto &ref : refs) {
+				if (!HasBinding(child_bindings, ref)) {
+					EnsureBindingAvailableFrom(child, ref);
+				}
+			}
+		}
+		for (auto &child : op->children) {
+			MarkProjectionReferencedBindings(child.get());
+		}
+	}
+
 	//--------------------------------------------------------------------------
 	// CollectLambdaParamNames
 	//
@@ -2431,6 +2454,7 @@ public:
 	/// Entry point: walk the plan and return the AST root.
 	unique_ptr<AstNode> Build(unique_ptr<LogicalOperator> &plan) {
 		MarkAggregateReferencedBindings(plan.get());
+		MarkProjectionReferencedBindings(plan.get());
 		return RecursiveTraversal(plan);
 	}
 };
