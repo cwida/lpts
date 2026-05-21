@@ -69,3 +69,15 @@ query I
 PRAGMA lpts_check('WITH cust AS (SELECT c_w_id, c_id, c_balance FROM rendering_customers), orders AS (SELECT o_w_id, o_c_id, COUNT(*) AS n FROM rendering_orders GROUP BY o_w_id, o_c_id), joined AS (SELECT c.c_w_id, c.c_id, c.c_balance, COALESCE(o.n, 0) AS orders FROM cust c LEFT JOIN orders o ON c.c_w_id = o.o_w_id AND c.c_id = o.o_c_id) SELECT c_w_id, AVG(c_balance) AS avg_bal, AVG(orders) AS avg_ord, CORR(c_balance, orders) AS corr FROM joined GROUP BY c_w_id');
 ----
 true
+
+statement ok
+CREATE TABLE rendering_reserved ("group" INTEGER, "select" INTEGER);
+
+statement ok
+INSERT INTO rendering_reserved VALUES (1, 10), (1, 20), (2, 30);
+
+# Base scan columns and pushed-down table filters must quote reserved identifiers.
+query I
+PRAGMA lpts_check('SELECT "group", SUM("select") FROM rendering_reserved WHERE "group" >= 1 GROUP BY "group" ORDER BY "group"');
+----
+true

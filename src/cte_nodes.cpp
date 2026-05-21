@@ -23,20 +23,9 @@ namespace duckdb {
 
 namespace {
 
-string QuoteTableWithOptionalSuffix(const string &table_name) {
-	static const string at_suffix = " AT (";
-	auto suffix_pos = table_name.find(at_suffix);
-	if (suffix_pos == string::npos) {
-		return KeywordHelper::WriteOptionallyQuoted(table_name);
-	}
-	return KeywordHelper::WriteOptionallyQuoted(table_name.substr(0, suffix_pos)) + table_name.substr(suffix_pos);
+bool GetNodeColumnsAreExpressions(const string &table_name) {
+	return table_name == "(SELECT 1)";
 }
-
-string QualifiedTableName(const string &catalog, const string &schema, const string &table_name) {
-	return KeywordHelper::WriteOptionallyQuoted(catalog) + "." + KeywordHelper::WriteOptionallyQuoted(schema) + "." +
-	       QuoteTableWithOptionalSuffix(table_name);
-}
-
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -108,8 +97,10 @@ string GetNode::ToQuery() {
 	get_str << "SELECT ";
 	if (column_names.empty()) {
 		get_str << "*";
-	} else {
+	} else if (GetNodeColumnsAreExpressions(table_name)) {
 		get_str << VecToSeparatedList(column_names);
+	} else {
+		get_str << VecToQuotedIdentifierList(column_names);
 	}
 	get_str << " FROM ";
 	if (!catalog.empty()) {
@@ -130,7 +121,7 @@ string GetNode::ToQuery() {
 			                                                                             : table_function_output_count;
 			vector<string> table_function_columns;
 			for (idx_t i = 0; i < alias_count && i < column_names.size(); i++) {
-				table_function_columns.push_back(column_names[i]);
+				table_function_columns.push_back(QuoteIdentifier(column_names[i]));
 			}
 			get_str << " _tf(" << VecToSeparatedList(table_function_columns) << ")";
 		}

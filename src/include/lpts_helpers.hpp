@@ -11,6 +11,18 @@ namespace duckdb {
 /// Convert a vector of strings into a separated list (e.g. "a, b, c").
 string VecToSeparatedList(vector<string> input_list, const string &separator = ", ");
 
+/// Quote an identifier for SQL output when needed.
+string QuoteIdentifier(const string &identifier);
+
+/// Quote a list of identifiers and join them with a separator.
+string VecToQuotedIdentifierList(const vector<string> &input_list, const string &separator = ", ");
+
+/// Quote a table name, preserving a DuckDB AT (...) snapshot suffix if present.
+string QuoteTableWithOptionalSuffix(const string &table_name);
+
+/// Build catalog.schema.table with each identifier quoted when needed.
+string QualifiedTableName(const string &catalog, const string &schema, const string &table_name);
+
 /// Escape single quotes in a string by doubling them (e.g. "it's" -> "it''s").
 string EscapeSingleQuotes(const string &input);
 

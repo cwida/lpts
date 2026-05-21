@@ -1397,7 +1397,7 @@ private:
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
 					string filter_str;
-					if (!TableFilterToSql(*entry.second, get.names[entry.first], filter_str)) {
+					if (!TableFilterToSql(*entry.second, QuoteIdentifier(get.names[entry.first]), filter_str)) {
 						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
@@ -2554,12 +2554,14 @@ private:
 					if (i > 0) {
 						sql += ", ";
 					}
-					sql += get.column_names[i] + " AS " + get.cte_column_names[i];
+					string source_col =
+					    get.table_name == "(SELECT 1)" ? get.column_names[i] : QuoteIdentifier(get.column_names[i]);
+					sql += source_col + " AS " + get.cte_column_names[i];
 				}
 			}
 			sql += " FROM ";
 			if (!get.catalog.empty()) {
-				sql += get.catalog + "." + get.schema + "." + get.table_name;
+				sql += QualifiedTableName(get.catalog, get.schema, get.table_name);
 			} else {
 				sql += get.table_name;
 				if (get.table_name.find('(') != string::npos && get.table_name != "(SELECT 1)" &&
@@ -2569,7 +2571,7 @@ private:
 					                        : get.table_function_output_count;
 					vector<string> table_function_columns;
 					for (idx_t i = 0; i < alias_count && i < get.column_names.size(); i++) {
-						table_function_columns.push_back(get.column_names[i]);
+						table_function_columns.push_back(QuoteIdentifier(get.column_names[i]));
 					}
 					sql += " _tf(" + VecToSeparatedList(table_function_columns) + ")";
 				}
