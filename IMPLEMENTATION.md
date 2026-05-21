@@ -35,6 +35,25 @@ build/release/duckdb -unsigned
 LOAD 'build/release/extension/lpts/lpts.duckdb_extension';
 ```
 
+## CLion
+
+Open `duckdb/CMakeLists.txt` as the CLion project, then change the project root
+to the LPTS repository root.
+
+For each CMake profile, set the build directory to `../build/<profile>` and add
+the extension configuration flag:
+
+```text
+-DDUCKDB_EXTENSION_CONFIGS=<path_to_lpts>/extension_config.cmake
+```
+
+Use the `unittest` target for SQLLogicTests. To run only LPTS tests, pass a
+single test file such as:
+
+```text
+test/sql/select.test
+```
+
 ## Tests
 
 Run one SQLLogicTest file directly:
