@@ -205,3 +205,33 @@ query I
 PRAGMA lpts_check('WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM nodes WHERE parent IS NULL UNION ALL SELECT n.id, t.depth+1 FROM nodes n JOIN tree t ON n.parent=t.id) SELECT id,depth FROM tree ORDER BY id');
 ----
 true
+
+# Recursive step with ORDER BY + LIMIT, which DuckDB plans as TopN.
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT n FROM cnt ORDER BY n DESC LIMIT 1) s WHERE n < 5) SELECT n FROM cnt ORDER BY n');
+----
+true
+
+# Recursive step with SEMI JOIN.
+statement ok
+CREATE TABLE recursive_allowed (n INT);
+
+statement ok
+INSERT INTO recursive_allowed VALUES (1), (2), (3);
+
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT cnt.n + 1 FROM cnt SEMI JOIN recursive_allowed a ON cnt.n = a.n WHERE cnt.n < 5) SELECT n FROM cnt ORDER BY n');
+----
+true
+
+# Recursive step with a correlated scalar subquery, which can introduce DelimJoin/SINGLE nodes.
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT cnt.n + 1 FROM cnt JOIN recursive_allowed a ON a.n = (SELECT max(r.n) FROM recursive_allowed r WHERE r.n = cnt.n) WHERE cnt.n < 3) SELECT n FROM cnt ORDER BY n');
+----
+true
+
+# Recursive step with IN subquery, which can introduce MARK joins.
+query I
+PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 4 AND n IN (SELECT n FROM recursive_allowed)) SELECT n FROM cnt ORDER BY n');
+----
+true

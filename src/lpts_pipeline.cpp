@@ -2513,6 +2513,11 @@ private:
 	// nested subquery with all column aliases expressed inline.
 	//--------------------------------------------------------------------------
 	string AstToInlineSQL(const AstNode &ast_node) const {
+		std::map<idx_t, string> inline_delim_sources;
+		return AstToInlineSQL(ast_node, inline_delim_sources);
+	}
+
+	string AstToInlineSQL(const AstNode &ast_node, std::map<idx_t, string> &inline_delim_sources) const {
 		const string &type = ast_node.NodeType();
 
 		if (type == "Get") {
@@ -2563,7 +2568,7 @@ private:
 		if (type == "Filter") {
 			const AstFilterNode &filter = static_cast<const AstFilterNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
-			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 			if (!filter.conditions.empty()) {
 				sql += " WHERE ";
 				for (size_t i = 0; i < filter.conditions.size(); i++) {
@@ -2586,14 +2591,14 @@ private:
 				}
 				sql += proj.expressions[i] + " AS " + proj.cte_column_names[i];
 			}
-			return sql + " FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			return sql + " FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 		}
 
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 2);
-			string left_sql = AstToInlineSQL(*ast_node.children[0]);
-			string right_sql = AstToInlineSQL(*ast_node.children[1]);
+			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
+			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
 			string join_kw;
 			switch (join.join_type) {
 			case JoinType::INNER:
@@ -2608,11 +2613,35 @@ private:
 			case JoinType::OUTER:
 				join_kw = "FULL OUTER";
 				break;
+			case JoinType::SEMI:
+				join_kw = "SEMI";
+				break;
+			case JoinType::ANTI:
+				join_kw = "ANTI";
+				break;
+			case JoinType::SINGLE:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT_SEMI:
+			case JoinType::RIGHT_ANTI:
+				break;
 			default:
 				throw NotImplementedException("AstToInlineSQL: JOIN type %s not supported in recursive CTE step",
 				                              EnumUtil::ToString(join.join_type));
 			}
-			string sql = "SELECT " + VecToSeparatedList(join.cte_column_names) + " FROM (" + left_sql + ") " + join_kw +
+			vector<string> select_cols = join.cte_column_names;
+			if (!join.mark_expression.empty() && !select_cols.empty()) {
+				select_cols.back() = join.mark_expression + " AS " + select_cols.back();
+			}
+			if (join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
+				string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + right_sql + ") " +
+				             (join.join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI") + " JOIN (" + left_sql + ")";
+				if (!join.conditions.empty()) {
+					sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+				}
+				return sql;
+			}
+			string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + left_sql + ") " + join_kw +
 			             " JOIN (" + right_sql + ")";
 			if (!join.conditions.empty()) {
 				sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
@@ -2620,15 +2649,111 @@ private:
 			return sql;
 		}
 
+		if (type == "DelimJoin") {
+			const AstDelimJoinNode &join = static_cast<const AstDelimJoinNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
+
+			std::map<idx_t, string> saved_sources;
+			for (const idx_t table_index : join.delim_table_indices) {
+				auto existing = inline_delim_sources.find(table_index);
+				if (existing != inline_delim_sources.end()) {
+					saved_sources[table_index] = existing->second;
+				}
+				inline_delim_sources[table_index] = left_sql;
+			}
+			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
+			for (const idx_t table_index : join.delim_table_indices) {
+				auto saved = saved_sources.find(table_index);
+				if (saved != saved_sources.end()) {
+					inline_delim_sources[table_index] = saved->second;
+				} else {
+					inline_delim_sources.erase(table_index);
+				}
+			}
+
+			string join_kw;
+			switch (join.join_type) {
+			case JoinType::INNER:
+				join_kw = "INNER";
+				break;
+			case JoinType::LEFT:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT:
+				join_kw = "RIGHT";
+				break;
+			case JoinType::OUTER:
+				join_kw = "FULL OUTER";
+				break;
+			case JoinType::SEMI:
+				join_kw = "SEMI";
+				break;
+			case JoinType::ANTI:
+				join_kw = "ANTI";
+				break;
+			case JoinType::SINGLE:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT_SEMI:
+			case JoinType::RIGHT_ANTI:
+				break;
+			default:
+				throw NotImplementedException("AstToInlineSQL: DELIM_JOIN type %s not supported in recursive CTE step",
+				                              EnumUtil::ToString(join.join_type));
+			}
+			vector<string> select_cols = join.cte_column_names;
+			if (!join.mark_expression.empty() && !select_cols.empty()) {
+				select_cols.back() = join.mark_expression + " AS " + select_cols.back();
+			}
+			if (join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
+				string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + right_sql + ") " +
+				             (join.join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI") + " JOIN (" + left_sql + ")";
+				if (!join.conditions.empty()) {
+					sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+				}
+				return sql;
+			}
+			string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + left_sql + ") " + join_kw +
+			             " JOIN (" + right_sql + ")";
+			if (!join.conditions.empty()) {
+				sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+			}
+			return sql;
+		}
+
+		if (type == "DelimGet") {
+			const AstDelimGetNode &delim_get = static_cast<const AstDelimGetNode &>(ast_node);
+			auto it = inline_delim_sources.find(delim_get.table_index);
+			if (it == inline_delim_sources.end()) {
+				throw NotImplementedException(
+				    "AstToInlineSQL: DelimGet table_index=%llu has no inline DELIM_JOIN source",
+				    (unsigned long long)delim_get.table_index);
+			}
+			string sql = "SELECT DISTINCT ";
+			for (size_t i = 0; i < delim_get.source_col_names.size(); i++) {
+				if (i > 0) {
+					sql += ", ";
+				}
+				sql += delim_get.source_col_names[i] + " AS " + delim_get.cte_column_names[i];
+			}
+			return sql + " FROM (" + it->second + ")";
+		}
+
 		if (type == "Aggregate") {
 			const AstAggregateNode &agg = static_cast<const AstAggregateNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
 			string sql = "SELECT ";
-			if (!agg.group_by_columns.empty()) {
-				sql += VecToSeparatedList(agg.group_by_columns) + ", ";
+			vector<string> select_items;
+			for (size_t i = 0; i < agg.group_by_columns.size(); i++) {
+				select_items.push_back(agg.group_by_columns[i] + " AS " + agg.cte_column_names[i]);
 			}
-			sql += VecToSeparatedList(agg.aggregate_expressions);
-			sql += " FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			for (size_t i = 0; i < agg.aggregate_expressions.size(); i++) {
+				select_items.push_back(agg.aggregate_expressions[i] + " AS " +
+				                       agg.cte_column_names[agg.group_by_columns.size() + i]);
+			}
+			sql += VecToSeparatedList(select_items);
+			sql += " FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 			if (!agg.group_by_clause.empty()) {
 				sql += " GROUP BY " + agg.group_by_clause;
 			}
@@ -2640,21 +2765,21 @@ private:
 			const AstDistinctNode &d = static_cast<const AstDistinctNode &>(ast_node);
 			const auto &cols =
 			    d.cte_column_names.empty() ? ast_node.children[0]->OutputColumnNames() : d.cte_column_names;
-			return "SELECT DISTINCT " + VecToSeparatedList(cols) + " FROM (" + AstToInlineSQL(*ast_node.children[0]) +
-			       ")";
+			return "SELECT DISTINCT " + VecToSeparatedList(cols) + " FROM (" +
+			       AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 		}
 
 		if (type == "Order") {
 			const AstOrderNode &o = static_cast<const AstOrderNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
-			return "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0]) + ") ORDER BY " +
+			return "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ") ORDER BY " +
 			       VecToSeparatedList(o.order_items);
 		}
 
 		if (type == "Limit") {
 			const AstLimitNode &l = static_cast<const AstLimitNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
-			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0]) + ")";
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 			if (!l.limit_str.empty()) {
 				sql += " LIMIT " + l.limit_str;
 			}
@@ -2664,12 +2789,23 @@ private:
 			return sql;
 		}
 
+		if (type == "TopN") {
+			const AstTopNNode &topn = static_cast<const AstTopNNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) +
+			             ") ORDER BY " + VecToSeparatedList(topn.order_items) + " LIMIT " + std::to_string(topn.limit);
+			if (topn.offset > 0) {
+				sql += " OFFSET " + std::to_string(topn.offset);
+			}
+			return sql;
+		}
+
 		if (type == "Union") {
 			const AstUnionNode &u = static_cast<const AstUnionNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 2);
 			string union_kw = u.is_union_all ? " UNION ALL " : " UNION ";
-			return "(" + AstToInlineSQL(*ast_node.children[0]) + ")" + union_kw + "(" +
-			       AstToInlineSQL(*ast_node.children[1]) + ")";
+			return "(" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")" + union_kw + "(" +
+			       AstToInlineSQL(*ast_node.children[1], inline_delim_sources) + ")";
 		}
 
 		throw NotImplementedException(
