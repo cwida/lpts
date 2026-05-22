@@ -1,5 +1,5 @@
 # name: test/sql/optimizer.test
-# description: test lpts with optimizer rules selectively disabled — lpts must produce correct results regardless of optimization state
+# description: test lpts with optimizers enabled and selectively disabled — STATISTICS_PROPAGATION effects and FILTER_PUSHDOWN, JOIN_ORDER, TOP_N
 # group: [sql]
 
 require lpts
@@ -195,3 +195,230 @@ query I
 PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
 ----
 true
+
+# ============================================================
+# STATISTICS_PROPAGATION enabled (default)
+#
+# Impossible-predicate pruning → LOGICAL_EMPTY_RESULT
+# When a filter can never be satisfied given column statistics,
+# STATISTICS_PROPAGATION replaces the subtree with an EMPTY_RESULT
+# node. LPTS serialises it as a "(SELECT 1) WHERE false" subquery.
+# ============================================================
+
+# Constant-false predicate: WHERE 1 = 0
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE 1 = 0');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 0');
+----
+
+# Column out-of-range: val ∈ [10, 50], so val < 0 is impossible
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 0');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 0');
+----
+
+# Boundary: val > 50 is impossible (max = 50)
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 50');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val > 50');
+----
+
+# Impossible range: val < 10 AND val > 50 — contradictory, pruned to EMPTY_RESULT
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 10 AND val > 50');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 10 AND val > 50');
+----
+
+# ============================================================
+# Always-true filter removal
+#
+# When statistics prove a filter always passes, it is removed
+# from the scan entirely. The LPTS-generated SQL must still
+# return all rows.
+# ============================================================
+
+# Constant-true predicate: WHERE 1 = 1
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE 1 = 1');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 1');
+----
+1	10
+2	20
+3	30
+4	40
+5	50
+
+# Column always in range: val ∈ [10, 50], so val >= 10 is always true
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val >= 10');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val >= 10');
+----
+1	10
+2	20
+3	30
+4	40
+5	50
+
+# ============================================================
+# Join stats: scan filter added from join partner statistics
+# ============================================================
+
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+1	100
+2	200
+3	300
+
+query I
+PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
+----
+true
+
+query III
+PRAGMA lpts_exec('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
+----
+2	20	200
+3	30	300
+
+# Impossible predicate on a join — EMPTY_RESULT propagates up
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100');
+----
+
+# Aggregate on pruned input → zero-row aggregate result
+query I
+PRAGMA lpts_check('SELECT count(*), sum(val) FROM t WHERE val > 50');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT count(*), sum(val) FROM t WHERE val > 50');
+----
+0	NULL
+
+# ============================================================
+# STATISTICS_PROPAGATION deliberately disabled
+# Without stats, impossible filters are not pruned — plan
+# contains a real scan + filter node, still correct.
+# ============================================================
+
+statement ok
+SET disabled_optimizers = 'STATISTICS_PROPAGATION';
+
+query I
+PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 0');
+----
+true
+
+query II
+PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 0');
+----
+
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+----
+true
+
+statement ok
+SET disabled_optimizers = '';
+
+# ============================================================
+# COLUMN_LIFETIME
+# Prunes unused output columns from LogicalFilter, LogicalOrder,
+# and LogicalComparisonJoin via projection_map. FilterNode and
+# OrderNode emit an explicit SELECT column list so the CTE
+# header column count always matches the body — even when
+# COLUMN_LIFETIME removes sort/filter keys from the output.
+# ============================================================
+
+# ORDER BY on a column that is NOT in the SELECT list.
+# COLUMN_LIFETIME prunes the sort key (val) from the ORDER CTE output.
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val DESC');
+----
+true
+
+# ORDER BY on multiple non-selected columns.
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val DESC, label ASC');
+----
+true
+
+# Filter where the condition column is not in the SELECT list.
+query I
+PRAGMA lpts_check('SELECT id FROM t WHERE val > 20');
+----
+true
+
+# Join: sort key from the right side pruned from ORDER CTE output.
+query I
+PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+# COLUMN_LIFETIME disabled: same queries must still round-trip correctly.
+statement ok
+SET disabled_optimizers = 'COLUMN_LIFETIME';
+
+query I
+PRAGMA lpts_check('SELECT id FROM t ORDER BY val');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT id FROM t WHERE val > 20');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+statement ok
+SET disabled_optimizers = '';

@@ -23,18 +23,8 @@ namespace duckdb {
 
 namespace {
 
-string QuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect) {
-	static const string at_suffix = " AT (";
-	auto suffix_pos = table_name.find(at_suffix);
-	if (suffix_pos == string::npos) {
-		return DialectQuoteIdent(table_name, dialect);
-	}
-	return DialectQuoteIdent(table_name.substr(0, suffix_pos), dialect) + table_name.substr(suffix_pos);
-}
-
-string QualifiedTableName(const string &catalog, const string &schema, const string &table_name, SqlDialect dialect) {
-	return DialectQuoteIdent(catalog, dialect) + "." + DialectQuoteIdent(schema, dialect) + "." +
-	       QuoteTableWithOptionalSuffix(table_name, dialect);
+bool GetNodeColumnsAreExpressions(const string &table_name) {
+	return table_name == "(SELECT 1)";
 }
 
 } // namespace
@@ -108,13 +98,15 @@ string GetNode::ToQuery() {
 	get_str << "SELECT ";
 	if (column_names.empty()) {
 		get_str << "*";
-	} else {
+	} else if (GetNodeColumnsAreExpressions(table_name)) {
 		get_str << VecToSeparatedList(column_names);
+	} else {
+		get_str << DialectVecToQuotedIdentifierList(column_names, dialect);
 	}
 	get_str << " FROM ";
 	if (!catalog.empty()) {
 		// Fully-qualified: catalog.schema.table (DuckDB / Spark dialect)
-		get_str << QualifiedTableName(catalog, schema, table_name, dialect);
+		get_str << DialectQualifiedTableName(catalog, schema, table_name, dialect);
 	} else {
 		if (!input_cte_name.empty()) {
 			get_str << input_cte_name << ", ";
@@ -130,7 +122,7 @@ string GetNode::ToQuery() {
 			                                                                             : table_function_output_count;
 			vector<string> table_function_columns;
 			for (idx_t i = 0; i < alias_count && i < column_names.size(); i++) {
-				table_function_columns.push_back(column_names[i]);
+				table_function_columns.push_back(DialectQuoteIdent(column_names[i], dialect));
 			}
 			get_str << " _tf(" << VecToSeparatedList(table_function_columns) << ")";
 		}
@@ -144,7 +136,9 @@ string GetNode::ToQuery() {
 
 string FilterNode::ToQuery() {
 	std::ostringstream get_str;
-	get_str << "SELECT * FROM ";
+	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
+	// respected: SELECT * would expose more columns than the CTE header declares.
+	get_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM ";
 	get_str << child_cte_name;
 	if (!conditions.empty()) {
 		get_str << " WHERE ";
@@ -291,7 +285,9 @@ string CteSetOperationNode::ToQuery() {
 
 string OrderNode::ToQuery() {
 	std::ostringstream order_str;
-	order_str << "SELECT * FROM " << child_cte_name;
+	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
+	// respected: SELECT * would expose more columns than the CTE header declares.
+	order_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!order_items.empty()) {
 		order_str << " ORDER BY " << VecToSeparatedList(order_items);
 	}
@@ -300,7 +296,7 @@ string OrderNode::ToQuery() {
 
 string LimitNode::ToQuery() {
 	std::ostringstream limit_str_stream;
-	limit_str_stream << "SELECT * FROM " << child_cte_name;
+	limit_str_stream << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!limit_str.empty()) {
 		limit_str_stream << " LIMIT ";
 		if (limit_needs_child_scalar) {
@@ -322,7 +318,7 @@ string LimitNode::ToQuery() {
 
 string TopNNode::ToQuery() {
 	std::ostringstream ss;
-	ss << "SELECT * FROM " << child_cte_name;
+	ss << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!order_items.empty()) {
 		ss << " ORDER BY " << VecToSeparatedList(order_items);
 	}
@@ -337,7 +333,7 @@ string TopNNode::ToQuery() {
 
 string DistinctNode::ToQuery() {
 	std::ostringstream distinct_str;
-	distinct_str << "SELECT DISTINCT * FROM " << child_cte_name;
+	distinct_str << "SELECT DISTINCT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	return distinct_str.str();
 }
 
@@ -351,6 +347,11 @@ string DelimGetNode::ToQuery() {
 	}
 	s << " FROM " << source_cte_name;
 	return s.str();
+}
+
+string RecursiveCteNode::ToQuery() {
+	string union_kw = union_all ? "\nUNION ALL\n" : "\nUNION\n";
+	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + recursive_step_sql;
 }
 
 /// Serialize the entire CTE list into a SQL string.
@@ -370,7 +371,7 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 
 	std::ostringstream sql_str;
 	if (!nodes.empty()) {
-		sql_str << "WITH ";
+		sql_str << (has_recursive_cte ? "WITH RECURSIVE " : "WITH ");
 		for (size_t i = 0; i < nodes.size(); ++i) {
 			sql_str << nodes[i]->ToCteQuery();
 			if (i != nodes.size() - 1) {

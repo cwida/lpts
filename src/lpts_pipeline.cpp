@@ -42,6 +42,8 @@
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/function/lambda_functions.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -61,6 +63,7 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_recursive_cte.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -137,6 +140,21 @@ private:
 		}
 	}
 
+	static bool HasBinding(const vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
+		for (const auto &candidate : bindings) {
+			if (candidate == binding) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static void AddUniqueBinding(vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
+		if (!HasBinding(bindings, binding)) {
+			bindings.push_back(binding);
+		}
+	}
+
 	/// SQL dialect for expression serialization (function renaming, etc.)
 	SqlDialect dialect = SqlDialect::DUCKDB;
 
@@ -177,6 +195,12 @@ private:
 	/// carries the original user-visible names, so CTE refs must follow the body output arity.
 	unordered_map<idx_t, vector<string>> materialized_cte_body_column_names;
 
+	/// Maps LogicalProjection nodes to lower-scope bindings that must be carried through
+	/// as hidden pass-through columns. Some optimizer/extension rewrites leave aggregate
+	/// arguments bound to a pre-projection column; without carrying that binding upward, LPTS
+	/// can emit a stale CTE column name in the aggregate SELECT list.
+	unordered_map<const LogicalOperator *, vector<ColumnBinding>> extra_projection_outputs;
+
 	const unique_ptr<ColStruct> &FindColumnBinding(const ColumnBinding &binding, const char *context) const {
 		auto it = column_map.find(MappableColumnBinding(binding));
 		if (it != column_map.end()) {
@@ -203,6 +227,92 @@ private:
 				RegisterChildBindingFallbacks(*child, child_bindings);
 			}
 		});
+	}
+
+	static void CollectColumnRefs(const Expression &expr, vector<ColumnBinding> &refs) {
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			const auto &bcr = expr.Cast<BoundColumnRefExpression>();
+			AddUniqueBinding(refs, bcr.binding);
+		}
+		ExpressionIterator::EnumerateChildren(const_cast<Expression &>(expr),
+		                                      [&](Expression &child) { CollectColumnRefs(child, refs); });
+	}
+
+	bool EnsureBindingAvailableFrom(LogicalOperator *op, const ColumnBinding &binding) {
+		if (!op) {
+			return false;
+		}
+		if (HasBinding(op->GetColumnBindings(), binding)) {
+			return true;
+		}
+		if (op->type != LogicalOperatorType::LOGICAL_PROJECTION || op->children.empty()) {
+			return false;
+		}
+		if (!EnsureBindingAvailableFrom(op->children[0].get(), binding)) {
+			return false;
+		}
+		AddUniqueBinding(extra_projection_outputs[op], binding);
+		return true;
+	}
+
+	void MarkAggregateReferencedBindings(LogicalOperator *op) {
+		if (!op) {
+			return;
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY && !op->children.empty()) {
+			auto &agg = op->Cast<LogicalAggregate>();
+			vector<ColumnBinding> refs;
+			for (const auto &group : agg.groups) {
+				CollectColumnRefs(*group, refs);
+			}
+			for (const auto &expr : agg.expressions) {
+				CollectColumnRefs(*expr, refs);
+				if (expr->type == ExpressionType::BOUND_AGGREGATE) {
+					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+					if (bound_agg.filter) {
+						CollectColumnRefs(*bound_agg.filter, refs);
+					}
+					if (bound_agg.order_bys) {
+						for (auto &order : bound_agg.order_bys->orders) {
+							CollectColumnRefs(*order.expression, refs);
+						}
+					}
+				}
+			}
+			auto *child = op->children[0].get();
+			const auto child_bindings = child->GetColumnBindings();
+			for (const auto &ref : refs) {
+				if (!HasBinding(child_bindings, ref)) {
+					EnsureBindingAvailableFrom(child, ref);
+				}
+			}
+		}
+		for (auto &child : op->children) {
+			MarkAggregateReferencedBindings(child.get());
+		}
+	}
+
+	void MarkProjectionReferencedBindings(LogicalOperator *op) {
+		if (!op) {
+			return;
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_PROJECTION && !op->children.empty()) {
+			auto &proj = op->Cast<LogicalProjection>();
+			vector<ColumnBinding> refs;
+			for (const auto &expr : proj.expressions) {
+				CollectColumnRefs(*expr, refs);
+			}
+			auto *child = op->children[0].get();
+			const auto child_bindings = child->GetColumnBindings();
+			for (const auto &ref : refs) {
+				if (!HasBinding(child_bindings, ref)) {
+					EnsureBindingAvailableFrom(child, ref);
+				}
+			}
+		}
+		for (auto &child : op->children) {
+			MarkProjectionReferencedBindings(child.get());
+		}
 	}
 
 	//--------------------------------------------------------------------------
@@ -246,6 +356,60 @@ private:
 		return contains_column_ref;
 	}
 
+	bool TableFilterToSql(const TableFilter &filter, const string &column_name, string &result) const {
+		switch (filter.filter_type) {
+		case TableFilterType::DYNAMIC_FILTER:
+			return false;
+		case TableFilterType::OPTIONAL_FILTER: {
+			auto &optional_filter = filter.Cast<OptionalFilter>();
+			if (!optional_filter.child_filter) {
+				return false;
+			}
+			return TableFilterToSql(*optional_filter.child_filter, column_name, result);
+		}
+		case TableFilterType::CONJUNCTION_AND: {
+			auto &and_filter = filter.Cast<ConjunctionAndFilter>();
+			vector<string> children;
+			for (auto &child_filter : and_filter.child_filters) {
+				string child_sql;
+				if (TableFilterToSql(*child_filter, column_name, child_sql)) {
+					children.push_back(std::move(child_sql));
+				}
+			}
+			if (children.empty()) {
+				return false;
+			}
+			result = VecToSeparatedList(children, " AND ");
+			return true;
+		}
+		case TableFilterType::CONJUNCTION_OR: {
+			auto &or_filter = filter.Cast<ConjunctionOrFilter>();
+			vector<string> children;
+			for (auto &child_filter : or_filter.child_filters) {
+				string child_sql;
+				if (!TableFilterToSql(*child_filter, column_name, child_sql)) {
+					return false;
+				}
+				children.push_back(std::move(child_sql));
+			}
+			if (children.empty()) {
+				return false;
+			}
+			result = VecToSeparatedList(children, " OR ");
+			return true;
+		}
+		case TableFilterType::EXPRESSION_FILTER: {
+			auto column_expr = make_uniq<BoundReferenceExpression>(column_name, LogicalType::INVALID, 0);
+			auto filter_expr = filter.ToExpression(*column_expr);
+			result = ExpressionToAliasedString(filter_expr);
+			return true;
+		}
+		default:
+			result = filter.ToString(column_name);
+			return true;
+		}
+	}
+
 	static string QuantileArgument(const BoundAggregateExpression &aggregate) {
 		// DuckDB does not expose quantile arguments through the aggregate children after binding.
 		// Keep this layout-dependent access isolated so a future DuckDB upgrade has one place
@@ -271,6 +435,44 @@ private:
 			values.push_back(quantile.val.ToSQLString());
 		}
 		return "[" + VecToSeparatedList(values) + "]";
+	}
+
+	static string ApproxQuantileArgument(const BoundAggregateExpression &aggregate) {
+		struct ApproxQuantileBindDataLayout {
+			void *vtable;
+			vector<float> quantiles;
+		};
+		const auto &bind_data = *reinterpret_cast<const ApproxQuantileBindDataLayout *>(aggregate.bind_info.get());
+		if (bind_data.quantiles.size() == 1) {
+			return Value::FLOAT(bind_data.quantiles[0]).ToSQLString();
+		}
+		vector<string> values;
+		for (const auto quantile : bind_data.quantiles) {
+			values.push_back(Value::FLOAT(quantile).ToSQLString());
+		}
+		return "[" + VecToSeparatedList(values) + "]";
+	}
+
+	static string ReservoirQuantileArguments(const BoundAggregateExpression &aggregate) {
+		struct ReservoirQuantileBindDataLayout {
+			void *vtable;
+			vector<double> quantiles;
+			idx_t sample_size;
+		};
+		const auto &bind_data = *reinterpret_cast<const ReservoirQuantileBindDataLayout *>(aggregate.bind_info.get());
+		vector<string> values;
+		for (const auto quantile : bind_data.quantiles) {
+			values.push_back(Value::DOUBLE(quantile).ToSQLString());
+		}
+		string quantile_arg = values.size() == 1 ? values[0] : "[" + VecToSeparatedList(values) + "]";
+		if (bind_data.sample_size == 8192) {
+			return quantile_arg;
+		}
+		return quantile_arg + ", " + to_string(bind_data.sample_size);
+	}
+
+	static bool IsQuantileAggregate(const string &agg_name) {
+		return agg_name == "quantile_cont" || agg_name == "quantile_disc";
 	}
 
 	static string StripTablePrefix(const string &cte_column_name) {
@@ -693,6 +895,16 @@ private:
 		}
 		case ExpressionClass::BOUND_FUNCTION: {
 			const BoundFunctionExpression &func_expr = expression->Cast<BoundFunctionExpression>();
+			// Strip internal compress/decompress wrappers injected by COMPRESSED_MATERIALIZATION.
+			// For non-BOUND_COLUMN_REF GROUP BY keys (e.g. COALESCE), the optimizer inlines
+			// __internal_compress_* directly into the aggregate's group expression instead of
+			// creating a separate projection. Render the first argument (the original expression)
+			// so the generated SQL stays valid and binder-accepted.
+			if (!func_expr.children.empty() && (func_expr.function.name.rfind("__internal_compress_", 0) == 0 ||
+			                                    func_expr.function.name.rfind("__internal_decompress_", 0) == 0)) {
+				expr_str << ExpressionToAliasedString(func_expr.children[0]);
+				break;
+			}
 			// Dialect-specific function name remapping.
 			string func_name = func_expr.function.name;
 			if (dialect == SqlDialect::POSTGRES) {
@@ -1217,21 +1429,10 @@ private:
 			}
 
 			// Pushdown table filters (rare, but present in some plans).
-			// FILTER_PUSHDOWN wraps pushed-down conditions in OptionalFilter, whose
-			// ToString() prepends "optional: ". Strip that prefix so the condition
-			// is valid SQL when embedded in a WHERE clause.
-			// JOIN_FILTER_PUSHDOWN attaches runtime-only dynamic filters whose
-			// ToString() starts with "Dynamic Filter" — skip those entirely since
-			// they are not valid SQL expressions.
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
-					string filter_str = entry.second->ToString(get.names[entry.first]);
-					static const string kOptionalPrefix = "optional: ";
-					if (filter_str.substr(0, kOptionalPrefix.size()) == kOptionalPrefix) {
-						filter_str = filter_str.substr(kOptionalPrefix.size());
-					}
-					static const string kDynamicFilterPrefix = "Dynamic Filter";
-					if (filter_str.substr(0, kDynamicFilterPrefix.size()) == kDynamicFilterPrefix) {
+					string filter_str;
+					if (!TableFilterToSql(*entry.second, DialectQuoteIdent(get.names[entry.first], dialect), filter_str)) {
 						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
@@ -1397,6 +1598,19 @@ private:
 					column_map[MappableColumnBinding(new_cb)] = std::move(new_col);
 				}
 			}
+			auto extra_it = extra_projection_outputs.find(op.get());
+			if (extra_it != extra_projection_outputs.end()) {
+				for (const auto &binding : extra_it->second) {
+					const unique_ptr<ColStruct> &src = FindColumnBinding(binding, "projection extra output");
+					const string passthrough_name = src->ToUniqueColumnName();
+					if (seen_names.count(passthrough_name)) {
+						continue;
+					}
+					seen_names.insert(passthrough_name);
+					expressions.push_back(passthrough_name);
+					cte_column_names.push_back(passthrough_name);
+				}
+			}
 
 			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index);
 		}
@@ -1442,6 +1656,9 @@ private:
 			// GROUP BY columns
 			for (size_t i = 0; i < agg.groups.size(); ++i) {
 				const unique_ptr<Expression> &g = agg.groups[i];
+				if (!op->children.empty()) {
+					RegisterChildBindingFallbacks(*g, op->children[0]->GetColumnBindings());
+				}
 				if (g->type == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
 					auto it = column_map.find(MappableColumnBinding(bcr.binding));
@@ -1486,6 +1703,9 @@ private:
 				}
 				vector<string> child_exprs;
 				for (const unique_ptr<Expression> &c : ba.children) {
+					if (!op->children.empty()) {
+						RegisterChildBindingFallbacks(*c, op->children[0]->GetColumnBindings());
+					}
 					child_exprs.push_back(ExpressionToAliasedString(c));
 				}
 				// Join child expressions with commas
@@ -1502,9 +1722,12 @@ private:
 						}
 						agg_str << "'" << EscapeSingleQuotes(separator) << "'";
 					}
-				} else if ((agg_name == "quantile_cont" || agg_name == "quantile_disc") && child_exprs.size() == 1 &&
-				           ba.bind_info) {
+				} else if (IsQuantileAggregate(agg_name) && child_exprs.size() == 1 && ba.bind_info) {
 					agg_str << ", " << QuantileArgument(ba);
+				} else if (agg_name == "approx_quantile" && child_exprs.size() == 1 && ba.bind_info) {
+					agg_str << ", " << ApproxQuantileArgument(ba);
+				} else if (agg_name == "reservoir_quantile" && child_exprs.size() == 1 && ba.bind_info) {
+					agg_str << ", " << ReservoirQuantileArguments(ba);
 				}
 				// Preserve intra-aggregate ORDER BY — matters for LIST, STRING_AGG,
 				// and other order-sensitive aggregates. Drop it only for aggregates
@@ -1512,10 +1735,13 @@ private:
 				// rendering ORDER BY for those would change the plan for no reason.
 				if (ba.order_bys && !ba.order_bys->orders.empty() && agg_name != "sum" && agg_name != "count" &&
 				    agg_name != "count_star" && agg_name != "min" && agg_name != "max" && agg_name != "avg" &&
-				    agg_name != "quantile_cont" && agg_name != "quantile_disc") {
+				    !IsQuantileAggregate(agg_name)) {
 					agg_str << " ORDER BY ";
 					for (size_t oi = 0; oi < ba.order_bys->orders.size(); ++oi) {
 						const BoundOrderByNode &ob = ba.order_bys->orders[oi];
+						if (!op->children.empty()) {
+							RegisterChildBindingFallbacks(*ob.expression, op->children[0]->GetColumnBindings());
+						}
 						if (oi > 0)
 							agg_str << ", ";
 						agg_str << ExpressionToAliasedString(ob.expression);
@@ -1536,6 +1762,9 @@ private:
 				// with `COUNT(*) FILTER (WHERE x > 0)` round-trips to `count_star()`,
 				// silently producing a total row count instead of a conditional count.
 				if (ba.filter) {
+					if (!op->children.empty()) {
+						RegisterChildBindingFallbacks(*ba.filter, op->children[0]->GetColumnBindings());
+					}
 					agg_str << " FILTER (WHERE " << ExpressionToAliasedString(ba.filter) << ")";
 				}
 				string agg_alias = "aggregate_" + std::to_string(i);
@@ -2200,6 +2429,38 @@ private:
 			child_nodes[0] = RecursiveTraversal(op->children[0]);
 			materialized_cte_body_column_names[mat_cte.table_index] = child_nodes[0]->OutputColumnNames();
 			child_nodes[1] = RecursiveTraversal(op->children[1]);
+		} else if (op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+			const LogicalRecursiveCTE &rec_cte = op->Cast<LogicalRecursiveCTE>();
+			LPTS_DEBUG_PRINT("[LPTS-AST] RECURSIVE_CTE: table_index=" + std::to_string(rec_cte.table_index) +
+			                 " ctename='" + rec_cte.ctename + "' union_all=" + std::to_string(rec_cte.union_all));
+			child_nodes.resize(2);
+
+			// Traverse anchor first to learn the actual output column names.
+			child_nodes[0] = RecursiveTraversal(op->children[0]);
+			const auto anchor_cols = child_nodes[0]->OutputColumnNames();
+
+			// Register the recursive CTE's output columns in column_map so parent nodes
+			// (Projections, Filters above the RecursiveCTE) can reference them.
+			// Also pre-register them in materialized_cte_body_column_names so that
+			// self-referencing LogicalCTERef nodes in the recursive step resolve correctly.
+			vector<string> output_col_names;
+			for (idx_t i = 0; i < anchor_cols.size(); i++) {
+				string col_name = StripTablePrefix(anchor_cols[i]);
+				auto col_struct = make_uniq<ColStruct>(rec_cte.table_index, col_name, "");
+				output_col_names.push_back(col_struct->ToUniqueColumnName());
+				column_map[MappableColumnBinding(ColumnBinding(rec_cte.table_index, i))] = std::move(col_struct);
+			}
+			materialized_cte_body_column_names[rec_cte.table_index] = anchor_cols;
+
+			// Traverse recursive step; self-referencing CteRef nodes will use the registered names.
+			child_nodes[1] = RecursiveTraversal(op->children[1]);
+
+			// Build the AstRecursiveCteNode directly (bypass the generic BuildNode path).
+			auto rec_node = make_uniq<AstRecursiveCteNode>(rec_cte.table_index, rec_cte.ctename, rec_cte.union_all,
+			                                               std::move(output_col_names));
+			rec_node->children.push_back(std::move(child_nodes[0]));
+			rec_node->children.push_back(std::move(child_nodes[1]));
+			return rec_node;
 		} else {
 			for (auto &child : op->children) {
 				child_nodes.push_back(RecursiveTraversal(child));
@@ -2227,6 +2488,8 @@ public:
 
 	/// Entry point: walk the plan and return the AST root.
 	unique_ptr<AstNode> Build(unique_ptr<LogicalOperator> &plan) {
+		MarkAggregateReferencedBindings(plan.get());
+		MarkProjectionReferencedBindings(plan.get());
 		return RecursiveTraversal(plan);
 	}
 };
@@ -2269,11 +2532,14 @@ class AstFlattener {
 private:
 	size_t node_count = 0;
 	vector<unique_ptr<CteNode>> cte_nodes;
-	SqlDialect dialect; // Controls dialect-specific SQL rendering.
+	SqlDialect dialect;             // Controls dialect-specific SQL rendering.
+	bool has_recursive_cte = false; // True when a RecursiveCteNode has been pushed.
 
 	/// Maps LogicalMaterializedCTE::table_index → (lpts_cte_name, lpts_cte_column_list)
 	/// of the last CTE generated for the body. Populated when flattening AstMaterializedCteNode;
 	/// consumed when flattening AstCteRefNode.
+	/// For RecursiveCteNode: stores {recursive_cte_name, stripped_col_names} so that
+	/// self-referencing CteRef nodes inside the recursive step resolve to the recursive CTE.
 	unordered_map<idx_t, pair<string, vector<string>>> cte_index_to_body_info;
 
 	/// Maps AstDelimGetNode::table_index → name of the outer left CTE to SELECT DISTINCT from.
@@ -2298,6 +2564,328 @@ private:
 		} else {
 			return "node_" + std::to_string(index);
 		}
+	}
+
+	//--------------------------------------------------------------------------
+	// AstToInlineSQL: generate inline (non-CTE) SQL for a subtree.
+	//
+	// Used for the recursive step of WITH RECURSIVE: the recursive step may
+	// contain self-referencing CteRef nodes that would create forward references
+	// if expressed as flat CTEs. Instead, the entire step is serialized as a
+	// nested subquery with all column aliases expressed inline.
+	//--------------------------------------------------------------------------
+	string AstToInlineSQL(const AstNode &ast_node) const {
+		std::map<idx_t, string> inline_delim_sources;
+		return AstToInlineSQL(ast_node, inline_delim_sources);
+	}
+
+	string AstToInlineSQL(const AstNode &ast_node, std::map<idx_t, string> &inline_delim_sources) const {
+		const string &type = ast_node.NodeType();
+
+		if (type == "Get") {
+			const AstGetNode &get = static_cast<const AstGetNode &>(ast_node);
+			string sql = "SELECT ";
+			if (get.column_names.empty()) {
+				sql += "*";
+			} else {
+				for (size_t i = 0; i < get.column_names.size(); i++) {
+					if (i > 0) {
+						sql += ", ";
+					}
+					string source_col =
+					    get.table_name == "(SELECT 1)" ? get.column_names[i] : DialectQuoteIdent(get.column_names[i], dialect);
+					sql += source_col + " AS " + get.cte_column_names[i];
+				}
+			}
+			sql += " FROM ";
+			if (!get.catalog.empty()) {
+				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect);
+			} else {
+				sql += get.table_name;
+				if (get.table_name.find('(') != string::npos && get.table_name != "(SELECT 1)" &&
+				    !get.column_names.empty() && get.table_name.find("ducklake_table_") == string::npos) {
+					idx_t alias_count = get.table_function_output_count == DConstants::INVALID_INDEX
+					                        ? get.column_names.size()
+					                        : get.table_function_output_count;
+					vector<string> table_function_columns;
+					for (idx_t i = 0; i < alias_count && i < get.column_names.size(); i++) {
+						table_function_columns.push_back(DialectQuoteIdent(get.column_names[i], dialect));
+					}
+					sql += " _tf(" + VecToSeparatedList(table_function_columns) + ")";
+				}
+			}
+			if (!get.table_filters.empty()) {
+				sql += " WHERE " + VecToSeparatedList(get.table_filters, " AND ");
+			}
+			return sql;
+		}
+
+		if (type == "CteRef") {
+			// Self-reference (cte_index = rec CTE table_index) or reference to a flat CTE.
+			const AstCteRefNode &cte_ref = static_cast<const AstCteRefNode &>(ast_node);
+			auto it = cte_index_to_body_info.find(cte_ref.cte_table_index);
+			if (it == cte_index_to_body_info.end()) {
+				throw InternalException("AstToInlineSQL: CteRef references unknown CTE index %llu",
+				                        (unsigned long long)cte_ref.cte_table_index);
+			}
+			const string &src_name = it->second.first;
+			const vector<string> &src_cols = it->second.second;
+			string sql = "SELECT ";
+			for (size_t i = 0; i < src_cols.size(); i++) {
+				if (i > 0) {
+					sql += ", ";
+				}
+				sql += src_cols[i] + " AS " + cte_ref.cte_column_names[i];
+			}
+			return sql + " FROM " + src_name;
+		}
+
+		if (type == "Filter") {
+			const AstFilterNode &filter = static_cast<const AstFilterNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			if (!filter.conditions.empty()) {
+				sql += " WHERE ";
+				for (size_t i = 0; i < filter.conditions.size(); i++) {
+					if (i > 0) {
+						sql += " AND ";
+					}
+					sql += "(" + filter.conditions[i] + ")";
+				}
+			}
+			return sql;
+		}
+
+		if (type == "Project") {
+			const AstProjectNode &proj = static_cast<const AstProjectNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT ";
+			for (size_t i = 0; i < proj.expressions.size(); i++) {
+				if (i > 0) {
+					sql += ", ";
+				}
+				sql += proj.expressions[i] + " AS " + proj.cte_column_names[i];
+			}
+			return sql + " FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+		}
+
+		if (type == "Join") {
+			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
+			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
+			string join_kw;
+			switch (join.join_type) {
+			case JoinType::INNER:
+				join_kw = "INNER";
+				break;
+			case JoinType::LEFT:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT:
+				join_kw = "RIGHT";
+				break;
+			case JoinType::OUTER:
+				join_kw = "FULL OUTER";
+				break;
+			case JoinType::SEMI:
+				join_kw = "SEMI";
+				break;
+			case JoinType::ANTI:
+				join_kw = "ANTI";
+				break;
+			case JoinType::SINGLE:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT_SEMI:
+			case JoinType::RIGHT_ANTI:
+				break;
+			default:
+				throw NotImplementedException("AstToInlineSQL: JOIN type %s not supported in recursive CTE step",
+				                              EnumUtil::ToString(join.join_type));
+			}
+			vector<string> select_cols = join.cte_column_names;
+			if (!join.mark_expression.empty() && !select_cols.empty()) {
+				select_cols.back() = join.mark_expression + " AS " + select_cols.back();
+			}
+			if (join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
+				string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + right_sql + ") " +
+				             (join.join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI") + " JOIN (" + left_sql + ")";
+				if (!join.conditions.empty()) {
+					sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+				}
+				return sql;
+			}
+			string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + left_sql + ") " + join_kw +
+			             " JOIN (" + right_sql + ")";
+			if (!join.conditions.empty()) {
+				sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+			}
+			return sql;
+		}
+
+		if (type == "DelimJoin") {
+			const AstDelimJoinNode &join = static_cast<const AstDelimJoinNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
+
+			std::map<idx_t, string> saved_sources;
+			for (const idx_t table_index : join.delim_table_indices) {
+				auto existing = inline_delim_sources.find(table_index);
+				if (existing != inline_delim_sources.end()) {
+					saved_sources[table_index] = existing->second;
+				}
+				inline_delim_sources[table_index] = left_sql;
+			}
+			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
+			for (const idx_t table_index : join.delim_table_indices) {
+				auto saved = saved_sources.find(table_index);
+				if (saved != saved_sources.end()) {
+					inline_delim_sources[table_index] = saved->second;
+				} else {
+					inline_delim_sources.erase(table_index);
+				}
+			}
+
+			string join_kw;
+			switch (join.join_type) {
+			case JoinType::INNER:
+				join_kw = "INNER";
+				break;
+			case JoinType::LEFT:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT:
+				join_kw = "RIGHT";
+				break;
+			case JoinType::OUTER:
+				join_kw = "FULL OUTER";
+				break;
+			case JoinType::SEMI:
+				join_kw = "SEMI";
+				break;
+			case JoinType::ANTI:
+				join_kw = "ANTI";
+				break;
+			case JoinType::SINGLE:
+				join_kw = "LEFT";
+				break;
+			case JoinType::RIGHT_SEMI:
+			case JoinType::RIGHT_ANTI:
+				break;
+			default:
+				throw NotImplementedException("AstToInlineSQL: DELIM_JOIN type %s not supported in recursive CTE step",
+				                              EnumUtil::ToString(join.join_type));
+			}
+			vector<string> select_cols = join.cte_column_names;
+			if (!join.mark_expression.empty() && !select_cols.empty()) {
+				select_cols.back() = join.mark_expression + " AS " + select_cols.back();
+			}
+			if (join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI) {
+				string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + right_sql + ") " +
+				             (join.join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI") + " JOIN (" + left_sql + ")";
+				if (!join.conditions.empty()) {
+					sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+				}
+				return sql;
+			}
+			string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + left_sql + ") " + join_kw +
+			             " JOIN (" + right_sql + ")";
+			if (!join.conditions.empty()) {
+				sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+			}
+			return sql;
+		}
+
+		if (type == "DelimGet") {
+			const AstDelimGetNode &delim_get = static_cast<const AstDelimGetNode &>(ast_node);
+			auto it = inline_delim_sources.find(delim_get.table_index);
+			if (it == inline_delim_sources.end()) {
+				throw NotImplementedException(
+				    "AstToInlineSQL: DelimGet table_index=%llu has no inline DELIM_JOIN source",
+				    (unsigned long long)delim_get.table_index);
+			}
+			string sql = "SELECT DISTINCT ";
+			for (size_t i = 0; i < delim_get.source_col_names.size(); i++) {
+				if (i > 0) {
+					sql += ", ";
+				}
+				sql += delim_get.source_col_names[i] + " AS " + delim_get.cte_column_names[i];
+			}
+			return sql + " FROM (" + it->second + ")";
+		}
+
+		if (type == "Aggregate") {
+			const AstAggregateNode &agg = static_cast<const AstAggregateNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT ";
+			vector<string> select_items;
+			for (size_t i = 0; i < agg.group_by_columns.size(); i++) {
+				select_items.push_back(agg.group_by_columns[i] + " AS " + agg.cte_column_names[i]);
+			}
+			for (size_t i = 0; i < agg.aggregate_expressions.size(); i++) {
+				select_items.push_back(agg.aggregate_expressions[i] + " AS " +
+				                       agg.cte_column_names[agg.group_by_columns.size() + i]);
+			}
+			sql += VecToSeparatedList(select_items);
+			sql += " FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			if (!agg.group_by_clause.empty()) {
+				sql += " GROUP BY " + agg.group_by_clause;
+			}
+			return sql;
+		}
+
+		if (type == "Distinct") {
+			D_ASSERT(ast_node.children.size() == 1);
+			const AstDistinctNode &d = static_cast<const AstDistinctNode &>(ast_node);
+			const auto &cols =
+			    d.cte_column_names.empty() ? ast_node.children[0]->OutputColumnNames() : d.cte_column_names;
+			return "SELECT DISTINCT " + VecToSeparatedList(cols) + " FROM (" +
+			       AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+		}
+
+		if (type == "Order") {
+			const AstOrderNode &o = static_cast<const AstOrderNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			return "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ") ORDER BY " +
+			       VecToSeparatedList(o.order_items);
+		}
+
+		if (type == "Limit") {
+			const AstLimitNode &l = static_cast<const AstLimitNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			if (!l.limit_str.empty()) {
+				sql += " LIMIT " + l.limit_str;
+			}
+			if (!l.offset_str.empty()) {
+				sql += " OFFSET " + l.offset_str;
+			}
+			return sql;
+		}
+
+		if (type == "TopN") {
+			const AstTopNNode &topn = static_cast<const AstTopNNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) +
+			             ") ORDER BY " + VecToSeparatedList(topn.order_items) + " LIMIT " + std::to_string(topn.limit);
+			if (topn.offset > 0) {
+				sql += " OFFSET " + std::to_string(topn.offset);
+			}
+			return sql;
+		}
+
+		if (type == "Union") {
+			const AstUnionNode &u = static_cast<const AstUnionNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string union_kw = u.is_union_all ? " UNION ALL " : " UNION ";
+			return "(" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")" + union_kw + "(" +
+			       AstToInlineSQL(*ast_node.children[1], inline_delim_sources) + ")";
+		}
+
+		throw NotImplementedException(
+		    "AstToInlineSQL: node type '%s' is not supported in a recursive CTE step — cannot serialize as inline SQL",
+		    type);
 	}
 
 	//--------------------------------------------------------------------------
@@ -2390,6 +2978,53 @@ private:
 			return make_uniq<DelimGetNode>(my_index, dg.cte_column_names, source_cte_name, dg.source_col_names);
 		}
 
+		// RecursiveCte: flatten anchor first (as flat CTEs), then generate inline SQL for the
+		// recursive step (to avoid forward references to the recursive CTE name), then create
+		// the RecursiveCteNode. Returns a GetNode that maps the recursive CTE's exposed columns
+		// to the LPTS-prefixed names expected by parent operators.
+		if (type == "RecursiveCte") {
+			const AstRecursiveCteNode &rec = static_cast<const AstRecursiveCteNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+
+			// 1. Flatten anchor: push all anchor flat CTEs; anchor_tail is the last one.
+			unique_ptr<CteNode> anchor_tail = FlattenNode(*ast_node.children[0]);
+			const string anchor_cte_name = anchor_tail->cte_name;
+			const vector<string> anchor_lpts_cols = anchor_tail->cte_column_list;
+			cte_nodes.push_back(std::move(anchor_tail));
+
+			// 2. Derive the stripped column names (user-visible, e.g. "n") for the CTE header.
+			vector<string> stripped_cols;
+			for (const string &c : anchor_lpts_cols) {
+				const size_t pos = c.find('_');
+				stripped_cols.push_back((pos != string::npos && pos + 1 < c.size()) ? c.substr(pos + 1) : c);
+			}
+
+			// 3. Assign the recursive CTE's index and name; register in cte_index_to_body_info
+			//    so self-referencing CteRef nodes inside the recursive step can resolve to it.
+			const size_t rec_index = node_count++;
+			const string rec_name = "recursive_cte_" + std::to_string(rec_index);
+			cte_index_to_body_info[rec.cte_table_index] = {rec_name, stripped_cols};
+			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: " + rec_name + " anchor='" + anchor_cte_name +
+			                 "' stripped_cols=[" + VecToSeparatedList(stripped_cols) + "]");
+
+			// 4. Generate inline SQL for the recursive step.
+			const string recursive_step_sql = AstToInlineSQL(*ast_node.children[1]);
+			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: recursive_step_sql='" + recursive_step_sql + "'");
+
+			// 5. Push the RecursiveCteNode and mark the list as recursive.
+			cte_nodes.push_back(make_uniq<RecursiveCteNode>(rec_index, stripped_cols, anchor_cte_name, anchor_lpts_cols,
+			                                                recursive_step_sql, rec.union_all));
+			has_recursive_cte = true;
+
+			// 6. Return a GetNode that maps the recursive CTE's exposed column names (stripped)
+			//    to the LPTS-prefixed names (output_col_names) that parent nodes expect.
+			const size_t scan_index = node_count++;
+			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: scan_" + std::to_string(scan_index) + " -> SELECT FROM '" +
+			                 rec_name + "'");
+			return make_uniq<GetNode>(scan_index, rec.output_col_names, "", "", rec_name, 0, vector<string>(),
+			                          stripped_cols);
+		}
+
 		// 1. Recurse into children first (post-order), remembering each child's CTE
 		//    name so the parent can reference it by name. We keep the name (not the
 		//    child's idx) because UNION flattening may insert intermediate CTEs into
@@ -2452,6 +3087,10 @@ private:
 			if (children_names.size() == 2) {
 				return make_uniq<UnionNode>(my_index, u.cte_column_names, children_names[0], children_names[1],
 				                            u.is_union_all);
+			}
+			if (children_names.size() == 1) {
+				return make_uniq<ProjectNode>(my_index, u.cte_column_names, children_names[0], children_column_lists[0],
+				                              0);
 			}
 			// N-ary UNION: chain as left-deep binary UNIONs
 			// (A UNION B UNION C) → UNION(UNION(A, B), C)
@@ -2532,7 +3171,7 @@ public:
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
 			StampDialect(cte_nodes, *insert_node);
-			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node));
+			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte);
 		}
 
 		// Regular SELECT: FlattenNode handles the entire subtree bottom-up.
@@ -2559,7 +3198,7 @@ public:
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
 		StampDialect(cte_nodes, *final_node);
-		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node));
+		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte);
 	}
 
 private:

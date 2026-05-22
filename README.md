@@ -1,119 +1,98 @@
-# LPTS — Logical Plan To String
+# LPTS
 
-A DuckDB extension that converts a SQL query's logical plan back into a SQL string representation. This is useful for understanding how DuckDB internally represents queries and for compiler/optimizer research.
+A DuckDB extension for **optimized-plan inspection** and **cross-system SQL
+compilation**. LPTS takes DuckDB's post-optimizer logical plan and reconstructs
+equivalent SQL as a sequence of named CTEs.
 
-The extension takes an input SQL query, runs it through DuckDB's parser and planner to obtain a logical plan, then converts that plan into a flat CTE (Common Table Expression) list, and finally serializes it back to a SQL string.
+This makes optimizer rewrites visible: filter pushdown, join reordering, CTE
+materialization, top-N rewrites, and subquery decorrelation can all show up in
+the generated SQL.
 
-The conversion pipeline is: **Logical Plan → CTE List → SQL String**. There is no AST involved.
-
-## Building
-
-```sh
-GEN=ninja make
-```
-
-The main binaries that will be built are:
-```
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/lpts/lpts.duckdb_extension
-```
-
-## Usage
-
-Start the DuckDB shell with the extension loaded:
-```sh
-./build/release/duckdb
-```
-
-### PRAGMA syntax
+## PRAGMA Syntax
 
 ```sql
--- First create some tables to query against
+PRAGMA lpts('<query>');
+```
+
+Example:
+
+```sql
+LOAD 'build/release/extension/lpts/lpts.duckdb_extension';
+
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
-CREATE TABLE orders (id INTEGER, user_id INTEGER, amount DECIMAL);
+INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 22), (3, 'Carol', 28);
 
--- Convert a SELECT query's logical plan to SQL
-PRAGMA lpts('SELECT * FROM users');
-
--- More complex example with joins
-PRAGMA lpts('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id');
-
--- Aggregation example
-PRAGMA lpts('SELECT name, count(*) FROM users GROUP BY name');
+PRAGMA lpts('SELECT name FROM users WHERE age > 25');
 ```
 
-### Table function syntax
+```text
+WITH scan_0 (t0_name) AS (SELECT name FROM memory.main.users WHERE age>25),
+projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
+SELECT t1_name AS "name" FROM projection_1;
+```
 
-For programmatic use, the `lpts_query` table function returns the result as a row:
+Check round-trip correctness:
+
 ```sql
-SELECT * FROM lpts_query('SELECT * FROM users WHERE age > 25');
+PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
 ```
 
-## How it works
-
-1. The input SQL query is parsed using DuckDB's `Parser`
-2. The parsed statement is planned using DuckDB's `Planner` to produce a `LogicalOperator` tree
-3. `LogicalPlanToSql` traverses the logical plan **bottom-up** (leaves first), converting each operator into a CTE node (`GetNode`, `FilterNode`, `ProjectNode`, `AggregateNode`, `JoinNode`, etc.)
-4. Each node becomes a CTE (Common Table Expression) in the output
-5. The complete CTE list is serialized back into a SQL string
-
-### CTE list
-
-We use a **flat, ordered list of CTEs** where dependencies between steps are expressed through name references (e.g. `filter_1` reads `FROM scan_0`). The bottom-up traversal order guarantees that each CTE only references CTEs defined before it. This makes the output easy to read and each step self-contained.
-
-### Supported operators
-
-- `LOGICAL_GET` — table scans (with filter pushdown)
-- `LOGICAL_FILTER` — WHERE clauses
-- `LOGICAL_PROJECTION` — column selection and expressions
-- `LOGICAL_AGGREGATE_AND_GROUP_BY` — aggregates and GROUP BY
-- `LOGICAL_COMPARISON_JOIN` — joins (INNER, LEFT, RIGHT, OUTER)
-- `LOGICAL_UNION` — UNION / UNION ALL
-- `LOGICAL_INSERT` — INSERT statements
-
-## Project structure
-
-```
-src/
-  include/
-    lpts_extension.hpp          # Extension class declaration
-    logical_plan_to_sql.hpp     # CTE node classes and LogicalPlanToSql converter
-    lpts_helpers.hpp            # String utility functions
-  lpts_extension.cpp            # Extension entry point, pragma and table function registration
-  logical_plan_to_sql.cpp       # CTE node ToQuery() implementations and plan traversal
-  lpts_helpers.cpp              # Helper function implementations
-test/
-  sql/
-    select.test                 # SELECT, filter tests
-    group_by.test               # Aggregate and GROUP BY tests
-    join.test                   # JOIN and UNION tests
+```text
+true
 ```
 
-## Running tests
+## Pragmas and Functions
 
-```sh
-make test
+| Function | Description |
+|---|---|
+| `PRAGMA lpts('query')` | Return generated CTE SQL |
+| `lpts_query('query')` | Table-function form of `PRAGMA lpts` |
+| `PRAGMA lpts_exec('query')` | Execute the generated SQL |
+| `PRAGMA lpts_check('query')` | Compare original and generated SQL with bag equality |
+| `PRAGMA print_ast('query')` | Print the AST to stdout |
+| `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
+
+## Supported Operators
+
+LPTS is intended to cover all logical operators produced by optimized DuckDB
+SELECT plans. The current regression suite round-trips all 22 TPC-H queries and
+exercises joins, aggregates, windows, set operations, CTEs, recursive CTEs,
+table functions, DuckLake scans, and inserts.
+
+Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
+
+## Settings
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `lpts_dialect` | VARCHAR | `duckdb` | Output dialect: `duckdb` or `postgres` |
+
+```sql
+SET lpts_dialect = 'postgres';
+PRAGMA lpts('SELECT name FROM users WHERE age > 25');
 ```
+
+PostgreSQL output currently removes DuckDB catalog/schema qualifiers and remaps
+a small set of function names. Full dialect portability is still in progress.
 
 ## Limitations
 
-- Tables referenced in the input query must exist in the current database context
-- Not all logical operator types are supported yet (e.g. DELETE, UPDATE, subqueries)
-- The output SQL uses CTE-based decomposition, which may differ from the original query structure
+- Source tables must exist when LPTS plans the query.
+- LPTS reconstructs the optimized plan, not the original SQL text.
+- LPTS does not preserve formatting, alias spelling, or original CTE structure.
+- PostgreSQL dialect support is partial.
+- `PRAGMA lpts_check` can fail on nondeterministic queries, such as unordered
+  aggregates or `LIMIT` queries with ties.
 
-## Setting up CLion
+## Documentation
 
-### Opening project
-Configuring CLion with this extension requires a little work. Firstly, make sure that the DuckDB submodule is available.
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
+- **[Implementation](IMPLEMENTATION.md)** - build instructions, CLion setup, pipeline notes, and development workflow
+- **[Tests](test/README.md)** - SQLLogicTest conventions
+- **[Benchmarks](benchmark/README.md)** - SQLStorm benchmark runner
 
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
+## TODO
 
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
-
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
+- TODO dialects: complete PostgreSQL rendering for casts, intervals, function
+  names, date/time format strings, identifier quoting, and null ordering.
+- TODO put the PDF report: add `LPTS_Research_Project_Report.pdf` to the repo
+  and link it from this README.

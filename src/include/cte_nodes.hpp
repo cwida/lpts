@@ -373,17 +373,39 @@ public:
 	string ToQuery() override;
 };
 
+/// Recursive CTE node — WITH RECURSIVE body definition.
+/// The body combines an anchor SELECT (reading from anchor_cte_name) with the
+/// recursive step (expressed as inline SQL) using UNION [ALL].
+/// cte_column_list holds the user-visible column names for the CTE header, e.g. (n).
+class RecursiveCteNode : public CteNode {
+	string anchor_cte_name;     ///< The flat CTE that holds the anchor result.
+	vector<string> anchor_cols; ///< LPTS column names to SELECT from the anchor CTE.
+	string recursive_step_sql;  ///< Inline SQL for the recursive step.
+	bool union_all;
+
+public:
+	~RecursiveCteNode() override = default;
+	RecursiveCteNode(const size_t index, vector<string> stripped_cols, string _anchor_cte_name,
+	                 vector<string> _anchor_cols, string _recursive_step_sql, bool _union_all)
+	    : CteNode(index, "recursive_cte_" + std::to_string(index), std::move(stripped_cols)),
+	      anchor_cte_name(std::move(_anchor_cte_name)), anchor_cols(std::move(_anchor_cols)),
+	      recursive_step_sql(std::move(_recursive_step_sql)), union_all(_union_all) {
+	}
+	string ToQuery() override;
+};
+
 /// The complete CTE list: an ordered list of CTE nodes + one final (root) node.
 /// Calling ToQuery() serializes the whole thing into a single SQL string.
 class CteList {
 	// Attributes.
 	vector<unique_ptr<CteNode>> nodes; ///< Ordered list of CTEs (leaf-to-root).
 	unique_ptr<RootNode> final_node;   ///< The closing statement (SELECT or INSERT).
+	bool has_recursive_cte;            ///< True if any node is a RecursiveCteNode.
 
 public:
 	// Constructor.
-	CteList(vector<unique_ptr<CteNode>> _nodes, unique_ptr<RootNode> _final_node)
-	    : nodes(std::move(_nodes)), final_node(std::move(_final_node)) {
+	CteList(vector<unique_ptr<CteNode>> _nodes, unique_ptr<RootNode> _final_node, bool _has_recursive_cte = false)
+	    : nodes(std::move(_nodes)), final_node(std::move(_final_node)), has_recursive_cte(_has_recursive_cte) {
 	}
 	/// Serialize the CTE list into a SQL query string.
 	/// If `use_newlines` is true, the string uses newlines between CTEs for readability.

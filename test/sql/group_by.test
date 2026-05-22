@@ -258,6 +258,19 @@ PRAGMA lpts_check('SELECT product, GROUPING(product) AS product_grouping, SUM(am
 ----
 true
 
+# --- Ordered-set aggregate stores percentile in aggregate bind data ---
+
+statement ok
+CREATE TABLE percentile_items (grp INTEGER, val DECIMAL(10, 2));
+
+statement ok
+INSERT INTO percentile_items VALUES (1, 10.00), (1, 20.00), (1, 30.00), (2, 5.00), (2, 15.00);
+
+query I
+PRAGMA lpts_check('SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY val) AS p75 FROM percentile_items');
+----
+true
+
 query I
 PRAGMA lpts_check('SELECT product, region, GROUPING(product) AS product_grouping, GROUPING(region) AS region_grouping, SUM(amount) FROM sales GROUP BY ROLLUP(product, region) ORDER BY product, region, product_grouping, region_grouping');
 ----

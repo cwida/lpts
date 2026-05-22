@@ -1,11 +1,33 @@
-# Testing this extension
-This directory contains all the tests for this extension. The `sql` directory holds tests that are written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). DuckDB aims to have most its tests in this format as SQL statements, so for the quack extension, this should probably be the goal too.
+# LPTS Tests
 
-The root makefile contains targets to build and run all of these tests. To run the SQLLogicTests:
+Tests are DuckDB SQLLogicTests under `test/sql/`.
+
+## Run
+
 ```bash
-make test
+GEN=ninja make
+build/release/test/unittest "test/sql/select.test"
+build/release/test/unittest "test/sql/tpch.test"
 ```
-or 
-```bash
-make test_debug
+
+## Rule
+
+Every feature test needs a round-trip check:
+
+```sql
+query I
+PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
+----
+true
 ```
+
+Use `PRAGMA lpts_exec('<query>')` only when concrete output rows are useful.
+Use `lpts_query('<query>')` only when the exact generated SQL is the behavior
+under test.
+
+## Notes
+
+- Prefer small tables and focused queries.
+- Use `rowsort` when row order is not part of the behavior.
+- Use explicit `ORDER BY` when order is part of the behavior.
+- Do not remove a failing test to make the suite pass.

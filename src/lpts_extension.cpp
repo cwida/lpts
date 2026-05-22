@@ -36,22 +36,24 @@ static SqlDialect ReadDialect(ClientContext &context) {
 /// Plan a query and run it through the optimizer, returning the optimized
 /// logical plan. This ensures LPTS sees the same plan DuckDB would execute.
 ///
-/// Some optimizers are disabled because they produce plan nodes or structures
-/// that LPTS cannot yet convert back to SQL:
-///   - COLUMN_LIFETIME: changes column bindings in ways that break CTE references
-///   - STATISTICS_PROPAGATION: triggers DUMMY_SCAN for constant-foldable queries
-///   - CTE_INLINING: introduces LogicalCTEScan nodes
-///   - MATERIALIZED_CTE: introduces LogicalCTEScan nodes
-///   - COMMON_SUBPLAN: introduces LogicalCTEScan nodes
-///
-/// REORDER_FILTER and JOIN_FILTER_PUSHDOWN are safe: REORDER_FILTER only reorders
-/// expressions inside LogicalFilter nodes (order doesn't affect SQL correctness),
-/// and JOIN_FILTER_PUSHDOWN only attaches runtime JoinFilterPushdownInfo metadata
-/// to join nodes and DynamicTableFilterSet to scans — neither is read by LPTS.
-///
-/// TODO: research whether the remaining disabled optimizers can be re-enabled by
-/// adding support for the plan structures they produce (DUMMY_SCAN, LogicalTopN,
-/// LogicalCTEScan).
+/// All optimizers are enabled. Key notes per optimizer:
+///   - CTE_INLINING: inlines CTEs into the query body; produces ordinary LogicalProjection
+///     nodes (no new node types needed).
+///   - MATERIALIZED_CTE: converts default CTEs to LogicalMaterializedCTE + LogicalCTERef;
+///     both are handled by AstMaterializedCteNode / AstCteRefNode.
+///   - COMMON_SUBPLAN: detects identical subplans and materializes them as
+///     LogicalMaterializedCTE + LogicalCTERef; handled by the same nodes above.
+///   - STATISTICS_PROPAGATION: LPTS handles LOGICAL_DUMMY_SCAN, LOGICAL_EMPTY_RESULT, and
+///     the LogicalExpressionGet+DummyScan pattern emitted by TryExecuteAggregates.
+///   - COMPRESSED_MATERIALIZATION: a sub-pass of STATISTICS_PROPAGATION that injects
+///     __internal_compress_* / __internal_decompress_* function calls.
+///     ExpressionToAliasedString() strips these wrappers transparently.
+///   - COLUMN_LIFETIME: sets projection_map on LogicalFilter, LogicalOrder, and
+///     LogicalComparisonJoin to prune columns no longer referenced above those nodes.
+///     FilterNode and OrderNode handle this by using an explicit SELECT column list
+///     instead of SELECT *, so the CTE header column count always matches the body.
+///   - REORDER_FILTER: only reorders expressions inside LogicalFilter nodes — safe.
+///   - JOIN_FILTER_PUSHDOWN: only attaches runtime metadata to join/scan nodes — safe.
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
 	Parser parser;
 	parser.ParseQuery(query);
@@ -61,53 +63,16 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	Planner planner(context);
 	planner.CreatePlan(parser.statements[0]->Copy());
 
-	// Temporarily disable optimizers that produce plan structures LPTS has not implemented yet.
 	auto &config = DBConfig::GetConfig(context);
 	auto saved = config.options.disabled_optimizers;
-	config.options.disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
-	config.options.disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
-	config.options.disabled_optimizers.insert(OptimizerType::CTE_INLINING);
-	config.options.disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
-	config.options.disabled_optimizers.insert(OptimizerType::COMMON_SUBPLAN);
-
-#if LPTS_DEBUG
-	{
-		string dump = "[LPTS] disabled_optimizers BEFORE LPTS optimize: {";
-		for (auto &t : config.options.disabled_optimizers) {
-			dump += OptimizerTypeToString(t) + ", ";
-		}
-		dump += "}";
-		LPTS_DEBUG_PRINT(dump);
-	}
-#endif
 
 	Optimizer optimizer(*planner.binder, context);
 	auto result = optimizer.Optimize(std::move(planner.plan));
 
 #if LPTS_DEBUG
-	// Re-enable ALL optimizers (clear disabled set) and re-plan for side-by-side comparison.
-	config.options.disabled_optimizers.clear();
-	{
-		string dump = "[LPTS] disabled_optimizers BEFORE full optimize: {";
-		for (auto &t : config.options.disabled_optimizers) {
-			dump += OptimizerTypeToString(t) + ", ";
-		}
-		dump += "}";
-		LPTS_DEBUG_PRINT(dump);
-	}
-
-	Parser full_parser;
-	full_parser.ParseQuery(query);
-	Planner full_planner(context);
-	full_planner.CreatePlan(full_parser.statements[0]->Copy());
-	Optimizer full_optimizer(*full_planner.binder, context);
-	auto full_result = full_optimizer.Optimize(std::move(full_planner.plan));
-
-	LPTS_DEBUG_PRINT("[LPTS] ===== Plan WITH LPTS-disabled optimizers (used by LPTS) =====");
+	LPTS_DEBUG_PRINT("[LPTS] ===== Optimized logical plan =====");
 	result->Print();
-	LPTS_DEBUG_PRINT("[LPTS] ===== Plan WITH ALL optimizers enabled =====");
-	full_result->Print();
-	LPTS_DEBUG_PRINT("[LPTS] ===== end plan comparison =====");
+	LPTS_DEBUG_PRINT("[LPTS] ===== end plan =====");
 #endif
 
 	// Restore original disabled_optimizers set
