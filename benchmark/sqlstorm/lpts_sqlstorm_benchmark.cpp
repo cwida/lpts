@@ -351,15 +351,15 @@ static bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 		reason = "volatile random() expression";
 		return true;
 	}
-	if (ContainsNormalizedPhrase(sql, "row_number() over")) {
+	if (HasWindowFunctionCall(sql, "row_number")) {
 		reason = "row_number over potentially tied ordering keys";
 		return true;
 	}
-	if (ContainsNormalizedPhrase(sql, "rank() over")) {
+	if (HasWindowFunctionCall(sql, "rank")) {
 		reason = "rank over potentially tied ordering keys";
 		return true;
 	}
-	if (ContainsNormalizedPhrase(sql, "dense_rank() over")) {
+	if (HasWindowFunctionCall(sql, "dense_rank")) {
 		reason = "dense_rank over potentially tied ordering keys";
 		return true;
 	}
