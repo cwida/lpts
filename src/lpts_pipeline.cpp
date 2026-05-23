@@ -2460,7 +2460,7 @@ private:
 			                                               std::move(output_col_names));
 			rec_node->children.push_back(std::move(child_nodes[0]));
 			rec_node->children.push_back(std::move(child_nodes[1]));
-			return rec_node;
+			return std::move(rec_node);
 		} else {
 			for (auto &child : op->children) {
 				child_nodes.push_back(RecursiveTraversal(child));
