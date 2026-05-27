@@ -22,6 +22,7 @@
 #include "lpts_pipeline.hpp"
 #include "lpts_helpers.hpp"
 #include "lpts_debug.hpp"
+#include "dialect_function_map.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
@@ -806,9 +807,8 @@ private:
 			separator = " ";
 		}
 		if (dialect == SqlDialect::SPARK && window.exclude_clause != WindowExcludeMode::NO_OTHER) {
-			throw NotImplementedException(
-			    "LPTS SPARK dialect: window EXCLUDE clauses are not supported by Spark SQL. "
-			    "Remove the EXCLUDE clause or restructure the window expression.");
+			throw NotImplementedException("LPTS SPARK dialect: window EXCLUDE clauses are not supported by Spark SQL. "
+			                              "Remove the EXCLUDE clause or restructure the window expression.");
 		}
 		switch (window.exclude_clause) {
 		case WindowExcludeMode::NO_OTHER:
@@ -905,40 +905,8 @@ private:
 				expr_str << ExpressionToAliasedString(func_expr.children[0]);
 				break;
 			}
-			// Dialect-specific function name remapping.
-			string func_name = func_expr.function.name;
-			if (dialect == SqlDialect::POSTGRES) {
-				if (func_name == "strptime") {
-					func_name = "to_timestamp";
-				} else if (func_name == "strftime") {
-					func_name = "to_char";
-				}
-			} else if (dialect == SqlDialect::SPARK) {
-				// Spark SQL: closest semantic equivalents for the DuckDB function names
-				// OpenIVM-emitted plans actually exercise. Functions Spark already has
-				// with identical signatures (e.g. `coalesce`, `greatest`, `least`,
-				// arithmetic operators, `length`, `lower`, `upper`, `cast`, etc.) pass
-				// through unchanged. Unsupported functions surface as a Spark-side error
-				// rather than being silently mistranslated.
-				if (func_name == "strftime") {
-					func_name = "date_format";
-				} else if (func_name == "strptime") {
-					func_name = "to_timestamp";
-				} else if (func_name == "list_transform" || func_name == "array_transform") {
-					func_name = "transform";
-				} else if (func_name == "list_aggregate" || func_name == "array_aggregate") {
-					func_name = "aggregate";
-				} else if (func_name == "list_filter" || func_name == "array_filter") {
-					func_name = "filter";
-				} else if (func_name == "list_value") {
-					func_name = "array";
-				} else if (func_name == "list_contains" || func_name == "array_contains") {
-					func_name = "array_contains";
-				} else if (func_name == "list_extract" || func_name == "array_extract") {
-					// Spark's element_at is 1-indexed (matches DuckDB list semantics).
-					func_name = "element_at";
-				}
-			}
+			// Dialect-specific function name remapping (see dialect_function_map.hpp).
+			string func_name = RemapFunctionNameForDialect(func_expr.function.name, dialect);
 			// For lambda functions, only serialize non-lambda, non-capture children
 			idx_t child_count = func_expr.children.size();
 			if (func_expr.function.bind_lambda != nullptr) {
@@ -1432,7 +1400,8 @@ private:
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
 					string filter_str;
-					if (!TableFilterToSql(*entry.second, DialectQuoteIdent(get.names[entry.first], dialect), filter_str)) {
+					if (!TableFilterToSql(*entry.second, DialectQuoteIdent(get.names[entry.first], dialect),
+					                      filter_str)) {
 						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
@@ -2592,8 +2561,9 @@ private:
 					if (i > 0) {
 						sql += ", ";
 					}
-					string source_col =
-					    get.table_name == "(SELECT 1)" ? get.column_names[i] : DialectQuoteIdent(get.column_names[i], dialect);
+					string source_col = get.table_name == "(SELECT 1)"
+					                        ? get.column_names[i]
+					                        : DialectQuoteIdent(get.column_names[i], dialect);
 					sql += source_col + " AS " + get.cte_column_names[i];
 				}
 			}
@@ -3170,8 +3140,7 @@ public:
 			auto insert_node =
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
-			StampDialect(cte_nodes, *insert_node);
-			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte);
+			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte, dialect);
 		}
 
 		// Regular SELECT: FlattenNode handles the entire subtree bottom-up.
@@ -3197,20 +3166,7 @@ public:
 		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, last_cte->cte_column_list,
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
-		StampDialect(cte_nodes, *final_node);
-		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte);
-	}
-
-private:
-	/// Propagate the flattener's dialect onto every node so dialect-aware
-	/// serialization (identifier quoting, etc.) works at ToQuery() time.
-	void StampDialect(vector<unique_ptr<CteNode>> &nodes, CteBaseNode &root) const {
-		for (auto &node : nodes) {
-			if (node) {
-				node->dialect = dialect;
-			}
-		}
-		root.dialect = dialect;
+		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte, dialect);
 	}
 };
 

@@ -1,0 +1,164 @@
+# name: test/sql/dialect_spark.test
+# description: lpts SQL output for the SPARK dialect — identifier quoting (backticks),
+# group: [sql]
+
+#              function name remapping, and dialect-only error paths. We cannot use
+#              lpts_check here (we cannot execute Spark SQL inside DuckDB), so we
+#              assert the literal SQL output via lpts_query(...) instead, per the
+#              guidance on PR #9.
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', 10), (2, 'Bob', 20);
+
+statement ok
+CREATE TABLE events (id INTEGER, ts TIMESTAMP, vals INTEGER[]);
+
+statement ok
+INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00', [1, 2, 3]);
+
+# ============================================================
+# Setup: enable SPARK dialect
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'spark';
+
+# ============================================================
+# Identifier quoting — backticks
+# ============================================================
+
+# Catalog.schema.table is fully backtick-quoted.
+query I
+SELECT sql LIKE '%`memory`.`main`.`users`%' AS qualified_backticks FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# Column names in the inner GET scan use backticks.
+query I
+SELECT sql LIKE '%SELECT `id`%' AS column_backticked FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# A reserved-word column ("order") is backticked in the output.
+query I
+SELECT sql LIKE '%`order`%' AS reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+# The final SELECT user-facing alias is backticked under SPARK.
+query I
+SELECT sql LIKE '% AS `name`%' AS alias_backticked FROM lpts_query('SELECT name FROM users');
+----
+true
+
+# Sanity: under SPARK we should NOT emit DuckDB-style double-quoted identifiers
+# (DuckDB only quotes reserved/special names; `id` etc. would otherwise come out
+# unquoted under DuckDB).
+query I
+SELECT sql NOT LIKE '%"users"%' AS no_double_quote_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# ============================================================
+# Function name remapping — Spark (refactored into dialect_function_map.cpp)
+# ============================================================
+
+# strftime → date_format
+query I
+SELECT sql LIKE '%date_format(%' AS spark_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+# list_transform → transform
+query I
+SELECT sql LIKE '%transform(%' AS spark_list_transform FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+----
+true
+
+# list_value → array
+query I
+SELECT sql LIKE '%array(%' AS spark_list_value FROM lpts_query('SELECT [id, id+1] AS pair FROM users');
+----
+true
+
+# list_contains → array_contains
+query I
+SELECT sql LIKE '%array_contains(%' AS spark_list_contains FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
+----
+true
+
+# list_extract → element_at
+query I
+SELECT sql LIKE '%element_at(%' AS spark_list_extract FROM lpts_query('SELECT list_extract(vals, 1) AS first_val FROM events');
+----
+true
+
+# COALESCE is a BOUND_OPERATOR (not a BOUND_FUNCTION) so it bypasses the dialect
+# function remap entirely and survives as the literal Spark-compatible keyword.
+# Two non-literal arguments avoid the optimizer folding the COALESCE away.
+query I
+SELECT sql LIKE '%COALESCE(%' AS coalesce_passthrough FROM lpts_query('SELECT coalesce(name, CAST(id AS VARCHAR)) AS c FROM users');
+----
+true
+
+# ============================================================
+# Window-frame SPARK gate: EXCLUDE clauses → NotImplementedException
+# (Spark SQL supports only ROWS / RANGE without exclusion.)
+# ============================================================
+
+statement error
+PRAGMA lpts('SELECT id, sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS s FROM users');
+----
+SPARK dialect: window EXCLUDE clauses
+
+# ============================================================
+# Dialect parser — accepts both 'spark' and 'SPARK', rejects unknowns
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_dialect = 'SPARK';
+
+# Round-trip back to a sane default for the rest of the tests.
+statement ok
+SET lpts_dialect = 'duckdb';
+
+# Unknown dialect: the validation happens lazily when the dialect is read by
+# lpts_query/lpts_check. The error message must list 'spark' as a valid option.
+statement ok
+SET lpts_dialect = 'snowflake';
+
+statement error
+SELECT sql FROM lpts_query('SELECT id FROM users');
+----
+spark
+
+# ============================================================
+# POSTGRES regression: the refactored RemapFunctionNameForDialect must still
+# emit the existing Postgres mappings (strftime → to_char, strptime →
+# to_timestamp). Guards against silent regression from the file split in #5.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'postgres';
+
+query I
+SELECT sql LIKE '%to_char(%' AS postgres_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+# Under DuckDB, strftime stays strftime (no remap).
+query I
+SELECT sql LIKE '%strftime(%' AS duckdb_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true

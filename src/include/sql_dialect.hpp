@@ -13,7 +13,8 @@ namespace duckdb {
 enum class SqlDialect {
 	DUCKDB,   ///< Default. Uses DuckDB-specific syntax (fully-qualified table refs, "ident" quoting, etc.)
 	POSTGRES, ///< PostgreSQL-compatible syntax (unqualified table refs, "ident" quoting, etc.)
-	SPARK     ///< Apache Spark SQL syntax (catalog.schema.table qualified, `ident` backtick quoting, ROWS/RANGE-only windows)
+	SPARK     ///< Apache Spark SQL syntax (catalog.schema.table qualified, `ident` backtick quoting, ROWS/RANGE-only
+	          ///< windows)
 };
 
 /// Parse a dialect string ("duckdb", "postgres", or "spark") into the enum.
