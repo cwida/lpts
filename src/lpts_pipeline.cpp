@@ -22,6 +22,7 @@
 #include "lpts_pipeline.hpp"
 #include "lpts_helpers.hpp"
 #include "lpts_debug.hpp"
+#include "dialect_function_map.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
@@ -790,6 +791,11 @@ private:
 			}
 		}
 		if (!frame_start.empty() || !frame_end.empty()) {
+			if (dialect == SqlDialect::SPARK && units == "GROUPS") {
+				throw NotImplementedException(
+				    "LPTS SPARK dialect: window frame units 'GROUPS' are not supported by Spark SQL "
+				    "(only ROWS and RANGE). Rewrite the window to use a ROWS/RANGE frame.");
+			}
 			result << separator << units;
 			if (!frame_start.empty() && !frame_end.empty()) {
 				result << " BETWEEN " << frame_start << " AND " << frame_end;
@@ -799,6 +805,10 @@ private:
 				result << " " << frame_end;
 			}
 			separator = " ";
+		}
+		if (dialect == SqlDialect::SPARK && window.exclude_clause != WindowExcludeMode::NO_OTHER) {
+			throw NotImplementedException("LPTS SPARK dialect: window EXCLUDE clauses are not supported by Spark SQL. "
+			                              "Remove the EXCLUDE clause or restructure the window expression.");
 		}
 		switch (window.exclude_clause) {
 		case WindowExcludeMode::NO_OTHER:
@@ -895,15 +905,8 @@ private:
 				expr_str << ExpressionToAliasedString(func_expr.children[0]);
 				break;
 			}
-			// Dialect-specific function name remapping.
-			string func_name = func_expr.function.name;
-			if (dialect == SqlDialect::POSTGRES) {
-				if (func_name == "strptime") {
-					func_name = "to_timestamp";
-				} else if (func_name == "strftime") {
-					func_name = "to_char";
-				}
-			}
+			// Dialect-specific function name remapping (see dialect_function_map.hpp).
+			string func_name = RemapFunctionNameForDialect(func_expr.function.name, dialect);
 			// For lambda functions, only serialize non-lambda, non-capture children
 			idx_t child_count = func_expr.children.size();
 			if (func_expr.function.bind_lambda != nullptr) {
@@ -1397,7 +1400,8 @@ private:
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
 					string filter_str;
-					if (!TableFilterToSql(*entry.second, QuoteIdentifier(get.names[entry.first]), filter_str)) {
+					if (!TableFilterToSql(*entry.second, DialectQuoteIdent(get.names[entry.first], dialect),
+					                      filter_str)) {
 						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
@@ -2425,7 +2429,7 @@ private:
 			                                               std::move(output_col_names));
 			rec_node->children.push_back(std::move(child_nodes[0]));
 			rec_node->children.push_back(std::move(child_nodes[1]));
-			return rec_node;
+			return std::move(rec_node);
 		} else {
 			for (auto &child : op->children) {
 				child_nodes.push_back(RecursiveTraversal(child));
@@ -2477,7 +2481,10 @@ SqlDialect ParseSqlDialect(const string &value) {
 	if (value == "postgres" || value == "POSTGRES" || value == "postgresql" || value == "POSTGRESQL") {
 		return SqlDialect::POSTGRES;
 	}
-	throw InvalidInputException("Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres'", value);
+	if (value == "spark" || value == "SPARK") {
+		return SqlDialect::SPARK;
+	}
+	throw InvalidInputException("Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark'", value);
 }
 
 //==============================================================================
@@ -2554,14 +2561,15 @@ private:
 					if (i > 0) {
 						sql += ", ";
 					}
-					string source_col =
-					    get.table_name == "(SELECT 1)" ? get.column_names[i] : QuoteIdentifier(get.column_names[i]);
+					string source_col = get.table_name == "(SELECT 1)"
+					                        ? get.column_names[i]
+					                        : DialectQuoteIdent(get.column_names[i], dialect);
 					sql += source_col + " AS " + get.cte_column_names[i];
 				}
 			}
 			sql += " FROM ";
 			if (!get.catalog.empty()) {
-				sql += QualifiedTableName(get.catalog, get.schema, get.table_name);
+				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect);
 			} else {
 				sql += get.table_name;
 				if (get.table_name.find('(') != string::npos && get.table_name != "(SELECT 1)" &&
@@ -2571,7 +2579,7 @@ private:
 					                        : get.table_function_output_count;
 					vector<string> table_function_columns;
 					for (idx_t i = 0; i < alias_count && i < get.column_names.size(); i++) {
-						table_function_columns.push_back(QuoteIdentifier(get.column_names[i]));
+						table_function_columns.push_back(DialectQuoteIdent(get.column_names[i], dialect));
 					}
 					sql += " _tf(" + VecToSeparatedList(table_function_columns) + ")";
 				}
@@ -3132,7 +3140,7 @@ public:
 			auto insert_node =
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
-			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte);
+			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte, dialect);
 		}
 
 		// Regular SELECT: FlattenNode handles the entire subtree bottom-up.
@@ -3158,7 +3166,7 @@ public:
 		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, last_cte->cte_column_list,
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
-		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte);
+		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte, dialect);
 	}
 };
 

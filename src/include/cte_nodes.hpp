@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "sql_dialect.hpp"
 
 namespace duckdb {
 
@@ -46,7 +47,9 @@ class CteBaseNode {
 public:
 	virtual ~CteBaseNode() = default;
 	/// Produce the SQL fragment for this node (the body inside a CTE's AS (...)).
-	virtual string ToQuery() = 0;
+	/// `dialect` controls identifier quoting and other dialect-specific syntax;
+	/// it is owned by the enclosing `CteList` and threaded in by it.
+	virtual string ToQuery(SqlDialect dialect) = 0;
 	// Constructor.
 	explicit CteBaseNode(const size_t index) : idx(index) {
 	}
@@ -78,7 +81,7 @@ public:
 	      child_cte_column_list(std::move(_child_cte_column_list)), final_column_list(std::move(_final_column_list)) {
 	}
 	// Functions
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// Node for insertion queries. Cannot be a CTE.
@@ -97,7 +100,7 @@ public:
 	      action_type(conflict_action_type) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// Node for update queries. Cannot be a CTE. (Not yet implemented.)
@@ -126,7 +129,7 @@ public:
 	// Requires ToQuery() to be implemented by derived classes.
 	/// Create a CTE-like string for the Node (excluding the WITH keyword).
 	/// Example output: "scan_0(t0_name, t0_age) AS (SELECT name, age FROM ...)"
-	string ToCteQuery();
+	string ToCteQuery(SqlDialect dialect);
 	// Attributes.
 	/// The name of the CTE (e.g. "scan_0", "filter_1").
 	string cte_name;
@@ -158,7 +161,7 @@ public:
 	      input_cte_name(std::move(_input_cte_name)), table_function_output_count(_table_function_output_count) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class FilterNode : public CteNode {
@@ -174,7 +177,7 @@ public:
 	      child_cte_name(std::move(_child_cte_name)), conditions(std::move(_conditions)) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class ProjectNode : public CteNode {
@@ -193,7 +196,7 @@ public:
 	      table_index(_table_index) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class AggregateNode : public CteNode {
@@ -213,7 +216,7 @@ public:
 	      group_by_clause(std::move(_group_by_clause)), aggregate_expressions(std::move(_aggregate_names)) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class JoinNode : public CteNode {
@@ -233,7 +236,7 @@ public:
 	      join_conditions(std::move(_join_conditions)), mark_expression(std::move(_mark_expression)) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class UnionNode : public CteNode {
@@ -251,7 +254,7 @@ public:
 	      is_union_all(union_all) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class ExceptNode : public CteNode {
@@ -269,7 +272,7 @@ public:
 	      is_except_all(except_all) {
 	}
 	// Functions.
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 class CteSetOperationNode : public CteNode {
@@ -286,7 +289,7 @@ public:
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)),
 	      op_name(std::move(_op_name)), is_all(all) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// ORDER BY node — wraps the child CTE with an ORDER BY clause.
@@ -299,7 +302,7 @@ public:
 	    : CteNode(index, "order_" + std::to_string(index), std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// LIMIT / OFFSET node — wraps the child CTE with LIMIT and optional OFFSET.
@@ -319,7 +322,7 @@ public:
 	      offset_str(std::move(_offset_str)), limit_needs_child_scalar(_limit_needs_child_scalar),
 	      offset_needs_child_scalar(_offset_needs_child_scalar) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// TOP_N node — ORDER BY + LIMIT/OFFSET fused into one CTE by the TOP_N optimizer.
@@ -337,7 +340,7 @@ public:
 	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)), limit(_limit),
 	      offset(_offset) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// DISTINCT node — wraps the child CTE with SELECT DISTINCT.
@@ -350,7 +353,7 @@ public:
 	    : CteNode(index, "distinct_" + std::to_string(index), std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// DELIM_GET node — SELECT DISTINCT of correlated columns from the outer query CTE.
@@ -367,7 +370,7 @@ public:
 	    : CteNode(index, "scan_" + std::to_string(index), std::move(cte_column_names)),
 	      source_cte_name(std::move(_source_cte_name)), source_cols(std::move(_source_cols)) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// Recursive CTE node — WITH RECURSIVE body definition.
@@ -388,7 +391,7 @@ public:
 	      anchor_cte_name(std::move(_anchor_cte_name)), anchor_cols(std::move(_anchor_cols)),
 	      recursive_step_sql(std::move(_recursive_step_sql)), union_all(_union_all) {
 	}
-	string ToQuery() override;
+	string ToQuery(SqlDialect dialect) override;
 };
 
 /// The complete CTE list: an ordered list of CTE nodes + one final (root) node.
@@ -398,11 +401,14 @@ class CteList {
 	vector<unique_ptr<CteNode>> nodes; ///< Ordered list of CTEs (leaf-to-root).
 	unique_ptr<RootNode> final_node;   ///< The closing statement (SELECT or INSERT).
 	bool has_recursive_cte;            ///< True if any node is a RecursiveCteNode.
+	SqlDialect dialect;                ///< Dialect propagated into every node's ToQuery().
 
 public:
 	// Constructor.
-	CteList(vector<unique_ptr<CteNode>> _nodes, unique_ptr<RootNode> _final_node, bool _has_recursive_cte = false)
-	    : nodes(std::move(_nodes)), final_node(std::move(_final_node)), has_recursive_cte(_has_recursive_cte) {
+	CteList(vector<unique_ptr<CteNode>> _nodes, unique_ptr<RootNode> _final_node, bool _has_recursive_cte = false,
+	        SqlDialect _dialect = SqlDialect::DUCKDB)
+	    : nodes(std::move(_nodes)), final_node(std::move(_final_node)), has_recursive_cte(_has_recursive_cte),
+	      dialect(_dialect) {
 	}
 	/// Serialize the CTE list into a SQL query string.
 	/// If `use_newlines` is true, the string uses newlines between CTEs for readability.

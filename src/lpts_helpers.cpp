@@ -6,6 +6,26 @@
 
 namespace duckdb {
 
+string DialectQuoteIdent(const string &name, SqlDialect dialect) {
+	if (dialect == SqlDialect::SPARK) {
+		// Spark always uses backticks; embedded backticks must be doubled.
+		std::ostringstream out;
+		out << '`';
+		for (char c : name) {
+			if (c == '`') {
+				out << '`' << '`';
+			} else {
+				out << c;
+			}
+		}
+		out << '`';
+		return out.str();
+	}
+	// DUCKDB / POSTGRES — fall back to DuckDB's helper, which only quotes when
+	// the identifier is a reserved keyword or contains special chars.
+	return KeywordHelper::WriteOptionallyQuoted(name);
+}
+
 string VecToSeparatedList(vector<string> input_list, const string &separator) {
 	std::ostringstream ret_str;
 	for (size_t i = 0; i < input_list.size(); ++i) {
@@ -43,6 +63,32 @@ string QuoteTableWithOptionalSuffix(const string &table_name) {
 
 string QualifiedTableName(const string &catalog, const string &schema, const string &table_name) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteTableWithOptionalSuffix(table_name);
+}
+
+string DialectVecToQuotedIdentifierList(const vector<string> &input_list, SqlDialect dialect, const string &separator) {
+	std::ostringstream ret_str;
+	for (size_t i = 0; i < input_list.size(); ++i) {
+		ret_str << DialectQuoteIdent(input_list[i], dialect);
+		if (i != input_list.size() - 1) {
+			ret_str << separator;
+		}
+	}
+	return ret_str.str();
+}
+
+string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect) {
+	static const string at_suffix = " AT (";
+	auto suffix_pos = table_name.find(at_suffix);
+	if (suffix_pos == string::npos) {
+		return DialectQuoteIdent(table_name, dialect);
+	}
+	return DialectQuoteIdent(table_name.substr(0, suffix_pos), dialect) + table_name.substr(suffix_pos);
+}
+
+string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
+                                 SqlDialect dialect) {
+	return DialectQuoteIdent(catalog, dialect) + "." + DialectQuoteIdent(schema, dialect) + "." +
+	       DialectQuoteTableWithOptionalSuffix(table_name, dialect);
 }
 
 string EscapeSingleQuotes(const string &input) {

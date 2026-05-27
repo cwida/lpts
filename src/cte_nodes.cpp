@@ -26,6 +26,7 @@ namespace {
 bool GetNodeColumnsAreExpressions(const string &table_name) {
 	return table_name == "(SELECT 1)";
 }
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -35,7 +36,7 @@ bool GetNodeColumnsAreExpressions(const string &table_name) {
 
 /// FinalReadNode: the closing SELECT that renames CTE columns back to their
 /// original names (e.g. "SELECT t2_name AS name FROM projection_2").
-string FinalReadNode::ToQuery() {
+string FinalReadNode::ToQuery(SqlDialect dialect) {
 	const size_t col_count = final_column_list.size();
 	if (child_cte_column_list.size() != col_count) {
 		throw InternalException("LPTS: Size mismatch between column lists");
@@ -44,7 +45,7 @@ string FinalReadNode::ToQuery() {
 	// Assign the final column names to the CTE column names. Format: "cte_col AS final_col".
 	merged_list.reserve(col_count);
 	for (size_t i = 0; i < final_column_list.size(); ++i) {
-		string final_name = KeywordHelper::WriteOptionallyQuoted(final_column_list[i]);
+		string final_name = DialectQuoteIdent(final_column_list[i], dialect);
 		merged_list.emplace_back(child_cte_column_list[i] + " AS " + final_name);
 	}
 	std::ostringstream sql_str;
@@ -55,7 +56,7 @@ string FinalReadNode::ToQuery() {
 	return sql_str.str();
 }
 
-string InsertNode::ToQuery() {
+string InsertNode::ToQuery(SqlDialect dialect) {
 	stringstream insert_str;
 	insert_str << "INSERT ";
 	switch (action_type) {
@@ -78,7 +79,7 @@ string InsertNode::ToQuery() {
 	return insert_str.str();
 }
 
-string CteNode::ToCteQuery() {
+string CteNode::ToCteQuery(SqlDialect dialect) {
 	std::ostringstream cte_str;
 	cte_str << cte_name;
 	if (!cte_column_list.empty()) {
@@ -87,12 +88,12 @@ string CteNode::ToCteQuery() {
 		cte_str << ")";
 	}
 	cte_str << " AS (";
-	cte_str << this->ToQuery();
+	cte_str << this->ToQuery(dialect);
 	cte_str << ")";
 	return cte_str.str();
 }
 
-string GetNode::ToQuery() {
+string GetNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream get_str;
 	get_str << "SELECT ";
 	if (column_names.empty()) {
@@ -100,12 +101,12 @@ string GetNode::ToQuery() {
 	} else if (GetNodeColumnsAreExpressions(table_name)) {
 		get_str << VecToSeparatedList(column_names);
 	} else {
-		get_str << VecToQuotedIdentifierList(column_names);
+		get_str << DialectVecToQuotedIdentifierList(column_names, dialect);
 	}
 	get_str << " FROM ";
 	if (!catalog.empty()) {
-		// Fully-qualified: catalog.schema.table (DuckDB dialect)
-		get_str << QualifiedTableName(catalog, schema, table_name);
+		// Fully-qualified: catalog.schema.table (DuckDB / Spark dialect)
+		get_str << DialectQualifiedTableName(catalog, schema, table_name, dialect);
 	} else {
 		if (!input_cte_name.empty()) {
 			get_str << input_cte_name << ", ";
@@ -121,7 +122,7 @@ string GetNode::ToQuery() {
 			                                                                             : table_function_output_count;
 			vector<string> table_function_columns;
 			for (idx_t i = 0; i < alias_count && i < column_names.size(); i++) {
-				table_function_columns.push_back(QuoteIdentifier(column_names[i]));
+				table_function_columns.push_back(DialectQuoteIdent(column_names[i], dialect));
 			}
 			get_str << " _tf(" << VecToSeparatedList(table_function_columns) << ")";
 		}
@@ -133,7 +134,7 @@ string GetNode::ToQuery() {
 	return get_str.str();
 }
 
-string FilterNode::ToQuery() {
+string FilterNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream get_str;
 	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
 	// respected: SELECT * would expose more columns than the CTE header declares.
@@ -153,7 +154,7 @@ string FilterNode::ToQuery() {
 	return get_str.str();
 }
 
-string ProjectNode::ToQuery() {
+string ProjectNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream project_str;
 	project_str << "SELECT ";
 	if (column_names.empty()) {
@@ -166,7 +167,7 @@ string ProjectNode::ToQuery() {
 	return project_str.str();
 }
 
-string AggregateNode::ToQuery() {
+string AggregateNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream aggregate_str;
 	aggregate_str << "SELECT ";
 	if (!group_by_columns.empty()) {
@@ -183,7 +184,7 @@ string AggregateNode::ToQuery() {
 	return aggregate_str.str();
 }
 
-string JoinNode::ToQuery() {
+string JoinNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream join_str;
 	// Use explicit column list instead of SELECT * to avoid including
 	// duplicate join key columns from both sides of the join.
@@ -241,7 +242,7 @@ string JoinNode::ToQuery() {
 	return join_str.str();
 }
 
-string UnionNode::ToQuery() {
+string UnionNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream union_str;
 	union_str << "SELECT * FROM ";
 	union_str << left_cte_name;
@@ -255,7 +256,7 @@ string UnionNode::ToQuery() {
 	return union_str.str();
 }
 
-string ExceptNode::ToQuery() {
+string ExceptNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream except_str;
 	except_str << "SELECT * FROM ";
 	except_str << left_cte_name;
@@ -269,7 +270,7 @@ string ExceptNode::ToQuery() {
 	return except_str.str();
 }
 
-string CteSetOperationNode::ToQuery() {
+string CteSetOperationNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream setop_str;
 	setop_str << "SELECT * FROM ";
 	setop_str << left_cte_name;
@@ -282,7 +283,7 @@ string CteSetOperationNode::ToQuery() {
 	return setop_str.str();
 }
 
-string OrderNode::ToQuery() {
+string OrderNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream order_str;
 	// Use explicit column list so COLUMN_LIFETIME projection_map pruning is
 	// respected: SELECT * would expose more columns than the CTE header declares.
@@ -293,7 +294,7 @@ string OrderNode::ToQuery() {
 	return order_str.str();
 }
 
-string LimitNode::ToQuery() {
+string LimitNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream limit_str_stream;
 	limit_str_stream << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!limit_str.empty()) {
@@ -315,7 +316,7 @@ string LimitNode::ToQuery() {
 	return limit_str_stream.str();
 }
 
-string TopNNode::ToQuery() {
+string TopNNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream ss;
 	ss << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	if (!order_items.empty()) {
@@ -330,13 +331,13 @@ string TopNNode::ToQuery() {
 	return ss.str();
 }
 
-string DistinctNode::ToQuery() {
+string DistinctNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream distinct_str;
 	distinct_str << "SELECT DISTINCT " << VecToSeparatedList(cte_column_list) << " FROM " << child_cte_name;
 	return distinct_str.str();
 }
 
-string DelimGetNode::ToQuery() {
+string DelimGetNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream s;
 	s << "SELECT DISTINCT ";
 	if (source_cols.empty()) {
@@ -348,7 +349,7 @@ string DelimGetNode::ToQuery() {
 	return s.str();
 }
 
-string RecursiveCteNode::ToQuery() {
+string RecursiveCteNode::ToQuery(SqlDialect dialect) {
 	string union_kw = union_all ? "\nUNION ALL\n" : "\nUNION\n";
 	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + recursive_step_sql;
 }
@@ -372,7 +373,7 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	if (!nodes.empty()) {
 		sql_str << (has_recursive_cte ? "WITH RECURSIVE " : "WITH ");
 		for (size_t i = 0; i < nodes.size(); ++i) {
-			sql_str << nodes[i]->ToCteQuery();
+			sql_str << nodes[i]->ToCteQuery(dialect);
 			if (i != nodes.size() - 1) {
 				sql_str << ", ";
 			} else if (!use_newlines) {
@@ -383,7 +384,7 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 			}
 		}
 	}
-	sql_str << final_node->ToQuery();
+	sql_str << final_node->ToQuery(dialect);
 	sql_str << ";";
 	return sql_str.str();
 }
