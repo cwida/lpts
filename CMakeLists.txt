@@ -14,6 +14,7 @@ set(EXTENSION_SOURCES
     src/lpts_extension.cpp
     src/cte_nodes.cpp
     src/lpts_helpers.cpp
+    src/lpts_parser.cpp
     src/lpts_ast.cpp
     src/lpts_ast_renderer.cpp
     src/lpts_pipeline.cpp

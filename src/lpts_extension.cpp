@@ -7,12 +7,14 @@
 #include "lpts_pipeline.hpp"
 #include "lpts_helpers.hpp"
 #include "lpts_debug.hpp"
+#include "lpts_parser.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/common/enums/allow_parser_override.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
@@ -55,7 +57,13 @@ static SqlDialect ReadDialect(ClientContext &context) {
 ///   - REORDER_FILTER: only reorders expressions inside LogicalFilter nodes — safe.
 ///   - JOIN_FILTER_PUSHDOWN: only attaches runtime metadata to join/scan nodes — safe.
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
-	Parser parser;
+	SqlDialect input_dialect = ReadInputDialect(context);
+	auto parser_options = context.GetParserOptions();
+	if (input_dialect != SqlDialect::DUCKDB) {
+		parser_options.parser_override_setting = AllowParserOverride::STRICT_OVERRIDE;
+	}
+	ScopedInputDialect scoped_input_dialect(input_dialect);
+	Parser parser(parser_options);
 	parser.ParseQuery(query);
 	if (parser.statements.empty()) {
 		throw ParserException("Failed to parse query: %s", query);
@@ -88,11 +96,13 @@ static string StripTrailingSemicolon(string sql) {
 	return sql;
 }
 
-static string FirstStatementSqlForSubquery(const string &query) {
-	Parser parser;
-	parser.ParseQuery(query);
+static string FirstStatementSqlForSubquery(ClientContext &context, const string &query) {
+	SqlDialect input_dialect = ReadInputDialect(context);
+	string normalized = NormalizeInputSqlToDuckDB(query, input_dialect);
+	Parser parser(context.GetParserOptions());
+	parser.ParseQuery(normalized);
 	if (parser.statements.empty()) {
-		throw ParserException("Failed to parse query: %s", query);
+		throw ParserException("Failed to parse query: %s", normalized);
 	}
 	return StripTrailingSemicolon(parser.statements[0]->ToString());
 }
@@ -219,7 +229,7 @@ static string LptsCheckPragmaFunction(ClientContext &context, const FunctionPara
 	// Normalize the original query to DuckDB's first parsed statement before embedding
 	// it as a subquery. Raw SQLStorm inputs often end with "LIMIT ...; -- comment",
 	// where simply trimming the last character leaves a semicolon inside the subquery.
-	string orig = FirstStatementSqlForSubquery(query);
+	string orig = FirstStatementSqlForSubquery(context, query);
 	lpts_sql = StripTrailingSemicolon(std::move(lpts_sql));
 
 	// Compare: no rows in (A EXCEPT ALL B) AND no rows in (B EXCEPT ALL A)
@@ -291,6 +301,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "SQL dialect for lpts output. Valid values: 'duckdb' (default), 'postgres', 'spark', "
 	                          "'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift', 'mysql', 'mariadb'",
 	                          LogicalType::VARCHAR, Value("duckdb"));
+	config.AddExtensionOption("lpts_input_dialect",
+	                          "SQL dialect for lpts input normalization. Valid values: 'duckdb' (default), "
+	                          "'postgres', 'spark', 'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift', "
+	                          "'mysql', 'mariadb'",
+	                          LogicalType::VARCHAR, Value("duckdb"));
+	ParserExtension::Register(config, LptsInputDialectParserExtension());
 
 	// Register PRAGMA lpts('query')
 	auto pragma = PragmaFunction::PragmaCall("lpts", LptsPragmaFunction, {LogicalType::VARCHAR});
