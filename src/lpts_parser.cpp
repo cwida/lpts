@@ -1,9 +1,6 @@
 #include "lpts_parser.hpp"
 #include "lpts_helpers.hpp"
 
-#include "duckdb/common/enums/allow_parser_override.hpp"
-#include "duckdb/parser/parser.hpp"
-
 #include <cctype>
 
 namespace duckdb {
@@ -11,18 +8,7 @@ namespace duckdb {
 SqlDialect ReadInputDialect(ClientContext &context) {
 	Value dialect_val;
 	if (context.TryGetCurrentSetting("lpts_input_dialect", dialect_val)) {
-		auto value = dialect_val.GetValue<string>();
-		string normalized = SQLToLowercase(value);
-		if (normalized == "duckdb" || normalized == "postgres" || normalized == "postgresql" || normalized == "spark" ||
-		    normalized == "hive" || normalized == "trino" || normalized == "presto" || normalized == "snowflake" ||
-		    normalized == "bigquery" || normalized == "bq" || normalized == "redshift" || normalized == "mysql" ||
-		    normalized == "mariadb") {
-			return ParseSqlDialect(value);
-		}
-		throw InvalidInputException(
-		    "Unknown lpts_input_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark', 'hive', 'trino', "
-		    "'presto', 'snowflake', 'bigquery', 'redshift', 'mysql', 'mariadb'",
-		    value);
+		return ParseSqlDialectSetting(dialect_val.GetValue<string>(), "lpts_input_dialect");
 	}
 	return SqlDialect::DUCKDB;
 }
@@ -126,6 +112,45 @@ static bool TryReadDoubleQuotedIdentifier(const string &sql, idx_t pos, idx_t &e
 		pos++;
 	}
 	return false;
+}
+
+static bool TryReadLineComment(const string &sql, idx_t pos, idx_t &end) {
+	if (pos + 1 >= sql.size() || sql[pos] != '-' || sql[pos + 1] != '-') {
+		return false;
+	}
+	end = pos + 2;
+	while (end < sql.size() && sql[end] != '\n' && sql[end] != '\r') {
+		end++;
+	}
+	return true;
+}
+
+static bool TryReadBlockComment(const string &sql, idx_t pos, idx_t &end) {
+	if (pos + 1 >= sql.size() || sql[pos] != '/' || sql[pos + 1] != '*') {
+		return false;
+	}
+	end = pos + 2;
+	while (end + 1 < sql.size() && !(sql[end] == '*' && sql[end + 1] == '/')) {
+		end++;
+	}
+	end = MinValue<idx_t>(end + 2, sql.size());
+	return true;
+}
+
+static bool TryReadSkippableSqlSpan(const string &sql, idx_t pos, idx_t &end) {
+	string literal;
+	return TryReadSingleQuotedLiteral(sql, pos, end, literal) || TryReadDoubleQuotedIdentifier(sql, pos, end) ||
+	       TryReadLineComment(sql, pos, end) || TryReadBlockComment(sql, pos, end);
+}
+
+static bool TryAppendSkippableSqlSpan(const string &sql, idx_t &pos, string &result) {
+	idx_t end;
+	if (!TryReadSkippableSqlSpan(sql, pos, end)) {
+		return false;
+	}
+	result += sql.substr(pos, end - pos);
+	pos = end - 1;
+	return true;
 }
 
 static void ThrowUnsupportedInputDialectFeature(SqlDialect dialect, const string &feature_name, const string &reason) {
@@ -315,34 +340,7 @@ static string NormalizeBacktickIdentifiers(const string &sql, SqlDialect dialect
 	string result;
 	for (idx_t i = 0; i < sql.size(); i++) {
 		char c = sql[i];
-		if (c == '\'') {
-			idx_t end;
-			string literal;
-			if (!TryReadSingleQuotedLiteral(sql, i, end, literal)) {
-				result += c;
-				continue;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			idx_t end = i + 2;
-			while (end < sql.size() && sql[end] != '\n' && sql[end] != '\r') {
-				end++;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			idx_t end = i + 2;
-			while (end + 1 < sql.size() && !(sql[end] == '*' && sql[end + 1] == '/')) {
-				end++;
-			}
-			end = MinValue<idx_t>(end + 2, sql.size());
-			result += sql.substr(i, end - i);
-			i = end - 1;
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
 			continue;
 		}
 		if (c == '`') {
@@ -386,35 +384,21 @@ static idx_t FindMatchingParen(const string &sql, idx_t open_pos) {
 	idx_t depth = 0;
 	for (idx_t i = open_pos; i < sql.size(); i++) {
 		char c = sql[i];
-		if (c == '\'') {
-			idx_t end;
-			string literal;
-			if (!TryReadSingleQuotedLiteral(sql, i, end, literal)) {
-				return DConstants::INVALID_INDEX;
-			}
+		idx_t end;
+		if (TryReadSkippableSqlSpan(sql, i, end)) {
 			i = end - 1;
 			continue;
 		}
-		if (c == '"') {
-			idx_t end;
-			if (!TryReadDoubleQuotedIdentifier(sql, i, end)) {
-				return DConstants::INVALID_INDEX;
-			}
-			i = end - 1;
-			continue;
+		if (c == '\'' || c == '"') {
+			return DConstants::INVALID_INDEX;
 		}
 		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			while (i < sql.size() && sql[i] != '\n' && sql[i] != '\r') {
-				i++;
-			}
-			continue;
+			return DConstants::INVALID_INDEX;
 		}
 		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			i += 2;
-			while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
-				i++;
-			}
-			i++;
+			return DConstants::INVALID_INDEX;
+		}
+		if (c == '`') {
 			continue;
 		}
 		if (c == '(') {
@@ -438,14 +422,13 @@ static vector<string> SplitTopLevelArgs(const string &args) {
 	idx_t start = 0;
 	for (idx_t i = 0; i < args.size(); i++) {
 		char c = args[i];
-		if (c == '\'') {
-			idx_t end;
-			string literal;
-			if (!TryReadSingleQuotedLiteral(args, i, end, literal)) {
-				throw ParserException("Unterminated string literal in dialect-normalized function call");
-			}
+		idx_t end;
+		if (TryReadSkippableSqlSpan(args, i, end)) {
 			i = end - 1;
 			continue;
+		}
+		if (c == '\'' || c == '"') {
+			throw ParserException("Unterminated quoted span in dialect-normalized function call");
 		}
 		if (c == '(') {
 			depth++;
@@ -470,44 +453,7 @@ static string RewriteFunctionCalls(const string &sql, SqlDialect dialect, const 
 	string result;
 	for (idx_t i = 0; i < sql.size(); i++) {
 		char c = sql[i];
-		if (c == '\'') {
-			idx_t end;
-			string literal;
-			if (!TryReadSingleQuotedLiteral(sql, i, end, literal)) {
-				result += c;
-				continue;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '"') {
-			idx_t end;
-			if (!TryReadDoubleQuotedIdentifier(sql, i, end)) {
-				result += c;
-				continue;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			idx_t end = i + 2;
-			while (end < sql.size() && sql[end] != '\n' && sql[end] != '\r') {
-				end++;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			idx_t end = i + 2;
-			while (end + 1 < sql.size() && !(sql[end] == '*' && sql[end + 1] == '/')) {
-				end++;
-			}
-			end = MinValue<idx_t>(end + 2, sql.size());
-			result += sql.substr(i, end - i);
-			i = end - 1;
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
 			continue;
 		}
 		if (!IsIdentStart(c)) {
@@ -574,44 +520,7 @@ static string RewriteMysqlLimitComma(const string &sql, SqlDialect dialect) {
 	string result;
 	for (idx_t i = 0; i < sql.size(); i++) {
 		char c = sql[i];
-		if (c == '\'') {
-			idx_t end;
-			string literal;
-			if (!TryReadSingleQuotedLiteral(sql, i, end, literal)) {
-				result += c;
-				continue;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '"') {
-			idx_t end;
-			if (!TryReadDoubleQuotedIdentifier(sql, i, end)) {
-				result += c;
-				continue;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			idx_t end = i + 2;
-			while (end < sql.size() && sql[end] != '\n' && sql[end] != '\r') {
-				end++;
-			}
-			result += sql.substr(i, end - i);
-			i = end - 1;
-			continue;
-		}
-		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			idx_t end = i + 2;
-			while (end + 1 < sql.size() && !(sql[end] == '*' && sql[end + 1] == '/')) {
-				end++;
-			}
-			end = MinValue<idx_t>(end + 2, sql.size());
-			result += sql.substr(i, end - i);
-			i = end - 1;
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
 			continue;
 		}
 		if (!MatchesKeywordAt(sql, i, "limit")) {
@@ -700,41 +609,6 @@ string NormalizeInputSqlToDuckDB(const string &query, SqlDialect dialect) {
 		return result;
 	}
 	return result;
-}
-
-static thread_local bool lpts_input_dialect_scope_active = false;
-static thread_local SqlDialect lpts_scoped_input_dialect = SqlDialect::DUCKDB;
-
-ScopedInputDialect::ScopedInputDialect(SqlDialect dialect)
-    : old_active(lpts_input_dialect_scope_active), old_dialect(lpts_scoped_input_dialect) {
-	lpts_input_dialect_scope_active = true;
-	lpts_scoped_input_dialect = dialect;
-}
-
-ScopedInputDialect::~ScopedInputDialect() {
-	lpts_input_dialect_scope_active = old_active;
-	lpts_scoped_input_dialect = old_dialect;
-}
-
-LptsInputDialectParserExtension::LptsInputDialectParserExtension() {
-	parser_override = ParserOverride;
-}
-
-ParserOverrideResult LptsInputDialectParserExtension::ParserOverride(ParserExtensionInfo *info, const string &query,
-                                                                     ParserOptions &options) {
-	if (!lpts_input_dialect_scope_active || lpts_scoped_input_dialect == SqlDialect::DUCKDB) {
-		return ParserOverrideResult();
-	}
-	try {
-		string normalized = NormalizeInputSqlToDuckDB(query, lpts_scoped_input_dialect);
-		auto normalized_options = options;
-		normalized_options.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
-		Parser parser(normalized_options);
-		parser.ParseQuery(normalized);
-		return ParserOverrideResult(std::move(parser.statements));
-	} catch (std::exception &e) {
-		return ParserOverrideResult(e);
-	}
 }
 
 } // namespace duckdb

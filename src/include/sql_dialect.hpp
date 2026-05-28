@@ -27,6 +27,10 @@ enum class SqlDialect {
 /// Throws InvalidInputException on unrecognised values.
 SqlDialect ParseSqlDialect(const string &value);
 
+/// Parse a dialect string into the enum for a named setting.
+/// Throws InvalidInputException on unrecognised values.
+SqlDialect ParseSqlDialectSetting(const string &value, const string &setting_name);
+
 /// Return whether the dialect quotes identifiers with backticks instead of ANSI double quotes.
 bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect);
 

@@ -3016,7 +3016,7 @@ unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalO
 //==============================================================================
 // ParseSqlDialect
 //==============================================================================
-SqlDialect ParseSqlDialect(const string &value) {
+SqlDialect ParseSqlDialectSetting(const string &value, const string &setting_name) {
 	string normalized = SQLToLowercase(value);
 	if (normalized == "duckdb") {
 		return SqlDialect::DUCKDB;
@@ -3046,9 +3046,13 @@ SqlDialect ParseSqlDialect(const string &value) {
 		return SqlDialect::MYSQL_MARIADB;
 	}
 	throw InvalidInputException(
-	    "Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark', 'hive', 'trino', 'presto', "
+	    "Unknown %s '%s'. Valid values: 'duckdb', 'postgres', 'spark', 'hive', 'trino', 'presto', "
 	    "'snowflake', 'bigquery', 'redshift', 'mysql', 'mariadb'",
-	    value);
+	    setting_name, value);
+}
+
+SqlDialect ParseSqlDialect(const string &value) {
+	return ParseSqlDialectSetting(value, "lpts_dialect");
 }
 
 //==============================================================================

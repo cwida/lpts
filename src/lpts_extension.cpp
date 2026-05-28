@@ -14,7 +14,6 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/common/enums/allow_parser_override.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
@@ -58,15 +57,11 @@ static SqlDialect ReadDialect(ClientContext &context) {
 ///   - JOIN_FILTER_PUSHDOWN: only attaches runtime metadata to join/scan nodes — safe.
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
 	SqlDialect input_dialect = ReadInputDialect(context);
-	auto parser_options = context.GetParserOptions();
-	if (input_dialect != SqlDialect::DUCKDB) {
-		parser_options.parser_override_setting = AllowParserOverride::STRICT_OVERRIDE;
-	}
-	ScopedInputDialect scoped_input_dialect(input_dialect);
-	Parser parser(parser_options);
-	parser.ParseQuery(query);
+	string normalized = NormalizeInputSqlToDuckDB(query, input_dialect);
+	Parser parser(context.GetParserOptions());
+	parser.ParseQuery(normalized);
 	if (parser.statements.empty()) {
-		throw ParserException("Failed to parse query: %s", query);
+		throw ParserException("Failed to parse query: %s", normalized);
 	}
 	Planner planner(context);
 	planner.CreatePlan(parser.statements[0]->Copy());
@@ -306,7 +301,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "'postgres', 'spark', 'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift', "
 	                          "'mysql', 'mariadb'",
 	                          LogicalType::VARCHAR, Value("duckdb"));
-	ParserExtension::Register(config, LptsInputDialectParserExtension());
 
 	// Register PRAGMA lpts('query')
 	auto pragma = PragmaFunction::PragmaCall("lpts", LptsPragmaFunction, {LogicalType::VARCHAR});
