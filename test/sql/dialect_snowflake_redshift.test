@@ -1,0 +1,99 @@
+# name: test/sql/dialect_snowflake_redshift.test
+# description: lpts SQL output for Snowflake and Redshift dialects
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', 10), (2, 'Bob', 20);
+
+statement ok
+CREATE TABLE events (id INTEGER, ts TIMESTAMP);
+
+statement ok
+INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00');
+
+# ============================================================
+# Snowflake: ANSI identifiers, fully qualified tables, TO_* date functions.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'snowflake';
+
+query I
+SELECT sql LIKE '%FROM memory.main.users%' AS snowflake_qualified_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%"order"%' AS snowflake_reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+query I
+SELECT sql NOT LIKE '%`%' AS snowflake_no_backticks FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%TO_CHAR(t0_ts, ''YYYY-MM-DD'')%' AS snowflake_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%TO_CHAR(t0_ts, ''YYYY-MM-DD HH24:MI:SS.FF6'')%' AS snowflake_fractional_seconds FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d %H:%M:%S.%f'') AS formatted FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%TO_TIMESTAMP(t0_name, ''YYYY-MM-DD'')%' AS snowflake_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%SPLIT(t0_name, '' '')%' AS snowflake_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+true
+
+# ============================================================
+# Redshift: Postgres-like table qualification, TO_* date functions.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'redshift';
+
+query I
+SELECT sql LIKE '%FROM users%' AS redshift_unqualified_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql NOT LIKE '%memory.main.users%' AS redshift_no_catalog_schema FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%"order"%' AS redshift_reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%TO_CHAR(t0_ts, ''YYYY-MM-DD'')%' AS redshift_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%TO_TIMESTAMP(t0_name, ''YYYY-MM-DD'')%' AS redshift_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%SPLIT_TO_ARRAY(t0_name, '' '')%' AS redshift_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';

@@ -122,6 +122,45 @@ string RemapForTrinoPresto(const string &name) {
 	return name;
 }
 
+string RemapForSnowflake(const string &name) {
+	if (name == "strftime") {
+		return "TO_CHAR";
+	}
+	if (name == "strptime") {
+		return "TO_TIMESTAMP";
+	}
+	if (name == "string_split" || name == "str_split") {
+		return "SPLIT";
+	}
+	return name;
+}
+
+string RemapForBigQuery(const string &name) {
+	if (name == "strftime") {
+		return "FORMAT_TIMESTAMP";
+	}
+	if (name == "strptime") {
+		return "PARSE_TIMESTAMP";
+	}
+	if (name == "string_split" || name == "str_split") {
+		return "SPLIT";
+	}
+	return name;
+}
+
+string RemapForRedshift(const string &name) {
+	if (name == "strftime") {
+		return "TO_CHAR";
+	}
+	if (name == "strptime") {
+		return "TO_TIMESTAMP";
+	}
+	if (name == "string_split" || name == "str_split") {
+		return "SPLIT_TO_ARRAY";
+	}
+	return name;
+}
+
 } // namespace
 
 string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect) {
@@ -134,6 +173,12 @@ string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect
 		return RemapForHive(duckdb_name);
 	case SqlDialect::TRINO_PRESTO:
 		return RemapForTrinoPresto(duckdb_name);
+	case SqlDialect::SNOWFLAKE:
+		return RemapForSnowflake(duckdb_name);
+	case SqlDialect::BIGQUERY:
+		return RemapForBigQuery(duckdb_name);
+	case SqlDialect::REDSHIFT:
+		return RemapForRedshift(duckdb_name);
 	case SqlDialect::DUCKDB:
 	default:
 		return duckdb_name;

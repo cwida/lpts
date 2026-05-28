@@ -1,0 +1,72 @@
+# name: test/sql/dialect_bigquery.test
+# description: lpts SQL output for the BigQuery dialect
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', 10), (2, 'Bob', 20);
+
+statement ok
+CREATE TABLE events (id INTEGER, ts TIMESTAMP);
+
+statement ok
+INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00');
+
+statement ok
+SET lpts_dialect = 'bigquery';
+
+# BigQuery table paths are one backticked path, not separately quoted segments.
+query I
+SELECT sql LIKE '%FROM `memory.main.users`%' AS bigquery_backticked_table_path FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql NOT LIKE '%`memory`.`main`.`users`%' AS bigquery_no_segmented_table_path FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%SELECT `id`%' AS bigquery_column_backticked FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%`order`%' AS bigquery_reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y-%m-%d'', t0_ts)%' AS bigquery_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%PARSE_TIMESTAMP(''%Y-%m-%d'', t0_name)%' AS bigquery_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%SPLIT(t0_name, '' '')%' AS bigquery_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+true
+
+statement ok
+SET lpts_dialect = 'bq';
+
+query I
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y'', t0_ts)%' AS bq_alias FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+query I
+SELECT sql NOT LIKE '%TO_CHAR(%' AS bigquery_no_snowflake_date_function FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';

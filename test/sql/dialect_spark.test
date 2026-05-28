@@ -154,7 +154,7 @@ SET lpts_dialect = 'duckdb';
 # Unknown dialect: the validation happens lazily when the dialect is read by
 # lpts_query/lpts_check. The error message must list 'spark' as a valid option.
 statement ok
-SET lpts_dialect = 'snowflake';
+SET lpts_dialect = 'not_a_dialect';
 
 statement error
 SELECT sql FROM lpts_query('SELECT id FROM users');

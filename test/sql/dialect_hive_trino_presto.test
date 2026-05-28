@@ -155,7 +155,7 @@ statement ok
 SET lpts_dialect = 'duckdb';
 
 statement ok
-SET lpts_dialect = 'oracle';
+SET lpts_dialect = 'not_a_dialect';
 
 statement error
 SELECT sql FROM lpts_query('SELECT id FROM users');
