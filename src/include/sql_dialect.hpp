@@ -26,6 +26,18 @@ enum class SqlDialect {
 /// Throws InvalidInputException on unrecognised values.
 SqlDialect ParseSqlDialect(const string &value);
 
+/// Return whether the dialect quotes identifiers with backticks instead of ANSI double quotes.
+bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect);
+
+/// Return whether the dialect renders table names without catalog/schema qualification.
+bool DialectUsesUnqualifiedTableNames(SqlDialect dialect);
+
+/// Return whether the dialect renders table names as schema.table.
+bool DialectUsesSchemaQualifiedTableNames(SqlDialect dialect);
+
+/// Return whether the dialect renders catalog/schema/table as one quoted path.
+bool DialectUsesSingleQuotedTablePath(SqlDialect dialect);
+
 /// Quote an identifier in the given dialect.
 /// - DUCKDB / POSTGRES: optionally `"name"` (DuckDB's `KeywordHelper::WriteOptionallyQuoted`).
 /// - SPARK / HIVE / BIGQUERY: always `` `name` `` (safe for reserved words and case).

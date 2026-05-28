@@ -23,6 +23,9 @@ INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00');
 statement ok
 SET lpts_dialect = 'snowflake';
 
+statement ok
+SET lpts_dialect = 'SnowFlake';
+
 query I
 SELECT sql LIKE '%FROM memory.main.users%' AS snowflake_qualified_table FROM lpts_query('SELECT id FROM users');
 ----
@@ -49,6 +52,11 @@ SELECT sql LIKE '%TO_CHAR(t0_ts, ''YYYY-MM-DD HH24:MI:SS.FF6'')%' AS snowflake_f
 true
 
 query I
+SELECT sql LIKE '%TO_CHAR(t0_ts, ''HH12:MI:SS DY MON'')%' AS snowflake_time_name_tokens FROM lpts_query('SELECT strftime(ts, ''%I:%M:%S %a %b'') AS formatted FROM events');
+----
+true
+
+query I
 SELECT sql LIKE '%TO_TIMESTAMP(t0_name, ''YYYY-MM-DD'')%' AS snowflake_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
 ----
 true
@@ -64,6 +72,9 @@ true
 
 statement ok
 SET lpts_dialect = 'redshift';
+
+statement ok
+SET lpts_dialect = 'RedShift';
 
 query I
 SELECT sql LIKE '%FROM users%' AS redshift_unqualified_table FROM lpts_query('SELECT id FROM users');
@@ -82,6 +93,11 @@ true
 
 query I
 SELECT sql LIKE '%TO_CHAR(t0_ts, ''YYYY-MM-DD'')%' AS redshift_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%TO_CHAR(t0_ts, ''HH24:MI:SS.US'')%' AS redshift_fractional_seconds FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
 ----
 true
 

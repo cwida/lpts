@@ -24,6 +24,9 @@ INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00', [1, 2, 3]);
 statement ok
 SET lpts_dialect = 'hive';
 
+statement ok
+SET lpts_dialect = 'Hive';
+
 query I
 SELECT sql LIKE '%FROM `main`.`users`%' AS hive_schema_table FROM lpts_query('SELECT id FROM users');
 ----
@@ -82,6 +85,9 @@ true
 statement ok
 SET lpts_dialect = 'trino';
 
+statement ok
+SET lpts_dialect = 'TrInO';
+
 query I
 SELECT sql LIKE '%FROM memory.main.users%' AS trino_three_part_table FROM lpts_query('SELECT id FROM users');
 ----
@@ -129,6 +135,9 @@ true
 
 statement ok
 SET lpts_dialect = 'presto';
+
+statement ok
+SET lpts_dialect = 'PrEsTo';
 
 query I
 SELECT sql LIKE '%date_format(%' AS presto_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');

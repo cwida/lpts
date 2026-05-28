@@ -6,8 +6,24 @@
 
 namespace duckdb {
 
+bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect) {
+	return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY;
+}
+
+bool DialectUsesUnqualifiedTableNames(SqlDialect dialect) {
+	return dialect == SqlDialect::POSTGRES || dialect == SqlDialect::REDSHIFT;
+}
+
+bool DialectUsesSchemaQualifiedTableNames(SqlDialect dialect) {
+	return dialect == SqlDialect::HIVE;
+}
+
+bool DialectUsesSingleQuotedTablePath(SqlDialect dialect) {
+	return dialect == SqlDialect::BIGQUERY;
+}
+
 string DialectQuoteIdent(const string &name, SqlDialect dialect) {
-	if (dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY) {
+	if (DialectUsesBacktickQuotedIdentifiers(dialect)) {
 		// Spark/Hive/BigQuery use backticks; embedded backticks must be doubled.
 		std::ostringstream out;
 		out << '`';
@@ -87,7 +103,7 @@ string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect 
 
 string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
                                  SqlDialect dialect) {
-	if (dialect == SqlDialect::BIGQUERY) {
+	if (DialectUsesSingleQuotedTablePath(dialect)) {
 		string table_path;
 		if (!catalog.empty()) {
 			table_path += catalog;
@@ -104,7 +120,7 @@ string DialectQualifiedTableName(const string &catalog, const string &schema, co
 		table_path += table_name;
 		return DialectQuoteTableWithOptionalSuffix(table_path, dialect);
 	}
-	if (dialect == SqlDialect::HIVE) {
+	if (DialectUsesSchemaQualifiedTableNames(dialect)) {
 		if (schema.empty()) {
 			return DialectQuoteTableWithOptionalSuffix(table_name, dialect);
 		}

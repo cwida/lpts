@@ -2752,28 +2752,29 @@ unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalO
 // ParseSqlDialect
 //==============================================================================
 SqlDialect ParseSqlDialect(const string &value) {
-	if (value == "duckdb" || value == "DUCKDB") {
+	string normalized = SQLToLowercase(value);
+	if (normalized == "duckdb") {
 		return SqlDialect::DUCKDB;
 	}
-	if (value == "postgres" || value == "POSTGRES" || value == "postgresql" || value == "POSTGRESQL") {
+	if (normalized == "postgres" || normalized == "postgresql") {
 		return SqlDialect::POSTGRES;
 	}
-	if (value == "spark" || value == "SPARK") {
+	if (normalized == "spark") {
 		return SqlDialect::SPARK;
 	}
-	if (value == "hive" || value == "HIVE") {
+	if (normalized == "hive") {
 		return SqlDialect::HIVE;
 	}
-	if (value == "trino" || value == "TRINO" || value == "presto" || value == "PRESTO") {
+	if (normalized == "trino" || normalized == "presto") {
 		return SqlDialect::TRINO_PRESTO;
 	}
-	if (value == "snowflake" || value == "SNOWFLAKE") {
+	if (normalized == "snowflake") {
 		return SqlDialect::SNOWFLAKE;
 	}
-	if (value == "bigquery" || value == "BIGQUERY" || value == "bq" || value == "BQ") {
+	if (normalized == "bigquery" || normalized == "bq") {
 		return SqlDialect::BIGQUERY;
 	}
-	if (value == "redshift" || value == "REDSHIFT") {
+	if (normalized == "redshift") {
 		return SqlDialect::REDSHIFT;
 	}
 	throw InvalidInputException(
@@ -3313,9 +3314,8 @@ private:
 			// Dialect-specific table reference:
 			//   DuckDB:   catalog.schema.table  (e.g. memory.main.users)
 			//   Postgres: table                 (e.g. users)
-			string catalog_out =
-			    (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::REDSHIFT) ? "" : get.catalog;
-			string schema_out = (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::REDSHIFT) ? "" : get.schema;
+			string catalog_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.catalog;
+			string schema_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.schema;
 			string input_cte_name = children_names.empty() ? string() : children_names[0];
 			return make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
 			                          get.table_index, get.table_filters, get.column_names, input_cte_name,

@@ -147,6 +147,9 @@ SET lpts_dialect = 'duckdb';
 statement ok
 SET lpts_dialect = 'SPARK';
 
+statement ok
+SET lpts_dialect = 'Spark';
+
 # Round-trip back to a sane default for the rest of the tests.
 statement ok
 SET lpts_dialect = 'duckdb';

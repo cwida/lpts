@@ -19,6 +19,9 @@ INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00');
 statement ok
 SET lpts_dialect = 'bigquery';
 
+statement ok
+SET lpts_dialect = 'BigQuery';
+
 # BigQuery table paths are one backticked path, not separately quoted segments.
 query I
 SELECT sql LIKE '%FROM `memory.main.users`%' AS bigquery_backticked_table_path FROM lpts_query('SELECT id FROM users');
@@ -46,6 +49,11 @@ SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y-%m-%d'', t0_ts)%' AS bigquery_strftime F
 true
 
 query I
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%H:%M:%S.%f'', t0_ts)%' AS bigquery_preserves_posix_fractional_seconds FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
+----
+true
+
+query I
 SELECT sql LIKE '%PARSE_TIMESTAMP(''%Y-%m-%d'', t0_name)%' AS bigquery_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
 ----
 true
@@ -57,6 +65,9 @@ true
 
 statement ok
 SET lpts_dialect = 'bq';
+
+statement ok
+SET lpts_dialect = 'Bq';
 
 query I
 SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y'', t0_ts)%' AS bq_alias FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
