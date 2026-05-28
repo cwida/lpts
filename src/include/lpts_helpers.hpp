@@ -24,9 +24,9 @@ string QuoteTableWithOptionalSuffix(const string &table_name);
 /// Build catalog.schema.table with each identifier quoted when needed.
 string QualifiedTableName(const string &catalog, const string &schema, const string &table_name);
 
-/// Dialect-aware variants. SPARK uses backtick quoting; DUCKDB/POSTGRES fall
-/// back to `KeywordHelper::WriteOptionallyQuoted` (matching the dialect-blind
-/// overloads above).
+/// Dialect-aware variants. SPARK/HIVE use backtick quoting; DUCKDB/POSTGRES/
+/// TRINO_PRESTO fall back to `KeywordHelper::WriteOptionallyQuoted` (matching
+/// the dialect-blind overloads above).
 string DialectVecToQuotedIdentifierList(const vector<string> &input_list, SqlDialect dialect,
                                         const string &separator = ", ");
 string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect);

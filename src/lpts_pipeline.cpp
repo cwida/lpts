@@ -166,6 +166,175 @@ private:
 	/// Populated lazily on first DuckLake scan per catalog.
 	unordered_map<string, idx_t> ducklake_current_snapshots;
 
+	static bool UsesJavaDateFormat(SqlDialect dialect) {
+		return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE;
+	}
+
+	static bool UsesPostgresDateFormat(SqlDialect dialect) {
+		return dialect == SqlDialect::POSTGRES;
+	}
+
+	static string ConvertDuckDBDateFormatToJava(const string &format) {
+		string result;
+		for (idx_t i = 0; i < format.size(); i++) {
+			if (format[i] != '%' || i + 1 >= format.size()) {
+				result += format[i];
+				continue;
+			}
+			char specifier = format[++i];
+			switch (specifier) {
+			case 'Y':
+				result += "yyyy";
+				break;
+			case 'y':
+				result += "yy";
+				break;
+			case 'm':
+				result += "MM";
+				break;
+			case 'd':
+				result += "dd";
+				break;
+			case 'H':
+				result += "HH";
+				break;
+			case 'I':
+				result += "hh";
+				break;
+			case 'M':
+				result += "mm";
+				break;
+			case 'S':
+				result += "ss";
+				break;
+			case 'f':
+				result += "SSSSSS";
+				break;
+			case 'z':
+				result += "Z";
+				break;
+			case 'Z':
+				result += "z";
+				break;
+			case 'a':
+				result += "EEE";
+				break;
+			case 'A':
+				result += "EEEE";
+				break;
+			case 'b':
+				result += "MMM";
+				break;
+			case 'B':
+				result += "MMMM";
+				break;
+			case '%':
+				result += "%";
+				break;
+			default:
+				result += "%";
+				result += specifier;
+				break;
+			}
+		}
+		return result;
+	}
+
+	static string ConvertDuckDBDateFormatToPostgres(const string &format) {
+		string result;
+		for (idx_t i = 0; i < format.size(); i++) {
+			if (format[i] != '%' || i + 1 >= format.size()) {
+				result += format[i];
+				continue;
+			}
+			char specifier = format[++i];
+			switch (specifier) {
+			case 'Y':
+				result += "YYYY";
+				break;
+			case 'y':
+				result += "YY";
+				break;
+			case 'm':
+				result += "MM";
+				break;
+			case 'd':
+				result += "DD";
+				break;
+			case 'H':
+				result += "HH24";
+				break;
+			case 'I':
+				result += "HH12";
+				break;
+			case 'M':
+				result += "MI";
+				break;
+			case 'S':
+				result += "SS";
+				break;
+			case 'f':
+				result += "US";
+				break;
+			case 'z':
+				result += "TZH:TZM";
+				break;
+			case 'Z':
+				result += "TZ";
+				break;
+			case 'a':
+				result += "Dy";
+				break;
+			case 'A':
+				result += "Day";
+				break;
+			case 'b':
+				result += "Mon";
+				break;
+			case 'B':
+				result += "Month";
+				break;
+			case '%':
+				result += "%";
+				break;
+			default:
+				result += "%";
+				result += specifier;
+				break;
+			}
+		}
+		return result;
+	}
+
+	static bool IsDateFormatFunction(const string &function_name) {
+		return function_name == "strftime" || function_name == "strptime";
+	}
+
+	static bool TryRenderConvertedDateFormat(const unique_ptr<Expression> &expression, SqlDialect dialect,
+	                                         string &result) {
+		if (expression->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return false;
+		}
+		const auto &constant = expression->Cast<BoundConstantExpression>();
+		if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		string format = constant.value.GetValue<string>();
+		if (UsesJavaDateFormat(dialect)) {
+			format = ConvertDuckDBDateFormatToJava(format);
+		} else if (UsesPostgresDateFormat(dialect)) {
+			format = ConvertDuckDBDateFormatToPostgres(format);
+		} else {
+			return false;
+		}
+		result = "'" + EscapeSingleQuotes(format) + "'";
+		return true;
+	}
+
+	static bool UsesArrowLambdaSyntax(SqlDialect dialect) {
+		return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::TRINO_PRESTO;
+	}
+
 	/// Query the current snapshot_id for a DuckLake catalog.
 	idx_t GetDuckLakeCurrentSnapshot(const string &catalog_name) {
 		auto it = ducklake_current_snapshots.find(catalog_name);
@@ -959,7 +1128,13 @@ private:
 					if (is_struct_pack && i < StructType::GetChildCount(func_expr.return_type)) {
 						expr_str << "\"" << StructType::GetChildName(func_expr.return_type, i) << "\" := ";
 					}
-					expr_str << ExpressionToAliasedString(func_expr.children[i]);
+					string converted_date_format;
+					if (i == 1 && IsDateFormatFunction(func_expr.function.name) &&
+					    TryRenderConvertedDateFormat(func_expr.children[i], dialect, converted_date_format)) {
+						expr_str << converted_date_format;
+					} else {
+						expr_str << ExpressionToAliasedString(func_expr.children[i]);
+					}
 				}
 				// Lambda function: serialize the lambda expression from bind_info
 				if (func_expr.function.bind_lambda != nullptr && func_expr.bind_info) {
@@ -982,14 +1157,30 @@ private:
 								param_names[i] = "p" + to_string(i);
 							}
 						}
-						expr_str << "lambda ";
-						for (idx_t i = 0; i < param_count; i++) {
-							if (i > 0) {
-								expr_str << ", ";
+						if (UsesArrowLambdaSyntax(dialect)) {
+							if (param_count == 1) {
+								expr_str << param_names[0];
+							} else {
+								expr_str << "(";
+								for (idx_t i = 0; i < param_count; i++) {
+									if (i > 0) {
+										expr_str << ", ";
+									}
+									expr_str << param_names[i];
+								}
+								expr_str << ")";
 							}
-							expr_str << param_names[i];
+							expr_str << " -> ";
+						} else {
+							expr_str << "lambda ";
+							for (idx_t i = 0; i < param_count; i++) {
+								if (i > 0) {
+									expr_str << ", ";
+								}
+								expr_str << param_names[i];
+							}
+							expr_str << ": ";
 						}
-						expr_str << ": ";
 						expr_str << ExpressionToAliasedString(bind_data.lambda_expr);
 					}
 				}
@@ -2484,7 +2675,14 @@ SqlDialect ParseSqlDialect(const string &value) {
 	if (value == "spark" || value == "SPARK") {
 		return SqlDialect::SPARK;
 	}
-	throw InvalidInputException("Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark'", value);
+	if (value == "hive" || value == "HIVE") {
+		return SqlDialect::HIVE;
+	}
+	if (value == "trino" || value == "TRINO" || value == "presto" || value == "PRESTO") {
+		return SqlDialect::TRINO_PRESTO;
+	}
+	throw InvalidInputException(
+	    "Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark', 'hive', 'trino', 'presto'", value);
 }
 
 //==============================================================================

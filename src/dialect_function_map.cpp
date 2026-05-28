@@ -63,6 +63,65 @@ string RemapForSpark(const string &name) {
 	return name;
 }
 
+/// Hive SQL equivalents for DuckDB function names that are common in Coral-style
+/// Spark/Hive/Trino translation workloads. Keep this conservative: only rename
+/// functions with clear same-arity equivalents.
+string RemapForHive(const string &name) {
+	if (name == "strftime") {
+		return "date_format";
+	}
+	if (name == "strptime") {
+		return "to_timestamp";
+	}
+	if (name == "string_split" || name == "str_split") {
+		return "split";
+	}
+	if (name == "list_transform" || name == "array_transform") {
+		return "transform";
+	}
+	if (name == "list_filter" || name == "array_filter") {
+		return "filter";
+	}
+	if (name == "list_value") {
+		return "array";
+	}
+	if (name == "list_contains" || name == "array_contains") {
+		return "array_contains";
+	}
+	if (name == "list_extract" || name == "array_extract") {
+		return "element_at";
+	}
+	return name;
+}
+
+/// Trino and Presto share most function names for the functions we currently
+/// serialize. Divergences should split out of this helper only when we need a
+/// concrete target-specific mapping.
+string RemapForTrinoPresto(const string &name) {
+	if (name == "strftime") {
+		return "date_format";
+	}
+	if (name == "strptime") {
+		return "date_parse";
+	}
+	if (name == "string_split" || name == "str_split") {
+		return "split";
+	}
+	if (name == "list_transform" || name == "array_transform") {
+		return "transform";
+	}
+	if (name == "list_filter" || name == "array_filter") {
+		return "filter";
+	}
+	if (name == "list_contains" || name == "array_contains") {
+		return "contains";
+	}
+	if (name == "list_extract" || name == "array_extract") {
+		return "element_at";
+	}
+	return name;
+}
+
 } // namespace
 
 string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect) {
@@ -71,6 +130,10 @@ string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect
 		return RemapForPostgres(duckdb_name);
 	case SqlDialect::SPARK:
 		return RemapForSpark(duckdb_name);
+	case SqlDialect::HIVE:
+		return RemapForHive(duckdb_name);
+	case SqlDialect::TRINO_PRESTO:
+		return RemapForTrinoPresto(duckdb_name);
 	case SqlDialect::DUCKDB:
 	default:
 		return duckdb_name;

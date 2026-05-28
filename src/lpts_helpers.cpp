@@ -7,8 +7,8 @@
 namespace duckdb {
 
 string DialectQuoteIdent(const string &name, SqlDialect dialect) {
-	if (dialect == SqlDialect::SPARK) {
-		// Spark always uses backticks; embedded backticks must be doubled.
+	if (dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE) {
+		// Spark/Hive use backticks; embedded backticks must be doubled.
 		std::ostringstream out;
 		out << '`';
 		for (char c : name) {
@@ -87,6 +87,12 @@ string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect 
 
 string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
                                  SqlDialect dialect) {
+	if (dialect == SqlDialect::HIVE) {
+		if (schema.empty()) {
+			return DialectQuoteTableWithOptionalSuffix(table_name, dialect);
+		}
+		return DialectQuoteIdent(schema, dialect) + "." + DialectQuoteTableWithOptionalSuffix(table_name, dialect);
+	}
 	return DialectQuoteIdent(catalog, dialect) + "." + DialectQuoteIdent(schema, dialect) + "." +
 	       DialectQuoteTableWithOptionalSuffix(table_name, dialect);
 }

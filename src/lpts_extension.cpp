@@ -288,7 +288,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Users can change it with: SET lpts_dialect = 'postgres';
 	DBConfig &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("lpts_dialect",
-	                          "SQL dialect for lpts output. Valid values: 'duckdb' (default), 'postgres', 'spark'",
+	                          "SQL dialect for lpts output. Valid values: 'duckdb' (default), 'postgres', 'spark', "
+	                          "'hive', 'trino', 'presto'",
 	                          LogicalType::VARCHAR, Value("duckdb"));
 
 	// Register PRAGMA lpts('query')

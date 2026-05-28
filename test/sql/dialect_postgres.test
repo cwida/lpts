@@ -84,6 +84,22 @@ SELECT sql LIKE '%to_char(%' AS postgres_strftime FROM lpts_query('SELECT strfti
 ----
 true
 
+query I
+SELECT sql LIKE '%to_char(t0_ts, ''YYYY-MM-DD'')%' AS postgres_strftime_format FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+# strptime → to_timestamp
+query I
+SELECT sql LIKE '%to_timestamp(%' AS postgres_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%to_timestamp(t0_name, ''YYYY-MM-DD'')%' AS postgres_strptime_format FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
 # string_split → string_to_array
 query I
 SELECT sql LIKE '%string_to_array(%' AS postgres_string_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');

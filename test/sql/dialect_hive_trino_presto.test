@@ -1,0 +1,166 @@
+# name: test/sql/dialect_hive_trino_presto.test
+# description: lpts SQL output for Coral/polyglot dialects: HIVE and shared TRINO/PRESTO
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', 10), (2, 'Bob', 20);
+
+statement ok
+CREATE TABLE events (id INTEGER, ts TIMESTAMP, vals INTEGER[]);
+
+statement ok
+INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00', [1, 2, 3]);
+
+# ============================================================
+# HIVE dialect: backtick identifiers, schema.table qualification,
+# and Hive/Spark-family function names.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'hive';
+
+query I
+SELECT sql LIKE '%FROM `main`.`users`%' AS hive_schema_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%SELECT `id`%' AS hive_column_backticked FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%`order`%' AS hive_reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%date_format(%' AS hive_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%date_format(t0_ts, ''yyyy-MM-dd'')%' AS hive_strftime_format FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%to_timestamp(%' AS hive_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%to_timestamp(t0_name, ''yyyy-MM-dd'')%' AS hive_strptime_format FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%split(%' AS hive_string_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%transform(t0_vals, x -> (x + 1))%' AS hive_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%array_contains(%' AS hive_list_contains FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
+----
+true
+
+# ============================================================
+# TRINO/PRESTO dialect: shared enum path, ANSI identifiers,
+# three-part table qualification, and Trino-family function names.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'trino';
+
+query I
+SELECT sql LIKE '%FROM memory.main.users%' AS trino_three_part_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%"order"%' AS trino_reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+query I
+SELECT sql NOT LIKE '%`%' AS trino_no_backticks FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%date_format(%' AS trino_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%date_parse(%' AS trino_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%date_parse(t0_name, ''%Y-%m-%d'')%' AS trino_strptime_format FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%split(%' AS trino_string_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%transform(t0_vals, x -> (x + 1))%' AS trino_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%SELECT contains(t0_vals, 2)%' AS trino_list_contains FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
+----
+true
+
+statement ok
+SET lpts_dialect = 'presto';
+
+query I
+SELECT sql LIKE '%date_format(%' AS presto_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%date_parse(%' AS presto_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_dialect = 'trino_presto';
+
+statement error
+SELECT sql FROM lpts_query('SELECT id FROM users');
+----
+trino
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_dialect = 'oracle';
+
+statement error
+SELECT sql FROM lpts_query('SELECT id FROM users');
+----
+trino
+
+statement ok
+SET lpts_dialect = 'duckdb';
