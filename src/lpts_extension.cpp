@@ -289,7 +289,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	DBConfig &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("lpts_dialect",
 	                          "SQL dialect for lpts output. Valid values: 'duckdb' (default), 'postgres', 'spark', "
-	                          "'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift'",
+	                          "'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift', 'mysql', 'mariadb'",
 	                          LogicalType::VARCHAR, Value("duckdb"));
 
 	// Register PRAGMA lpts('query')

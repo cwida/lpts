@@ -19,7 +19,8 @@ enum class SqlDialect {
 	TRINO_PRESTO, ///< Trino/Presto SQL syntax (catalog.schema.table qualified, "ident" quoting)
 	SNOWFLAKE,    ///< Snowflake SQL syntax (catalog.schema.table qualified, "ident" quoting)
 	BIGQUERY,     ///< BigQuery SQL syntax (`catalog.schema.table` path quoting)
-	REDSHIFT      ///< Redshift SQL syntax (unqualified table refs, "ident" quoting)
+	REDSHIFT,     ///< Redshift SQL syntax (unqualified table refs, "ident" quoting)
+	MYSQL_MARIADB ///< MySQL/MariaDB SQL syntax (schema.table qualified, `ident` quoting)
 };
 
 /// Parse a dialect string into the enum.
@@ -40,7 +41,7 @@ bool DialectUsesSingleQuotedTablePath(SqlDialect dialect);
 
 /// Quote an identifier in the given dialect.
 /// - DUCKDB / POSTGRES: optionally `"name"` (DuckDB's `KeywordHelper::WriteOptionallyQuoted`).
-/// - SPARK / HIVE / BIGQUERY: always `` `name` `` (safe for reserved words and case).
+/// - SPARK / HIVE / BIGQUERY / MYSQL_MARIADB: always `` `name` `` (safe for reserved words and case).
 /// - TRINO_PRESTO / SNOWFLAKE / REDSHIFT: optionally `"name"` (ANSI identifier quoting).
 string DialectQuoteIdent(const string &name, SqlDialect dialect);
 

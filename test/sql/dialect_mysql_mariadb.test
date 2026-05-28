@@ -1,0 +1,111 @@
+# name: test/sql/dialect_mysql_mariadb.test
+# description: lpts SQL output for the MySQL/MariaDB dialect
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', 10), (2, 'Bob', 20);
+
+statement ok
+CREATE TABLE events (id INTEGER, ts TIMESTAMP, vals INTEGER[]);
+
+statement ok
+INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00', [1, 2, 3]);
+
+# ============================================================
+# MySQL: backtick identifiers, schema.table qualification,
+# POSIX-style date format strings.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'mysql';
+
+statement ok
+SET lpts_dialect = 'MySQL';
+
+query I
+SELECT sql LIKE '%FROM `main`.`users`%' AS mysql_schema_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql NOT LIKE '%`memory`.`main`.`users`%' AS mysql_no_catalog_table FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%SELECT `id`%' AS mysql_column_backticked FROM lpts_query('SELECT id FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%`order`%' AS mysql_reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%Y-%m-%d'')%' AS mysql_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%H:%i:%s.%f'')%' AS mysql_time_format_tokens FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%STR_TO_DATE(t0_name, ''%Y-%m-%d'')%' AS mysql_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%STR_TO_DATE(t0_name, ''%H:%i:%s'')%' AS mysql_time_parse_tokens FROM lpts_query('SELECT strptime(name, ''%H:%M:%S'') AS parsed FROM users');
+----
+true
+
+statement error
+SELECT sql FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+----
+MYSQL/MARIADB dialect
+
+statement error
+SELECT sql FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
+----
+MYSQL/MARIADB dialect
+
+statement error
+SELECT sql FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+MYSQL/MARIADB dialect
+
+# ============================================================
+# MariaDB shares the same internal rendering path.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'mariadb';
+
+query I
+SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%Y'')%' AS mariadb_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%STR_TO_DATE(t0_name, ''%Y-%m-%d'')%' AS mariadb_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
+----
+true
+
+statement ok
+SET lpts_dialect = 'mysql_mariadb';
+
+statement error
+SELECT sql FROM lpts_query('SELECT id FROM users');
+----
+mysql
+
+statement ok
+SET lpts_dialect = 'duckdb';

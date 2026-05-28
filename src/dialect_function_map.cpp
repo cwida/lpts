@@ -161,6 +161,16 @@ string RemapForRedshift(const string &name) {
 	return name;
 }
 
+string RemapForMySQLMariaDB(const string &name) {
+	if (name == "strftime") {
+		return "DATE_FORMAT";
+	}
+	if (name == "strptime") {
+		return "STR_TO_DATE";
+	}
+	return name;
+}
+
 } // namespace
 
 string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect) {
@@ -179,6 +189,8 @@ string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect
 		return RemapForBigQuery(duckdb_name);
 	case SqlDialect::REDSHIFT:
 		return RemapForRedshift(duckdb_name);
+	case SqlDialect::MYSQL_MARIADB:
+		return RemapForMySQLMariaDB(duckdb_name);
 	case SqlDialect::DUCKDB:
 	default:
 		return duckdb_name;

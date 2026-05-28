@@ -7,7 +7,8 @@
 namespace duckdb {
 
 bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect) {
-	return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY;
+	return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY ||
+	       dialect == SqlDialect::MYSQL_MARIADB;
 }
 
 bool DialectUsesUnqualifiedTableNames(SqlDialect dialect) {
@@ -15,7 +16,7 @@ bool DialectUsesUnqualifiedTableNames(SqlDialect dialect) {
 }
 
 bool DialectUsesSchemaQualifiedTableNames(SqlDialect dialect) {
-	return dialect == SqlDialect::HIVE;
+	return dialect == SqlDialect::HIVE || dialect == SqlDialect::MYSQL_MARIADB;
 }
 
 bool DialectUsesSingleQuotedTablePath(SqlDialect dialect) {
@@ -24,7 +25,7 @@ bool DialectUsesSingleQuotedTablePath(SqlDialect dialect) {
 
 string DialectQuoteIdent(const string &name, SqlDialect dialect) {
 	if (DialectUsesBacktickQuotedIdentifiers(dialect)) {
-		// Spark/Hive/BigQuery use backticks; embedded backticks must be doubled.
+		// Spark/Hive/BigQuery/MySQL/MariaDB use backticks; embedded backticks must be doubled.
 		std::ostringstream out;
 		out << '`';
 		for (char c : name) {

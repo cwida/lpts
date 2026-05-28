@@ -178,6 +178,10 @@ private:
 		return dialect == SqlDialect::SNOWFLAKE;
 	}
 
+	static bool UsesMySQLMariaDBDateFormat(SqlDialect dialect) {
+		return dialect == SqlDialect::MYSQL_MARIADB;
+	}
+
 	static string ConvertDuckDBDateFormatToJava(const string &format) {
 		string result;
 		for (idx_t i = 0; i < format.size(); i++) {
@@ -376,12 +380,84 @@ private:
 		return result;
 	}
 
+	static string ConvertDuckDBDateFormatToMySQLMariaDB(const string &format) {
+		string result;
+		for (idx_t i = 0; i < format.size(); i++) {
+			if (format[i] != '%' || i + 1 >= format.size()) {
+				result += format[i];
+				continue;
+			}
+			char specifier = format[++i];
+			switch (specifier) {
+			case 'Y':
+				result += "%Y";
+				break;
+			case 'y':
+				result += "%y";
+				break;
+			case 'm':
+				result += "%m";
+				break;
+			case 'd':
+				result += "%d";
+				break;
+			case 'H':
+				result += "%H";
+				break;
+			case 'I':
+				result += "%h";
+				break;
+			case 'M':
+				result += "%i";
+				break;
+			case 'S':
+				result += "%s";
+				break;
+			case 'f':
+				result += "%f";
+				break;
+			case 'a':
+				result += "%a";
+				break;
+			case 'W':
+			case 'A':
+				result += "%W";
+				break;
+			case 'b':
+				result += "%b";
+				break;
+			case 'B':
+				result += "%M";
+				break;
+			case '%':
+				result += "%%";
+				break;
+			default:
+				result += "%";
+				result += specifier;
+				break;
+			}
+		}
+		return result;
+	}
+
 	static bool IsDateFormatFunction(const string &function_name) {
 		return function_name == "strftime" || function_name == "strptime";
 	}
 
 	static bool UsesBigQueryDateFunctionArgumentOrder(const string &function_name, SqlDialect dialect) {
 		return dialect == SqlDialect::BIGQUERY && IsDateFormatFunction(function_name);
+	}
+
+	static bool IsUnsupportedMySQLMariaDBFunction(const BoundFunctionExpression &func_expr) {
+		if (func_expr.function.bind_lambda != nullptr) {
+			return true;
+		}
+		const string &name = func_expr.function.name;
+		return name == "list_transform" || name == "array_transform" || name == "list_filter" ||
+		       name == "array_filter" || name == "list_aggregate" || name == "array_aggregate" ||
+		       name == "list_contains" || name == "array_contains" || name == "list_extract" ||
+		       name == "array_extract" || name == "list_value" || name == "string_split" || name == "str_split";
 	}
 
 	static bool TryRenderConvertedDateFormat(const unique_ptr<Expression> &expression, SqlDialect dialect,
@@ -398,6 +474,8 @@ private:
 			format = ConvertDuckDBDateFormatToJava(format);
 		} else if (UsesSnowflakeDateFormat(dialect)) {
 			format = ConvertDuckDBDateFormatToSnowflake(format);
+		} else if (UsesMySQLMariaDBDateFormat(dialect)) {
+			format = ConvertDuckDBDateFormatToMySQLMariaDB(format);
 		} else if (UsesPostgresDateFormat(dialect)) {
 			format = ConvertDuckDBDateFormatToPostgres(format);
 		} else {
@@ -1149,6 +1227,11 @@ private:
 			                                    func_expr.function.name.rfind("__internal_decompress_", 0) == 0)) {
 				expr_str << ExpressionToAliasedString(func_expr.children[0]);
 				break;
+			}
+			if (dialect == SqlDialect::MYSQL_MARIADB && IsUnsupportedMySQLMariaDBFunction(func_expr)) {
+				throw NotImplementedException(
+				    "LPTS MYSQL/MARIADB dialect: DuckDB function '%s' has no safe SQL equivalent",
+				    func_expr.function.name);
 			}
 			// Dialect-specific function name remapping (see dialect_function_map.hpp).
 			string func_name = RemapFunctionNameForDialect(func_expr.function.name, dialect);
@@ -2777,9 +2860,12 @@ SqlDialect ParseSqlDialect(const string &value) {
 	if (normalized == "redshift") {
 		return SqlDialect::REDSHIFT;
 	}
+	if (normalized == "mysql" || normalized == "mariadb") {
+		return SqlDialect::MYSQL_MARIADB;
+	}
 	throw InvalidInputException(
 	    "Unknown lpts_dialect '%s'. Valid values: 'duckdb', 'postgres', 'spark', 'hive', 'trino', 'presto', "
-	    "'snowflake', 'bigquery', 'redshift'",
+	    "'snowflake', 'bigquery', 'redshift', 'mysql', 'mariadb'",
 	    value);
 }
 
