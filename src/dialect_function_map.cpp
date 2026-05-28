@@ -12,13 +12,18 @@ namespace duckdb {
 namespace {
 
 /// Postgres equivalents for DuckDB function names that OpenIVM-emitted plans
-/// actually exercise.
+/// actually exercise. Functions with identical names/signatures in both DuckDB
+/// and PostgreSQL pass through unchanged.
 string RemapForPostgres(const string &name) {
 	if (name == "strptime") {
 		return "to_timestamp";
 	}
 	if (name == "strftime") {
 		return "to_char";
+	}
+	if (name == "string_split" || name == "str_split") {
+		// PostgreSQL uses string_to_array(string, delimiter) for the same purpose.
+		return "string_to_array";
 	}
 	return name;
 }

@@ -1,0 +1,164 @@
+# name: test/sql/dialect_postgres.test
+# description: lpts SQL output for the POSTGRES dialect — table qualification,
+# group: [sql]
+
+#              identifier quoting, function name remapping, INSERT conflict syntax,
+#              and dialect parser round-trip. Uses lpts_query (LIKE pattern checks)
+#              for assertions on syntax that differs from DuckDB, and lpts_check
+#              for queries whose POSTGRES output is still valid in DuckDB.
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', 10), (2, 'Bob', 20);
+
+statement ok
+CREATE TABLE events (id INTEGER, ts TIMESTAMP, tags VARCHAR[]);
+
+statement ok
+INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00', ['news', 'sports']);
+
+statement ok
+CREATE TABLE dest (id INTEGER, name VARCHAR, "order" INTEGER);
+
+# ============================================================
+# Setup: enable POSTGRES dialect
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'postgres';
+
+# ============================================================
+# Table qualification — unqualified output
+# ============================================================
+
+# DuckDB emits catalog.schema.table (memory.main.users); POSTGRES emits just the table name.
+query I
+SELECT sql NOT LIKE '%memory.main%' AS no_catalog_schema FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# POSTGRES output must contain the bare table name, not schema-qualified.
+query I
+SELECT sql LIKE '%FROM users%' AS bare_table_name FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# Round-trip still correct: unqualified names resolve fine inside DuckDB.
+query I
+PRAGMA lpts_check('SELECT id, name FROM users');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT id FROM users WHERE id > 1');
+----
+true
+
+# ============================================================
+# Identifier quoting — double quotes (same as DuckDB)
+# ============================================================
+
+# Reserved-word column ("order") must be double-quoted in output.
+query I
+SELECT sql LIKE '%"order"%' AS reserved_word_quoted FROM lpts_query('SELECT "order" FROM users');
+----
+true
+
+# POSTGRES must NOT use backtick quoting (that is Spark-only).
+query I
+SELECT sql NOT LIKE '%`%' AS no_backticks FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# ============================================================
+# Function name remapping — PostgreSQL
+# ============================================================
+
+# strftime → to_char
+query I
+SELECT sql LIKE '%to_char(%' AS postgres_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+# string_split → string_to_array
+query I
+SELECT sql LIKE '%string_to_array(%' AS postgres_string_split FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
+----
+true
+
+# Functions shared between DuckDB and PostgreSQL pass through unchanged.
+# COALESCE is a BOUND_OPERATOR so it bypasses the dialect function remap.
+query I
+SELECT sql LIKE '%COALESCE(%' AS coalesce_passthrough FROM lpts_query('SELECT coalesce(name, CAST(id AS VARCHAR)) AS c FROM users');
+----
+true
+
+# ============================================================
+# INSERT ON CONFLICT DO NOTHING
+# ============================================================
+# NOTE: INSERT OR IGNORE with a PRIMARY KEY is rewritten by DuckDB's optimizer
+# to LOGICAL_MERGE_INTO, which LPTS does not yet handle. Without a PRIMARY KEY,
+# the DuckDB binder rejects OR IGNORE entirely. The InsertNode::ToQuery(POSTGRES)
+# path is therefore exercised only when MERGE_INTO support is added; the
+# implementation is already in place in cte_nodes.cpp.
+
+# ============================================================
+# Dialect parser — accepts postgres / POSTGRES / postgresql / POSTGRESQL
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_dialect = 'POSTGRES';
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_dialect = 'postgresql';
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_dialect = 'POSTGRESQL';
+
+# Round-trip back to a sane default for the rest of the tests.
+statement ok
+SET lpts_dialect = 'duckdb';
+
+# ============================================================
+# DuckDB regression: table names stay fully-qualified under DUCKDB dialect.
+# ============================================================
+
+query I
+SELECT sql LIKE '%memory.main.users%' AS duckdb_qualified FROM lpts_query('SELECT id FROM users');
+----
+true
+
+# ============================================================
+# SPARK regression: the POSTGRES remap must NOT emit Spark mappings.
+# strftime under POSTGRES → to_char (not date_format).
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'postgres';
+
+query I
+SELECT sql NOT LIKE '%date_format(%' AS no_spark_remap FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+# Under DuckDB dialect, strftime is emitted as-is (no remap).
+query I
+SELECT sql LIKE '%strftime(%' AS duckdb_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+----
+true
