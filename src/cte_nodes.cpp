@@ -64,10 +64,21 @@ string InsertNode::ToQuery(SqlDialect dialect) {
 		break;
 	case OnConflictAction::REPLACE:
 	case OnConflictAction::UPDATE:
+		if (dialect == SqlDialect::POSTGRES) {
+			// PostgreSQL ON CONFLICT DO UPDATE requires explicit conflict columns and SET
+			// clauses — metadata not available at this stage. Surface as an error.
+			throw NotImplementedException(
+			    "LPTS POSTGRES dialect: OR REPLACE / OR UPDATE conflict action requires "
+			    "ON CONFLICT (columns) DO UPDATE SET ... syntax. "
+			    "Explicit conflict columns are not available in the logical plan. "
+			    "Use ON CONFLICT DO NOTHING or handle conflict resolution at the application level.");
+		}
 		insert_str << "OR REPLACE ";
 		break;
 	case OnConflictAction::NOTHING:
-		insert_str << "OR IGNORE ";
+		if (dialect != SqlDialect::POSTGRES) {
+			insert_str << "OR IGNORE ";
+		}
 		break;
 	default:
 		throw NotImplementedException("OnConflictAction::%s is not implemented", EnumUtil::ToString(action_type));
@@ -76,6 +87,9 @@ string InsertNode::ToQuery(SqlDialect dialect) {
 	insert_str << target_table;
 	insert_str << " SELECT * FROM ";
 	insert_str << child_cte_name;
+	if (dialect == SqlDialect::POSTGRES && action_type == OnConflictAction::NOTHING) {
+		insert_str << " ON CONFLICT DO NOTHING";
+	}
 	return insert_str.str();
 }
 
