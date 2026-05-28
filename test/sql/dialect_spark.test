@@ -135,7 +135,7 @@ true
 statement error
 PRAGMA lpts('SELECT id, sum(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS s FROM users');
 ----
-SPARK dialect: window EXCLUDE clauses
+LPTS_UNSUPPORTED_OPERATOR
 
 # ============================================================
 # Dialect parser — accepts both 'spark' and 'SPARK', rejects unknowns

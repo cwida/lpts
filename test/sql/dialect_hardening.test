@@ -1,0 +1,83 @@
+# name: test/sql/dialect_hardening.test
+# description: fail-closed dialect diagnostics for unsupported functions, types, date tokens, and operators
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INTEGER, name VARCHAR, ts TIMESTAMP, vals INTEGER[]);
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice', TIMESTAMP '2024-01-15 12:34:56', [1, 2, 3]);
+
+# Unsupported list functions should fail before emitting plausible target SQL.
+statement ok
+SET lpts_dialect = 'postgres';
+
+statement error
+SELECT sql FROM lpts_query('SELECT list_contains(vals, 2) FROM users');
+----
+LPTS_UNSUPPORTED_FUNCTION
+
+# Non-DuckDB dialects should reject unsupported DuckDB cast target types.
+statement error
+SELECT sql FROM lpts_query('SELECT CAST(id AS HUGEINT) FROM users');
+----
+LPTS_UNSUPPORTED_TYPE
+
+statement ok
+SET lpts_dialect = 'bigquery';
+
+statement error
+SELECT sql FROM lpts_query('SELECT CAST(id AS SMALLINT) FROM users');
+----
+LPTS_UNSUPPORTED_TYPE
+
+statement ok
+SET lpts_dialect = 'postgres';
+
+# TRY_CAST needs per-dialect rendering for dialects without TRY_CAST syntax.
+statement error
+SELECT sql FROM lpts_query('SELECT TRY_CAST(name AS INTEGER) FROM users');
+----
+LPTS_DIALECT_SEMANTIC_RISK
+
+# Unknown date format tokens should not silently pass through converted format strings.
+statement ok
+SET lpts_dialect = 'spark';
+
+statement error
+SELECT sql FROM lpts_query('SELECT strftime(ts, ''%j'') FROM users');
+----
+LPTS_UNSUPPORTED_DATE_FORMAT_TOKEN
+
+# Unsupported logical operators should use structured error codes.
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement error
+SELECT sql FROM lpts_query('UPDATE users SET id = id + 1');
+----
+LPTS_UNSUPPORTED_OPERATOR
+
+statement error
+SELECT sql FROM lpts_query('DELETE FROM users WHERE id = 1');
+----
+LPTS_UNSUPPORTED_OPERATOR
+
+statement error
+SELECT sql FROM lpts_query('SELECT * FROM users POSITIONAL JOIN users AS u2');
+----
+LPTS_UNSUPPORTED_OPERATOR
+
+# MySQL/MariaDB should fail closed for FULL OUTER JOIN.
+statement ok
+SET lpts_dialect = 'mysql';
+
+statement error
+SELECT sql FROM lpts_query('SELECT * FROM users FULL OUTER JOIN users AS u2 ON users.id = u2.id');
+----
+LPTS_UNSUPPORTED_JOIN_TYPE
+
+statement ok
+SET lpts_dialect = 'duckdb';

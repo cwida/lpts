@@ -32,6 +32,13 @@ string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect 
 string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
                                  SqlDialect dialect);
 
+/// Stable lower-case name for diagnostics.
+string SqlDialectToString(SqlDialect dialect);
+
+/// Throw a structured LPTS NotImplementedException with dialect and feature context.
+[[noreturn]] void ThrowLptsNotImplemented(const string &code, SqlDialect dialect, const string &feature_kind,
+                                          const string &feature_name, const string &context, const string &reason);
+
 /// Escape single quotes in a string by doubling them (e.g. "it's" -> "it''s").
 string EscapeSingleQuotes(const string &input);
 

@@ -58,6 +58,11 @@ SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%H:%i:%s.%f'')%' AS mysql_time_format_tok
 true
 
 query I
+SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%j %p'')%' AS mysql_compatible_date_tokens FROM lpts_query('SELECT strftime(ts, ''%j %p'') AS formatted FROM events');
+----
+true
+
+query I
 SELECT sql LIKE '%STR_TO_DATE(t0_name, ''%Y-%m-%d'')%' AS mysql_strptime FROM lpts_query('SELECT strptime(name, ''%Y-%m-%d'') AS parsed FROM users');
 ----
 true
@@ -67,20 +72,30 @@ SELECT sql LIKE '%STR_TO_DATE(t0_name, ''%H:%i:%s'')%' AS mysql_time_parse_token
 ----
 true
 
+query I
+SELECT sql LIKE '%CAST(t0_id AS TINYINT)%' AS mysql_preserves_tinyint_cast FROM lpts_query('SELECT CAST(id AS TINYINT) FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%CAST(t0_id AS SMALLINT)%' AS mysql_preserves_smallint_cast FROM lpts_query('SELECT CAST(id AS SMALLINT) FROM users');
+----
+true
+
 statement error
 SELECT sql FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
 ----
-MYSQL/MARIADB dialect
+LPTS_UNSUPPORTED_FUNCTION
 
 statement error
 SELECT sql FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
 ----
-MYSQL/MARIADB dialect
+LPTS_UNSUPPORTED_FUNCTION
 
 statement error
 SELECT sql FROM lpts_query('SELECT string_split(name, '' '') AS parts FROM users');
 ----
-MYSQL/MARIADB dialect
+LPTS_UNSUPPORTED_FUNCTION
 
 # ============================================================
 # MariaDB shares the same internal rendering path.

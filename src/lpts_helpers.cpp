@@ -131,6 +131,37 @@ string DialectQualifiedTableName(const string &catalog, const string &schema, co
 	       DialectQuoteTableWithOptionalSuffix(table_name, dialect);
 }
 
+string SqlDialectToString(SqlDialect dialect) {
+	switch (dialect) {
+	case SqlDialect::DUCKDB:
+		return "duckdb";
+	case SqlDialect::POSTGRES:
+		return "postgres";
+	case SqlDialect::SPARK:
+		return "spark";
+	case SqlDialect::HIVE:
+		return "hive";
+	case SqlDialect::TRINO_PRESTO:
+		return "trino_presto";
+	case SqlDialect::SNOWFLAKE:
+		return "snowflake";
+	case SqlDialect::BIGQUERY:
+		return "bigquery";
+	case SqlDialect::REDSHIFT:
+		return "redshift";
+	case SqlDialect::MYSQL_MARIADB:
+		return "mysql_mariadb";
+	default:
+		return "unknown";
+	}
+}
+
+[[noreturn]] void ThrowLptsNotImplemented(const string &code, SqlDialect dialect, const string &feature_kind,
+                                          const string &feature_name, const string &context, const string &reason) {
+	throw NotImplementedException("%s: dialect=%s feature=%s name=%s context=%s reason=%s", code,
+	                              SqlDialectToString(dialect), feature_kind, feature_name, context, reason);
+}
+
 string EscapeSingleQuotes(const string &input) {
 	std::stringstream escaped_stream;
 	for (char c : input) {

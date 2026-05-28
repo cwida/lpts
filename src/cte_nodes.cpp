@@ -81,7 +81,9 @@ string InsertNode::ToQuery(SqlDialect dialect) {
 		}
 		break;
 	default:
-		throw NotImplementedException("OnConflictAction::%s is not implemented", EnumUtil::ToString(action_type));
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "on_conflict_action",
+		                        EnumUtil::ToString(action_type), "InsertNode",
+		                        "ON CONFLICT action is not implemented by LPTS");
 	}
 	insert_str << "INTO ";
 	insert_str << target_table;
@@ -238,7 +240,8 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 		join_str << "LEFT";
 		break;
 	default:
-		throw NotImplementedException("JoinType::%s is not implemented", EnumUtil::ToString(join_type));
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", EnumUtil::ToString(join_type),
+		                        "JoinNode", "join type is not implemented by LPTS");
 	}
 	join_str << " JOIN ";
 	// MARK→LEFT joins: deduplicate the right side to prevent left-row multiplication

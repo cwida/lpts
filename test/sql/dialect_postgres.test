@@ -113,6 +113,16 @@ SELECT sql LIKE '%COALESCE(%' AS coalesce_passthrough FROM lpts_query('SELECT co
 ----
 true
 
+query I
+SELECT sql LIKE '%CAST(t0_id AS SMALLINT)%' AS postgres_preserves_smallint_cast FROM lpts_query('SELECT CAST(id AS SMALLINT) AS s FROM users');
+----
+true
+
+statement error
+SELECT sql FROM lpts_query('SELECT CAST(id AS TINYINT) AS t FROM users');
+----
+LPTS_UNSUPPORTED_TYPE
+
 # ============================================================
 # INSERT ON CONFLICT DO NOTHING
 # ============================================================

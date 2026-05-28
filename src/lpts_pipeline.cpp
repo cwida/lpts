@@ -182,12 +182,25 @@ private:
 		return dialect == SqlDialect::MYSQL_MARIADB;
 	}
 
-	static string ConvertDuckDBDateFormatToJava(const string &format) {
+	static bool IsDuckDBDialect(SqlDialect dialect) {
+		return dialect == SqlDialect::DUCKDB;
+	}
+
+	static void ThrowUnsupportedDateFormatToken(SqlDialect dialect, char specifier) {
+		string token = specifier == '\0' ? "<trailing %>" : "%" + string(1, specifier);
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_DATE_FORMAT_TOKEN", dialect, "date_format_token", token,
+		                        "date format conversion", "no verified equivalent token for target dialect");
+	}
+
+	static string ConvertDuckDBDateFormatToJava(const string &format, SqlDialect dialect) {
 		string result;
 		for (idx_t i = 0; i < format.size(); i++) {
-			if (format[i] != '%' || i + 1 >= format.size()) {
+			if (format[i] != '%') {
 				result += format[i];
 				continue;
+			}
+			if (i + 1 >= format.size()) {
+				ThrowUnsupportedDateFormatToken(dialect, '\0');
 			}
 			char specifier = format[++i];
 			switch (specifier) {
@@ -240,20 +253,21 @@ private:
 				result += "%";
 				break;
 			default:
-				result += "%";
-				result += specifier;
-				break;
+				ThrowUnsupportedDateFormatToken(dialect, specifier);
 			}
 		}
 		return result;
 	}
 
-	static string ConvertDuckDBDateFormatToPostgres(const string &format) {
+	static string ConvertDuckDBDateFormatToPostgres(const string &format, SqlDialect dialect) {
 		string result;
 		for (idx_t i = 0; i < format.size(); i++) {
-			if (format[i] != '%' || i + 1 >= format.size()) {
+			if (format[i] != '%') {
 				result += format[i];
 				continue;
+			}
+			if (i + 1 >= format.size()) {
+				ThrowUnsupportedDateFormatToken(dialect, '\0');
 			}
 			char specifier = format[++i];
 			switch (specifier) {
@@ -306,20 +320,21 @@ private:
 				result += "%";
 				break;
 			default:
-				result += "%";
-				result += specifier;
-				break;
+				ThrowUnsupportedDateFormatToken(dialect, specifier);
 			}
 		}
 		return result;
 	}
 
-	static string ConvertDuckDBDateFormatToSnowflake(const string &format) {
+	static string ConvertDuckDBDateFormatToSnowflake(const string &format, SqlDialect dialect) {
 		string result;
 		for (idx_t i = 0; i < format.size(); i++) {
-			if (format[i] != '%' || i + 1 >= format.size()) {
+			if (format[i] != '%') {
 				result += format[i];
 				continue;
+			}
+			if (i + 1 >= format.size()) {
+				ThrowUnsupportedDateFormatToken(dialect, '\0');
 			}
 			char specifier = format[++i];
 			switch (specifier) {
@@ -372,20 +387,21 @@ private:
 				result += "%";
 				break;
 			default:
-				result += "%";
-				result += specifier;
-				break;
+				ThrowUnsupportedDateFormatToken(dialect, specifier);
 			}
 		}
 		return result;
 	}
 
-	static string ConvertDuckDBDateFormatToMySQLMariaDB(const string &format) {
+	static string ConvertDuckDBDateFormatToMySQLMariaDB(const string &format, SqlDialect dialect) {
 		string result;
 		for (idx_t i = 0; i < format.size(); i++) {
-			if (format[i] != '%' || i + 1 >= format.size()) {
+			if (format[i] != '%') {
 				result += format[i];
 				continue;
+			}
+			if (i + 1 >= format.size()) {
+				ThrowUnsupportedDateFormatToken(dialect, '\0');
 			}
 			char specifier = format[++i];
 			switch (specifier) {
@@ -416,6 +432,18 @@ private:
 			case 'f':
 				result += "%f";
 				break;
+			case 'j':
+				result += "%j";
+				break;
+			case 'p':
+				result += "%p";
+				break;
+			case 'U':
+				result += "%U";
+				break;
+			case 'w':
+				result += "%w";
+				break;
 			case 'a':
 				result += "%a";
 				break;
@@ -433,9 +461,7 @@ private:
 				result += "%%";
 				break;
 			default:
-				result += "%";
-				result += specifier;
-				break;
+				ThrowUnsupportedDateFormatToken(dialect, specifier);
 			}
 		}
 		return result;
@@ -449,15 +475,44 @@ private:
 		return dialect == SqlDialect::BIGQUERY && IsDateFormatFunction(function_name);
 	}
 
-	static bool IsUnsupportedMySQLMariaDBFunction(const BoundFunctionExpression &func_expr) {
-		if (func_expr.function.bind_lambda != nullptr) {
-			return true;
-		}
-		const string &name = func_expr.function.name;
+	static bool IsDuckDBListFunction(const string &name) {
 		return name == "list_transform" || name == "array_transform" || name == "list_filter" ||
 		       name == "array_filter" || name == "list_aggregate" || name == "array_aggregate" ||
 		       name == "list_contains" || name == "array_contains" || name == "list_extract" ||
-		       name == "array_extract" || name == "list_value" || name == "string_split" || name == "str_split";
+		       name == "array_extract" || name == "list_value";
+	}
+
+	static bool IsStringSplitFunction(const string &name) {
+		return name == "string_split" || name == "str_split";
+	}
+
+	static bool DialectSupportsListFunction(SqlDialect dialect) {
+		return dialect == SqlDialect::DUCKDB || dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE ||
+		       dialect == SqlDialect::TRINO_PRESTO;
+	}
+
+	static bool DialectSupportsLambdaFunction(SqlDialect dialect) {
+		return dialect == SqlDialect::DUCKDB || dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE ||
+		       dialect == SqlDialect::TRINO_PRESTO;
+	}
+
+	static void ValidateFunctionForDialect(const BoundFunctionExpression &func_expr, SqlDialect dialect) {
+		if (IsDuckDBDialect(dialect)) {
+			return;
+		}
+		const string &name = func_expr.function.name;
+		if (func_expr.function.bind_lambda != nullptr && !DialectSupportsLambdaFunction(dialect)) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", name, "BOUND_FUNCTION",
+			                        "no safe lambda syntax or list semantics for target dialect");
+		}
+		if (IsDuckDBListFunction(name) && !DialectSupportsListFunction(dialect)) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", name, "BOUND_FUNCTION",
+			                        "no verified list/array equivalent for target dialect");
+		}
+		if (dialect == SqlDialect::MYSQL_MARIADB && IsStringSplitFunction(name)) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", name, "BOUND_FUNCTION",
+			                        "no safe array-returning string split equivalent");
+		}
 	}
 
 	static bool TryRenderConvertedDateFormat(const unique_ptr<Expression> &expression, SqlDialect dialect,
@@ -471,13 +526,13 @@ private:
 		}
 		string format = constant.value.GetValue<string>();
 		if (UsesJavaDateFormat(dialect)) {
-			format = ConvertDuckDBDateFormatToJava(format);
+			format = ConvertDuckDBDateFormatToJava(format, dialect);
 		} else if (UsesSnowflakeDateFormat(dialect)) {
-			format = ConvertDuckDBDateFormatToSnowflake(format);
+			format = ConvertDuckDBDateFormatToSnowflake(format, dialect);
 		} else if (UsesMySQLMariaDBDateFormat(dialect)) {
-			format = ConvertDuckDBDateFormatToMySQLMariaDB(format);
+			format = ConvertDuckDBDateFormatToMySQLMariaDB(format, dialect);
 		} else if (UsesPostgresDateFormat(dialect)) {
-			format = ConvertDuckDBDateFormatToPostgres(format);
+			format = ConvertDuckDBDateFormatToPostgres(format, dialect);
 		} else {
 			return false;
 		}
@@ -487,6 +542,95 @@ private:
 
 	static bool UsesArrowLambdaSyntax(SqlDialect dialect) {
 		return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::TRINO_PRESTO;
+	}
+
+	static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) {
+		if (IsDuckDBDialect(dialect)) {
+			return type.ToString();
+		}
+		switch (type.id()) {
+		case LogicalTypeId::BOOLEAN:
+			return "BOOLEAN";
+		case LogicalTypeId::TINYINT:
+			if (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::BIGQUERY || dialect == SqlDialect::REDSHIFT) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
+				                        "target dialect does not support TINYINT cast syntax");
+			}
+			return "TINYINT";
+		case LogicalTypeId::SMALLINT:
+			if (dialect == SqlDialect::BIGQUERY) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
+				                        "target dialect does not support SMALLINT cast syntax");
+			}
+			return "SMALLINT";
+		case LogicalTypeId::INTEGER:
+			return "INTEGER";
+		case LogicalTypeId::BIGINT:
+			return "BIGINT";
+		case LogicalTypeId::FLOAT:
+			return "FLOAT";
+		case LogicalTypeId::DOUBLE:
+			return "DOUBLE";
+		case LogicalTypeId::DECIMAL:
+			return type.ToString();
+		case LogicalTypeId::VARCHAR:
+			return "VARCHAR";
+		case LogicalTypeId::DATE:
+			return "DATE";
+		case LogicalTypeId::TIME:
+			return "TIME";
+		case LogicalTypeId::TIMESTAMP:
+			return "TIMESTAMP";
+		default:
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
+			                        "no verified target dialect cast type mapping");
+			return type.ToString();
+		}
+	}
+
+	static void ValidateTryCastForDialect(SqlDialect dialect) {
+		if (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY ||
+		    dialect == SqlDialect::REDSHIFT || dialect == SqlDialect::MYSQL_MARIADB) {
+			ThrowLptsNotImplemented("LPTS_DIALECT_SEMANTIC_RISK", dialect, "function", "TRY_CAST", "BOUND_CAST",
+			                        "target dialect needs a dialect-specific TRY_CAST/SAFE_CAST rewrite");
+		}
+	}
+
+	static bool IsSupportedSqlJoinType(JoinType join_type) {
+		switch (join_type) {
+		case JoinType::INNER:
+		case JoinType::LEFT:
+		case JoinType::RIGHT:
+		case JoinType::OUTER:
+		case JoinType::SEMI:
+		case JoinType::ANTI:
+		case JoinType::SINGLE:
+		case JoinType::MARK:
+		case JoinType::RIGHT_SEMI:
+		case JoinType::RIGHT_ANTI:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	static void ValidateJoinTypeForDialect(JoinType join_type, SqlDialect dialect, const string &context) {
+		if (!IsSupportedSqlJoinType(join_type)) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", EnumUtil::ToString(join_type),
+			                        context, "join type is not implemented by LPTS");
+		}
+		if (IsDuckDBDialect(dialect)) {
+			return;
+		}
+		if (join_type == JoinType::OUTER && dialect == SqlDialect::MYSQL_MARIADB) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", "OUTER", context,
+			                        "MySQL/MariaDB do not support FULL OUTER JOIN");
+		}
+		if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::RIGHT_SEMI ||
+		    join_type == JoinType::RIGHT_ANTI) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", EnumUtil::ToString(join_type),
+			                        context, "SEMI/ANTI JOIN SQL syntax is not portable for this dialect");
+		}
 	}
 
 	/// Query the current snapshot_id for a DuckLake catalog.
@@ -870,7 +1014,9 @@ private:
 		case OrderType::ORDER_DEFAULT:
 			break;
 		default:
-			throw NotImplementedException("Not implemented ORDER BY direction for window expression");
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "order_by_direction",
+			                        std::to_string(static_cast<int>(order.type)), "BoundOrderByNode",
+			                        "ORDER BY direction is not implemented by LPTS");
 		}
 		switch (order.null_order) {
 		case OrderByNullType::NULLS_FIRST:
@@ -882,12 +1028,14 @@ private:
 		case OrderByNullType::ORDER_DEFAULT:
 			break;
 		default:
-			throw NotImplementedException("Not implemented ORDER BY null ordering for window expression");
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "order_by_null_order",
+			                        std::to_string(static_cast<int>(order.null_order)), "BoundOrderByNode",
+			                        "ORDER BY null ordering is not implemented by LPTS");
 		}
 		return result.str();
 	}
 
-	static string WindowFunctionName(const BoundWindowExpression &window) {
+	string WindowFunctionName(const BoundWindowExpression &window) const {
 		if (window.aggregate) {
 			string agg_name = window.aggregate->name;
 			if (agg_name == "sum_no_overflow") {
@@ -924,8 +1072,9 @@ private:
 		case ExpressionType::WINDOW_FILL:
 			return "fill";
 		default:
-			throw NotImplementedException("Not implemented window function: %s",
-			                              ExpressionTypeToString(window.GetExpressionType()));
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "window_function",
+			                        ExpressionTypeToString(window.GetExpressionType()), "BOUND_WINDOW",
+			                        "window function is not implemented by LPTS");
 		}
 	}
 
@@ -994,7 +1143,9 @@ private:
 		case WindowBoundary::INVALID:
 			return "";
 		default:
-			throw NotImplementedException("Not implemented window frame start");
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_frame_start",
+			                        std::to_string(static_cast<int>(window.start)), "BOUND_WINDOW",
+			                        "window frame start is not implemented by LPTS");
 		}
 	}
 
@@ -1031,7 +1182,9 @@ private:
 		case WindowBoundary::INVALID:
 			return "";
 		default:
-			throw NotImplementedException("Not implemented window frame end");
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_frame_end",
+			                        std::to_string(static_cast<int>(window.end)), "BOUND_WINDOW",
+			                        "window frame end is not implemented by LPTS");
 		}
 	}
 
@@ -1115,9 +1268,8 @@ private:
 		}
 		if (!frame_start.empty() || !frame_end.empty()) {
 			if (dialect == SqlDialect::SPARK && units == "GROUPS") {
-				throw NotImplementedException(
-				    "LPTS SPARK dialect: window frame units 'GROUPS' are not supported by Spark SQL "
-				    "(only ROWS and RANGE). Rewrite the window to use a ROWS/RANGE frame.");
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_frame_units", "GROUPS",
+				                        "BOUND_WINDOW", "Spark SQL supports ROWS/RANGE frames but not GROUPS");
 			}
 			result << separator << units;
 			if (!frame_start.empty() && !frame_end.empty()) {
@@ -1130,8 +1282,9 @@ private:
 			separator = " ";
 		}
 		if (dialect == SqlDialect::SPARK && window.exclude_clause != WindowExcludeMode::NO_OTHER) {
-			throw NotImplementedException("LPTS SPARK dialect: window EXCLUDE clauses are not supported by Spark SQL. "
-			                              "Remove the EXCLUDE clause or restructure the window expression.");
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_exclude_clause",
+			                        std::to_string(static_cast<int>(window.exclude_clause)), "BOUND_WINDOW",
+			                        "Spark SQL does not support window EXCLUDE clauses");
 		}
 		switch (window.exclude_clause) {
 		case WindowExcludeMode::NO_OTHER:
@@ -1146,7 +1299,9 @@ private:
 			result << separator << "EXCLUDE TIES";
 			break;
 		default:
-			throw NotImplementedException("Not implemented window exclude mode");
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_exclude_clause",
+			                        std::to_string(static_cast<int>(window.exclude_clause)), "BOUND_WINDOW",
+			                        "window exclude mode is not implemented by LPTS");
 		}
 		result << ")";
 		return result.str();
@@ -1196,9 +1351,12 @@ private:
 		}
 		case ExpressionClass::BOUND_CAST: {
 			const BoundCastExpression &cast_expr = expression->Cast<BoundCastExpression>();
+			if (cast_expr.try_cast) {
+				ValidateTryCastForDialect(dialect);
+			}
 			expr_str << (cast_expr.try_cast ? "TRY_CAST(" : "CAST(");
 			expr_str << ExpressionToAliasedString(cast_expr.child);
-			expr_str << " AS " + cast_expr.return_type.ToString() + ")";
+			expr_str << " AS " + RenderCastTargetType(cast_expr.return_type, dialect) + ")";
 			break;
 		}
 		case ExpressionClass::BOUND_CONJUNCTION: {
@@ -1228,11 +1386,7 @@ private:
 				expr_str << ExpressionToAliasedString(func_expr.children[0]);
 				break;
 			}
-			if (dialect == SqlDialect::MYSQL_MARIADB && IsUnsupportedMySQLMariaDBFunction(func_expr)) {
-				throw NotImplementedException(
-				    "LPTS MYSQL/MARIADB dialect: DuckDB function '%s' has no safe SQL equivalent",
-				    func_expr.function.name);
-			}
+			ValidateFunctionForDialect(func_expr, dialect);
 			// Dialect-specific function name remapping (see dialect_function_map.hpp).
 			string func_name = RemapFunctionNameForDialect(func_expr.function.name, dialect);
 			// For lambda functions, only serialize non-lambda, non-capture children
@@ -1420,12 +1574,16 @@ private:
 				         << ExpressionToAliasedString(op_expr.children[1]) << ")";
 				break;
 			case ExpressionType::OPERATOR_TRY:
+				if (!IsDuckDBDialect(dialect)) {
+					ThrowLptsNotImplemented("LPTS_DIALECT_SEMANTIC_RISK", dialect, "operator", "TRY", "BOUND_OPERATOR",
+					                        "TRY expression has dialect-specific semantics");
+				}
 				expr_str << "TRY(" << ExpressionToAliasedString(op_expr.children[0]) << ")";
 				break;
 			default:
-				throw NotImplementedException(
-				    "Not implemented BOUND_OPERATOR subtype for ExpressionToAliasedString: %s",
-				    ExpressionTypeToString(op_expr.GetExpressionType()));
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "expression_operator",
+				                        ExpressionTypeToString(op_expr.GetExpressionType()), "BOUND_OPERATOR",
+				                        "expression operator is not implemented by LPTS");
 			}
 			break;
 		}
@@ -1440,8 +1598,9 @@ private:
 			break;
 		}
 		default:
-			throw NotImplementedException("Not implemented expression for ExpressionToAliasedString: %s",
-			                              ExpressionTypeToString(expression->type));
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "expression_class",
+			                        ExpressionTypeToString(expression->type), "ExpressionToAliasedString",
+			                        "expression class is not implemented by LPTS");
 		}
 		return expr_str.str();
 	}
@@ -1804,7 +1963,9 @@ private:
 
 			for (idx_t i = 0; i < window.expressions.size(); i++) {
 				if (window.expressions[i]->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
-					throw NotImplementedException("AstBuilder: only BOUND_WINDOW supported in LOGICAL_WINDOW");
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "expression_class",
+					                        ExpressionTypeToString(window.expressions[i]->type), "LOGICAL_WINDOW",
+					                        "LOGICAL_WINDOW only supports BOUND_WINDOW expressions");
 				}
 				const BoundWindowExpression &window_expr = window.expressions[i]->Cast<BoundWindowExpression>();
 				const string expr_str = WindowExpressionToAliasedString(window_expr);
@@ -2016,7 +2177,9 @@ private:
 			for (size_t i = 0; i < agg.expressions.size(); ++i) {
 				const unique_ptr<Expression> &expr = agg.expressions[i];
 				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
-					throw NotImplementedException("AstBuilder: only BOUND_AGGREGATE supported in aggregates");
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "expression_class",
+					                        ExpressionTypeToString(expr->type), "LOGICAL_AGGREGATE_AND_GROUP_BY",
+					                        "aggregate operator only supports BOUND_AGGREGATE expressions");
 				}
 				const BoundAggregateExpression &ba = expr->Cast<BoundAggregateExpression>();
 				std::ostringstream agg_str;
@@ -2152,6 +2315,7 @@ private:
 		//----------------------------------------------------------------------
 		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
 			const LogicalComparisonJoin &join_op = op->Cast<LogicalComparisonJoin>();
+			ValidateJoinTypeForDialect(join_op.join_type, dialect, "LOGICAL_COMPARISON_JOIN");
 			vector<string> conditions;
 			vector<ColumnBinding> child_bindings;
 			for (auto &child : op->children) {
@@ -2218,6 +2382,7 @@ private:
 		// Serialize as a normal JOIN with the condition as an opaque predicate.
 		case LogicalOperatorType::LOGICAL_ANY_JOIN: {
 			const LogicalAnyJoin &any_join = op->Cast<LogicalAnyJoin>();
+			ValidateJoinTypeForDialect(any_join.join_type, dialect, "LOGICAL_ANY_JOIN");
 			vector<string> conditions;
 			if (any_join.condition) {
 				conditions.push_back("(" + ExpressionToAliasedString(any_join.condition) + ")");
@@ -2313,7 +2478,9 @@ private:
 				limit_str = ExpressionToAliasedString(limit_expr);
 				limit_needs_child_scalar = ExpressionContainsColumnRef(*limit_expr);
 			} else if (limit_op.limit_val.Type() != LimitNodeType::UNSET) {
-				throw NotImplementedException("LPTS: LIMIT node type not implemented");
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "limit_node_type",
+				                        std::to_string(static_cast<int>(limit_op.limit_val.Type())), "LOGICAL_LIMIT",
+				                        "LIMIT node type is not implemented by LPTS");
 			}
 			string offset_str;
 			bool offset_needs_child_scalar = false;
@@ -2324,7 +2491,9 @@ private:
 				offset_str = ExpressionToAliasedString(offset_expr);
 				offset_needs_child_scalar = ExpressionContainsColumnRef(*offset_expr);
 			} else if (limit_op.offset_val.Type() != LimitNodeType::UNSET) {
-				throw NotImplementedException("LPTS: OFFSET node type not implemented");
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "offset_node_type",
+				                        std::to_string(static_cast<int>(limit_op.offset_val.Type())), "LOGICAL_LIMIT",
+				                        "OFFSET node type is not implemented by LPTS");
 			}
 			vector<string> cte_column_names;
 			for (const ColumnBinding &cb : op->GetColumnBindings()) {
@@ -2591,6 +2760,7 @@ private:
 		case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 		case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
 			const LogicalComparisonJoin &dj = op->Cast<LogicalComparisonJoin>();
+			ValidateJoinTypeForDialect(dj.join_type, dialect, LogicalOperatorToString(op->type));
 			const idx_t inner_child_idx = dj.delim_flipped ? 0 : 1;
 
 			// Collect ALL DELIM_GET table_indices from the inner subtree.
@@ -2707,9 +2877,21 @@ private:
 			                                   std::move(delim_tis), std::move(mark_col_expr));
 		}
 
+		case LogicalOperatorType::LOGICAL_SAMPLE:
+		case LogicalOperatorType::LOGICAL_PIVOT:
+		case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		case LogicalOperatorType::LOGICAL_JOIN:
+		case LogicalOperatorType::LOGICAL_DELETE:
+		case LogicalOperatorType::LOGICAL_UPDATE:
+		case LogicalOperatorType::LOGICAL_MERGE_INTO:
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
+			                        LogicalOperatorToString(op->type), "AstBuilder",
+			                        "logical operator is not implemented by LPTS");
 		default:
-			throw NotImplementedException("AstBuilder: operator '%s' is not yet implemented",
-			                              LogicalOperatorToString(op->type));
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
+			                        LogicalOperatorToString(op->type), "AstBuilder",
+			                        "logical operator is not implemented by LPTS");
 		}
 	}
 

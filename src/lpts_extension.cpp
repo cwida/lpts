@@ -260,7 +260,7 @@ static unique_ptr<FunctionData> PrintAstTableBind(ClientContext &context, TableF
 	auto ast = LogicalPlanToAst(context, plan);
 
 	auto result = make_uniq<PrintAstBindData>();
-	result->rendered = PrintAst(*ast);
+	result->rendered = RenderAstTree(*ast);
 
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("ast");

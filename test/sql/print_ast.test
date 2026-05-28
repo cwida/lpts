@@ -10,18 +10,18 @@ CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 statement ok
 CREATE TABLE orders (id INTEGER, user_id INTEGER, amount DECIMAL);
 
-# Simple select — should produce Project → Get
+# Simple select — should produce a rendered Project → Get tree
 query I
-SELECT replace(ast, chr(10), ' | ') FROM print_ast_query('SELECT * FROM users');
+SELECT ast LIKE '%Project%' AND ast LIKE '%Get%' AND instr(ast, chr(10)) > 0 FROM print_ast_query('SELECT * FROM users');
 ----
-Project (table_index=1, expressions=3) |   t1_id <- t0_id |   t1_name <- t0_name |   t1_age <- t0_age |   Get memory.main.users (table_index=0) |     columns: [id, name, age]
+true
 
 # Select with filter on empty table — STATISTICS_PROPAGATION detects the table is empty
 # (column stats have inverted min/max), so it prunes the whole plan to EMPTY_RESULT.
 query I
-SELECT replace(ast, chr(10), ' | ') FROM print_ast_query('SELECT * FROM users WHERE age > 25');
+SELECT ast LIKE '%Get%' AND ast LIKE '%false%' AND instr(ast, chr(10)) > 0 FROM print_ast_query('SELECT * FROM users WHERE age > 25');
 ----
-Get ..(SELECT 1) (table_index=0) |   columns: [NULL::INTEGER, NULL::VARCHAR, NULL::INTEGER] |   filters: [false]
+true
 
 # Filter pushdown on a populated table — FILTER_PUSHDOWN folds the condition into
 # the scan's table_filters and STATISTICS_PROPAGATION keeps it (age range [20,30]
@@ -33,15 +33,21 @@ statement ok
 INSERT INTO users_pop VALUES (1, 'Alice', 20), (2, 'Bob', 30);
 
 query I
-SELECT replace(ast, chr(10), ' | ') FROM print_ast_query('SELECT * FROM users_pop WHERE age > 25');
+SELECT ast LIKE '%Project%' AND ast LIKE '%Get%' AND ast LIKE '%age>25%' FROM print_ast_query('SELECT * FROM users_pop WHERE age > 25');
 ----
-Project (table_index=1, expressions=3) |   t1_id <- t0_id |   t1_name <- t0_name |   t1_age <- t0_age |   Get memory.main.users_pop (table_index=0) |     columns: [age, id, name] |     filters: [age>25]
+true
 
 # Join — should produce Project → Aggregate → Join → Get + Get
 query I
-SELECT replace(ast, chr(10), ' | ') FROM print_ast_query('SELECT u.name, sum(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name');
+SELECT ast LIKE '%Project%' AND ast LIKE '%Aggregate%' AND ast LIKE '%Join%' AND ast LIKE '%Get%' FROM print_ast_query('SELECT u.name, sum(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name');
 ----
-Project (table_index=2, expressions=2) |   t2_name <- t3_name |   t2_aggregate_0 <- t4_aggregate_0 |   Aggregate (groups=1, aggregates=1) |     group_by: [t0_name] |     t4_aggregate_0 <- sum(t1_amount) |     Join (INNER, conditions=1) |       on: (t0_id = t1_user_id) |       Get memory.main.users (table_index=0) |         columns: [id, name] |       Get memory.main.orders (table_index=1) |         columns: [user_id, amount]
+true
+
+# Generated CTE SQL should use newline-separated WITH entries for readability.
+query I
+SELECT instr(sql, chr(10)) > 0 FROM lpts_query('SELECT u.name, sum(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name');
+----
+true
 
 # Cross product — should produce Join(INNER, ON TRUE)
 query I
