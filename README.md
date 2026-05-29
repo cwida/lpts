@@ -32,7 +32,7 @@ SELECT t1_name AS "name" FROM projection_1;
 ```
 
 LPTS plans the query through DuckDB, optimizes it, then serializes the optimized
-logical plan.
+logical plan. For more details, check the [related report](TODO).
 
 ## Supported Dialects
 
@@ -171,3 +171,5 @@ SELECT "order", strftime(ts, '%Y-%m-%d %H:%M:%S') AS formatted FROM events LIMIT
 - **[Building](docs/building.md)** - build, local loading, updating, and CLion setup
 - **[Tests](docs/test.md)** - SQLLogicTest conventions
 - **[Benchmark](docs/benchmark.md)** - SQLStorm benchmark runner
+
+Maintainer: [ila](https://github.com/ila)
