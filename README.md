@@ -4,10 +4,6 @@ A DuckDB extension for **optimized-plan inspection** and **cross-system SQL
 compilation**. LPTS takes DuckDB's post-optimizer logical plan and reconstructs
 equivalent SQL as a sequence of named CTEs.
 
-This makes optimizer rewrites visible: filter pushdown, join reordering, CTE
-materialization, top-N rewrites, and subquery decorrelation can all show up in
-the generated SQL.
-
 ## PRAGMA Syntax
 
 ```sql
@@ -17,7 +13,8 @@ PRAGMA lpts('<query>');
 Example:
 
 ```sql
-LOAD 'build/release/extension/lpts/lpts.duckdb_extension';
+INSTALL lpts FROM community;
+LOAD lpts;
 
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 22), (3, 'Carol', 28);
@@ -41,6 +38,18 @@ PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
 true
 ```
 
+LPTS plans the query through DuckDB with all DuckDB optimizers enabled, then
+serializes the optimized logical plan.
+
+## Use Cases
+
+- Inspect optimized DuckDB plans as SQL.
+- Debug optimizer rewrites such as filter pushdown, join reordering, top-N,
+  materialized CTEs, and subquery decorrelation.
+- Generate a CTE program that communicates the optimized execution shape.
+- Emit SQL for another engine with `lpts_dialect`.
+- Normalize non-DuckDB SQL input before planning with `lpts_input_dialect`.
+
 ## Pragmas and Functions
 
 | Function | Description |
@@ -51,6 +60,7 @@ true
 | `PRAGMA lpts_check('query')` | Compare original and generated SQL with bag equality |
 | `PRAGMA print_ast('query')` | Print the AST to stdout |
 | `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
+| `lpts_normalize_query('query')` | Return input-dialect SQL normalized to DuckDB SQL |
 
 ## Supported Operators
 
@@ -61,38 +71,44 @@ table functions, DuckLake scans, and inserts.
 
 Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 
+## Supported Dialects
+
+The dialect settings accept these values:
+
+| Dialect | Accepted values |
+|---|---|
+| DuckDB | `duckdb` |
+| PostgreSQL | `postgres`, `postgresql` |
+| Spark SQL | `spark` |
+| Hive | `hive` |
+| Trino / Presto | `trino`, `presto` |
+| Snowflake | `snowflake` |
+| BigQuery | `bigquery`, `bq` |
+| Redshift | `redshift` |
+| MySQL / MariaDB | `mysql`, `mariadb` |
+
+Trino and Presto share one renderer internally. MySQL and MariaDB also share one
+renderer internally.
+
 ## Settings
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `lpts_dialect` | VARCHAR | `duckdb` | Output dialect: `duckdb` or `postgres` |
+| `lpts_dialect` | VARCHAR | `duckdb` | Output dialect for generated SQL |
+| `lpts_input_dialect` | VARCHAR | `duckdb` | Input dialect to normalize before DuckDB parses and plans the query |
 
 ```sql
 SET lpts_dialect = 'postgres';
 PRAGMA lpts('SELECT name FROM users WHERE age > 25');
 ```
 
-PostgreSQL output currently removes DuckDB catalog/schema qualifiers and remaps
-a small set of function names. Full dialect portability is still in progress.
-
-## Limitations
-
-- Source tables must exist when LPTS plans the query.
-- LPTS reconstructs the optimized plan, not the original SQL text.
-- LPTS does not preserve formatting, alias spelling, or original CTE structure.
-- PostgreSQL dialect support is partial.
-- `PRAGMA lpts_check` can fail on nondeterministic queries, such as unordered
-  aggregates or `LIMIT` queries with ties.
+```sql
+SET lpts_input_dialect = 'mysql';
+SELECT sql FROM lpts_normalize_query('SELECT `order` FROM users LIMIT 1, 2');
+```
 
 ## Documentation
 
-- **[Implementation](IMPLEMENTATION.md)** - build instructions, CLion setup, pipeline notes, and development workflow
-- **[Tests](test/README.md)** - SQLLogicTest conventions
-- **[Benchmarks](benchmark/README.md)** - SQLStorm benchmark runner
-
-## TODO
-
-- TODO dialects: complete PostgreSQL rendering for casts, intervals, function
-  names, date/time format strings, identifier quoting, and null ordering.
-- TODO put the PDF report: add `LPTS_Research_Project_Report.pdf` to the repo
-  and link it from this README.
+- **[Building](docs/building.md)** - build, local loading, updating, and CLion setup
+- **[Tests](docs/test.md)** - SQLLogicTest conventions
+- **[Benchmark](docs/benchmark.md)** - SQLStorm benchmark runner
