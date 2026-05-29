@@ -184,3 +184,22 @@ query I
 PRAGMA lpts_check('SELECT id FROM t ORDER BY id; -- trailing SQLStorm comment');
 ----
 true
+
+# --- function metadata: public LPTS functions have descriptions and examples ---
+
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name IN (
+  'lpts',
+  'lpts_query',
+  'lpts_exec',
+  'lpts_check',
+  'print_ast',
+  'print_ast_query',
+  'lpts_normalize_query'
+)
+AND description IS NOT NULL
+AND len(examples) > 0;
+----
+7
