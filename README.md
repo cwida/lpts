@@ -50,16 +50,6 @@ The dialect settings accept these values:
 | Redshift | `redshift` |
 | MySQL / MariaDB | `mysql`, `mariadb` |
 
-Check round-trip correctness with `lpts_check`:
-
-```sql
-PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
-```
-
-```text
-true
-```
-
 ## Pragmas and Functions
 
 | Function | Description |
@@ -79,7 +69,8 @@ true
   materialized CTEs, and subquery decorrelation.
 - Generate a CTE program that communicates the optimized execution shape.
 - Emit SQL for another engine with `lpts_dialect`.
-- Convert other SQL dialect syntax to DuckDB SQL with `lpts_input_dialect`, to then execute it.
+- Convert other SQL dialect syntax to DuckDB SQL with `lpts_input_dialect`,
+  then execute or inspect it.
 
 ## Supported Operators
 
@@ -97,13 +88,25 @@ Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 | `lpts_dialect` | VARCHAR | `duckdb` | Output dialect for generated SQL |
 | `lpts_input_dialect` | VARCHAR | `duckdb` | Input dialect to normalize before DuckDB parses and plans the query |
 
+## Examples
+
 ```sql
-CREATE TABLE events (id INTEGER, ts TIMESTAMP, name VARCHAR);
+CREATE TABLE events (id INTEGER, ts TIMESTAMP, name VARCHAR, "order" INTEGER);
 INSERT INTO events VALUES
-    (1, TIMESTAMP '2024-01-15 08:09:10', 'alpha'),
-    (11, TIMESTAMP '2024-01-16 11:12:13', 'beta');
+    (1, TIMESTAMP '2024-01-15 08:09:10', 'alpha', 10),
+    (11, TIMESTAMP '2024-01-16 11:12:13', 'beta', 20);
 
 SET lpts_dialect = 'postgres';
+
+-- Return generated CTE SQL directly in the shell.
+PRAGMA lpts(
+    'SELECT strftime(ts, ''%Y-%m-%d'') AS day
+     FROM events
+     WHERE id > 10
+     ORDER BY day'
+);
+
+-- Return generated CTE SQL as a table row, useful in scripts and tests.
 SELECT sql
 FROM lpts_query(
     'SELECT strftime(ts, ''%Y-%m-%d'') AS day
@@ -121,12 +124,41 @@ SELECT t1_day AS "day" FROM order_2;
 ```
 
 ```sql
+SET lpts_dialect = 'duckdb';
+
+-- Execute the generated SQL and return the query result.
+PRAGMA lpts_exec('SELECT name FROM events WHERE id > 10 ORDER BY name');
+
+-- Compare original and generated SQL using bag equality.
+PRAGMA lpts_check('SELECT name FROM events WHERE id > 10 ORDER BY name');
+```
+
+```text
+name
+----
+beta
+
+match
+-----
+true
+```
+
+```sql
+-- Print the AST tree to stdout for interactive debugging.
+PRAGMA print_ast('SELECT name FROM events WHERE id > 10 ORDER BY name');
+
+-- Return the AST tree as a table row, useful for tools and regression tests.
+SELECT ast
+FROM print_ast_query('SELECT name FROM events WHERE id > 10 ORDER BY name');
+```
+
+```sql
 SET lpts_input_dialect = 'mysql';
+
+-- Normalize source-dialect SQL to DuckDB SQL before planning or execution.
 SELECT sql
 FROM lpts_normalize_query(
-    'SELECT `order`, DATE_FORMAT(ts, ''%Y-%m-%d %H:%i:%s'') AS formatted
-     FROM events
-     LIMIT 5, 10'
+    'SELECT `order`, DATE_FORMAT(ts, ''%Y-%m-%d %H:%i:%s'') AS formatted FROM events LIMIT 5, 10'
 );
 ```
 
