@@ -1,0 +1,82 @@
+# name: test/sql/normalization.test
+# description: golden input dialect normalization fixtures
+# group: [sql]
+
+require lpts
+
+statement ok
+SET lpts_input_dialect = 'postgres';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT [order] FROM [users]');
+----
+SELECT "order" FROM "users"
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT arr[1] FROM t');
+----
+SELECT arr[1] FROM t
+
+statement error
+SELECT sql FROM lpts_normalize_query('SELECT id AS x FROM users WHERE x > 1');
+----
+LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
+
+statement error
+SELECT sql FROM lpts_normalize_query('SELECT id AS x FROM users GROUP BY x');
+----
+LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
+
+statement ok
+SET lpts_input_dialect = 'bigquery';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT CAST(id AS INT64), CAST(name AS STRING), TRY_CAST(id AS FLOAT64) FROM users');
+----
+SELECT CAST(id AS BIGINT), CAST(name AS VARCHAR), TRY_CAST(id AS DOUBLE) FROM users
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT DATE_DIFF(CAST(''2024-01-16'' AS DATE), CAST(''2024-01-15'' AS DATE), DAY)');
+----
+SELECT date_diff('day', CAST('2024-01-15' AS DATE), CAST('2024-01-16' AS DATE))
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT DATE_TRUNC(CAST(''2024-01-15'' AS DATE), MONTH)');
+----
+SELECT date_trunc('month', CAST('2024-01-15' AS DATE))
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT CURRENT_DATE(), CURRENT_TIMESTAMP()');
+----
+SELECT CAST(now() AS DATE), now()
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT id FROM users QUALIFY row_number() OVER (ORDER BY id) = 1');
+----
+SELECT id FROM users QUALIFY row_number() OVER (ORDER BY id) = 1
+
+statement error
+SELECT sql FROM lpts_normalize_query('SELECT id, row_number() OVER (ORDER BY id) AS rn FROM users QUALIFY rn = 1');
+----
+LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
+
+statement ok
+SET lpts_input_dialect = 'mysql';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT DATE_ADD(CAST(''2024-01-15'' AS DATE), INTERVAL 1 DAY)');
+----
+SELECT (CAST('2024-01-15' AS DATE) + INTERVAL '1' day)
+
+statement error
+SELECT sql FROM lpts_normalize_query('SELECT INTERVAL 1 DAY 2 HOUR');
+----
+LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
+
+statement ok
+SET lpts_input_dialect = 'spark';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT date_add(CAST(''2024-01-15'' AS DATE), 2), datediff(CAST(''2024-01-16'' AS DATE), CAST(''2024-01-15'' AS DATE))');
+----
+SELECT (CAST('2024-01-15' AS DATE) + (2) * INTERVAL '1' DAY), date_diff('day', CAST('2024-01-15' AS DATE), CAST('2024-01-16' AS DATE))

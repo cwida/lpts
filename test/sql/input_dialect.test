@@ -246,6 +246,14 @@ PRAGMA lpts_exec('SELECT typeof(PARSE_DATE(''%Y-%m-%d'', ''2024-01-15''))');
 DATE
 
 statement ok
+SET lpts_input_dialect = 'spark';
+
+query I
+PRAGMA lpts_check('SELECT date_add(CAST(''2024-01-15'' AS DATE), 2), datediff(CAST(''2024-01-16'' AS DATE), CAST(''2024-01-15'' AS DATE))');
+----
+true
+
+statement ok
 SET lpts_input_dialect = 'not_a_dialect';
 
 statement error

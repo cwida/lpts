@@ -1,7 +1,9 @@
 #include "lpts_parser.hpp"
 #include "lpts_helpers.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <cstring>
 
 namespace duckdb {
 
@@ -58,6 +60,10 @@ static idx_t SkipWhitespace(const string &sql, idx_t pos) {
 static string TrimCopy(string value) {
 	StringUtil::Trim(value);
 	return value;
+}
+
+static string LowerCopy(const string &value) {
+	return SQLToLowercase(value);
 }
 
 static string SingleQuotedSqlString(const string &value) {
@@ -156,6 +162,63 @@ static bool TryAppendSkippableSqlSpan(const string &sql, idx_t &pos, string &res
 static void ThrowUnsupportedInputDialectFeature(SqlDialect dialect, const string &feature_name, const string &reason) {
 	throw NotImplementedException("LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE: dialect=%s feature=%s reason=%s",
 	                              SqlDialectToString(dialect), feature_name, reason);
+}
+
+static string QuoteDuckDBIdentifier(const string &identifier) {
+	string result = "\"";
+	for (char c : identifier) {
+		if (c == '"') {
+			result += "\"\"";
+		} else {
+			result += c;
+		}
+	}
+	result += "\"";
+	return result;
+}
+
+static bool IsSafeIdentifierContent(const string &identifier) {
+	if (identifier.empty() || !IsIdentStart(identifier[0])) {
+		return false;
+	}
+	for (idx_t i = 1; i < identifier.size(); i++) {
+		if (!IsIdentPart(identifier[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static idx_t PreviousNonWhitespace(const string &sql, idx_t pos) {
+	while (pos > 0) {
+		pos--;
+		if (!std::isspace(static_cast<unsigned char>(sql[pos]))) {
+			return pos;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static bool CanStartBracketIdentifier(const string &sql, idx_t pos) {
+	idx_t prev = PreviousNonWhitespace(sql, pos);
+	if (prev == DConstants::INVALID_INDEX) {
+		return true;
+	}
+	char c = sql[prev];
+	if (IsIdentPart(c)) {
+		idx_t start = prev;
+		while (start > 0 && IsIdentPart(sql[start - 1])) {
+			start--;
+		}
+		string token = LowerCopy(sql.substr(start, prev - start + 1));
+		return token == "select" || token == "from" || token == "where" || token == "by" || token == "group" ||
+		       token == "order" || token == "having" || token == "qualify" || token == "on" || token == "join" ||
+		       token == "as" || token == "and" || token == "or";
+	}
+	if (c == ')' || c == ']' || c == '"' || c == '\'' || c == '`') {
+		return false;
+	}
+	return true;
 }
 
 enum class InputDateFormatStyle : uint8_t { MYSQL_PERCENT, BIGQUERY_PERCENT, JAVA, POSTGRES, SNOWFLAKE };
@@ -380,6 +443,43 @@ static string NormalizeBacktickIdentifiers(const string &sql, SqlDialect dialect
 	return result;
 }
 
+static string NormalizeBracketIdentifiers(const string &sql, SqlDialect dialect) {
+	if (dialect == SqlDialect::DUCKDB) {
+		return sql;
+	}
+
+	string result;
+	for (idx_t i = 0; i < sql.size(); i++) {
+		char c = sql[i];
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
+			continue;
+		}
+		if (c != '[' || !CanStartBracketIdentifier(sql, i)) {
+			result += c;
+			continue;
+		}
+
+		idx_t close_pos = i + 1;
+		while (close_pos < sql.size() && sql[close_pos] != ']') {
+			close_pos++;
+		}
+		if (close_pos >= sql.size()) {
+			result += c;
+			continue;
+		}
+
+		string identifier = sql.substr(i + 1, close_pos - i - 1);
+		if (!IsSafeIdentifierContent(identifier)) {
+			result += sql.substr(i, close_pos - i + 1);
+			i = close_pos;
+			continue;
+		}
+		result += QuoteDuckDBIdentifier(identifier);
+		i = close_pos;
+	}
+	return result;
+}
+
 static idx_t FindMatchingParen(const string &sql, idx_t open_pos) {
 	idx_t depth = 0;
 	for (idx_t i = open_pos; i < sql.size(); i++) {
@@ -417,6 +517,9 @@ static idx_t FindMatchingParen(const string &sql, idx_t open_pos) {
 }
 
 static vector<string> SplitTopLevelArgs(const string &args) {
+	if (TrimCopy(args).empty()) {
+		return {};
+	}
 	vector<string> result;
 	idx_t depth = 0;
 	idx_t start = 0;
@@ -445,11 +548,159 @@ static vector<string> SplitTopLevelArgs(const string &args) {
 	return result;
 }
 
-static string RewriteFunctionCalls(const string &sql, SqlDialect dialect, const string &source_name,
-                                   const string &target_name, bool convert_format_arg,
-                                   InputDateFormatStyle format_style = InputDateFormatStyle::MYSQL_PERCENT,
-                                   idx_t format_arg_index = 1, bool swap_two_args = false,
-                                   bool cast_result_to_date = false) {
+enum class InputFunctionRewriteKind : uint8_t {
+	RENAME,
+	DATE_ADD_DAYS,
+	DATE_SUB_DAYS,
+	DATE_ADD_INTERVAL,
+	DATE_SUB_INTERVAL,
+	DATE_DIFF_DAYS,
+	DATE_DIFF_UNIT_LAST,
+	DATE_TRUNC_UNIT_SECOND,
+	CURRENT_DATE,
+	CURRENT_TIMESTAMP
+};
+
+struct InputFunctionRewrite {
+	const char *source_name;
+	const char *target_name;
+	InputFunctionRewriteKind kind;
+	bool convert_format_arg;
+	InputDateFormatStyle format_style;
+	idx_t format_arg_index;
+	bool swap_two_args;
+	bool cast_result_to_date;
+	uint32_t dialect_mask;
+};
+
+static constexpr uint32_t DialectBit(SqlDialect dialect) {
+	return 1U << static_cast<uint8_t>(dialect);
+}
+
+static constexpr uint32_t ALL_INPUT_DIALECTS = DialectBit(SqlDialect::POSTGRES) | DialectBit(SqlDialect::SPARK) |
+                                               DialectBit(SqlDialect::HIVE) | DialectBit(SqlDialect::TRINO_PRESTO) |
+                                               DialectBit(SqlDialect::SNOWFLAKE) | DialectBit(SqlDialect::BIGQUERY) |
+                                               DialectBit(SqlDialect::REDSHIFT) | DialectBit(SqlDialect::MYSQL_MARIADB);
+
+static bool AppliesToDialect(const InputFunctionRewrite &rewrite, SqlDialect dialect) {
+	return (rewrite.dialect_mask & DialectBit(dialect)) != 0;
+}
+
+static string NormalizeDatePartArg(const string &arg, SqlDialect dialect, const string &function_name) {
+	string trimmed = TrimCopy(arg);
+	idx_t end;
+	string literal;
+	if (TryReadSingleQuotedLiteral(trimmed, 0, end, literal) && SkipWhitespace(trimmed, end) == trimmed.size()) {
+		return SingleQuotedSqlString(LowerCopy(literal));
+	}
+	for (char c : trimmed) {
+		if (!std::isalpha(static_cast<unsigned char>(c)) && c != '_') {
+			ThrowUnsupportedInputDialectFeature(dialect, function_name,
+			                                    "date part must be an identifier or string literal");
+		}
+	}
+	return SingleQuotedSqlString(LowerCopy(trimmed));
+}
+
+static string BuildRewrittenFunctionCall(const InputFunctionRewrite &rewrite, SqlDialect dialect, vector<string> args) {
+	const string source_name = rewrite.source_name;
+	if (rewrite.convert_format_arg) {
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name,
+			                                    "date format function rewrite expects exactly two arguments");
+		}
+		if (rewrite.format_arg_index >= args.size()) {
+			throw InternalException("date format argument index out of range");
+		}
+		idx_t literal_end;
+		string format;
+		if (!TryReadSingleQuotedLiteral(args[rewrite.format_arg_index], 0, literal_end, format) ||
+		    SkipWhitespace(args[rewrite.format_arg_index], literal_end) != args[rewrite.format_arg_index].size()) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date format argument must be a string literal");
+		}
+		args[rewrite.format_arg_index] =
+		    SingleQuotedSqlString(ConvertInputDateFormatToDuckDB(format, dialect, rewrite.format_style));
+	}
+
+	string rewritten_call;
+	switch (rewrite.kind) {
+	case InputFunctionRewriteKind::RENAME:
+		if (rewrite.swap_two_args) {
+			if (args.size() != 2) {
+				ThrowUnsupportedInputDialectFeature(dialect, source_name,
+				                                    "argument reordering expects exactly two arguments");
+			}
+			rewritten_call = string(rewrite.target_name) + "(" + args[1] + ", " + args[0] + ")";
+		} else {
+			rewritten_call = string(rewrite.target_name) + "(" + VecToSeparatedList(args, ", ") + ")";
+		}
+		break;
+	case InputFunctionRewriteKind::DATE_ADD_DAYS:
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date_add expects exactly two arguments");
+		}
+		rewritten_call = "(" + args[0] + " + (" + args[1] + ") * INTERVAL '1' DAY)";
+		break;
+	case InputFunctionRewriteKind::DATE_SUB_DAYS:
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date_sub expects exactly two arguments");
+		}
+		rewritten_call = "(" + args[0] + " - (" + args[1] + ") * INTERVAL '1' DAY)";
+		break;
+	case InputFunctionRewriteKind::DATE_ADD_INTERVAL:
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date_add expects exactly two arguments");
+		}
+		rewritten_call = "(" + args[0] + " + " + args[1] + ")";
+		break;
+	case InputFunctionRewriteKind::DATE_SUB_INTERVAL:
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date_sub expects exactly two arguments");
+		}
+		rewritten_call = "(" + args[0] + " - " + args[1] + ")";
+		break;
+	case InputFunctionRewriteKind::DATE_DIFF_DAYS:
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "datediff expects exactly two arguments");
+		}
+		rewritten_call = "date_diff('day', " + args[1] + ", " + args[0] + ")";
+		break;
+	case InputFunctionRewriteKind::DATE_DIFF_UNIT_LAST:
+		if (args.size() != 3) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date_diff expects exactly three arguments");
+		}
+		rewritten_call =
+		    "date_diff(" + NormalizeDatePartArg(args[2], dialect, source_name) + ", " + args[1] + ", " + args[0] + ")";
+		break;
+	case InputFunctionRewriteKind::DATE_TRUNC_UNIT_SECOND:
+		if (args.size() != 2) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "date_trunc expects exactly two arguments");
+		}
+		rewritten_call = "date_trunc(" + NormalizeDatePartArg(args[1], dialect, source_name) + ", " + args[0] + ")";
+		break;
+	case InputFunctionRewriteKind::CURRENT_DATE:
+		if (!args.empty()) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "current_date expects no arguments");
+		}
+		rewritten_call = "CAST(now() AS DATE)";
+		break;
+	case InputFunctionRewriteKind::CURRENT_TIMESTAMP:
+		if (!args.empty()) {
+			ThrowUnsupportedInputDialectFeature(dialect, source_name, "current_timestamp expects no arguments");
+		}
+		rewritten_call = "now()";
+		break;
+	default:
+		throw InternalException("unknown input function rewrite kind");
+	}
+
+	if (rewrite.cast_result_to_date) {
+		rewritten_call = "CAST(" + rewritten_call + " AS DATE)";
+	}
+	return rewritten_call;
+}
+
+static string RewriteFunctionCalls(const string &sql, SqlDialect dialect, const InputFunctionRewrite &rewrite) {
 	string result;
 	for (idx_t i = 0; i < sql.size(); i++) {
 		char c = sql[i];
@@ -468,7 +719,7 @@ static string RewriteFunctionCalls(const string &sql, SqlDialect dialect, const 
 		}
 		string ident = sql.substr(ident_start, ident_end - ident_start);
 		idx_t open_pos = SkipWhitespace(sql, ident_end);
-		if (!EqualsLowercase(ident, source_name) || open_pos >= sql.size() || sql[open_pos] != '(') {
+		if (!EqualsLowercase(ident, rewrite.source_name) || open_pos >= sql.size() || sql[open_pos] != '(') {
 			result += ident;
 			i = ident_end - 1;
 			continue;
@@ -476,42 +727,81 @@ static string RewriteFunctionCalls(const string &sql, SqlDialect dialect, const 
 
 		idx_t close_pos = FindMatchingParen(sql, open_pos);
 		if (close_pos == DConstants::INVALID_INDEX) {
-			ThrowUnsupportedInputDialectFeature(dialect, source_name, "could not find matching ')'");
+			ThrowUnsupportedInputDialectFeature(dialect, rewrite.source_name, "could not find matching ')'");
 		}
 		auto args = SplitTopLevelArgs(sql.substr(open_pos + 1, close_pos - open_pos - 1));
-		if (convert_format_arg) {
-			if (args.size() != 2) {
-				ThrowUnsupportedInputDialectFeature(dialect, source_name,
-				                                    "date format function rewrite expects exactly two arguments");
-			}
-			if (format_arg_index >= args.size()) {
-				throw InternalException("date format argument index out of range");
-			}
-			idx_t literal_end;
-			string format;
-			if (!TryReadSingleQuotedLiteral(args[format_arg_index], 0, literal_end, format) ||
-			    SkipWhitespace(args[format_arg_index], literal_end) != args[format_arg_index].size()) {
-				ThrowUnsupportedInputDialectFeature(dialect, source_name,
-				                                    "date format argument must be a string literal");
-			}
-			args[format_arg_index] =
-			    SingleQuotedSqlString(ConvertInputDateFormatToDuckDB(format, dialect, format_style));
-		}
-		string rewritten_call;
-		if (swap_two_args) {
-			if (args.size() != 2) {
-				ThrowUnsupportedInputDialectFeature(dialect, source_name,
-				                                    "argument reordering expects exactly two arguments");
-			}
-			rewritten_call = target_name + "(" + args[1] + ", " + args[0] + ")";
-		} else {
-			rewritten_call = target_name + "(" + VecToSeparatedList(args, ", ") + ")";
-		}
-		if (cast_result_to_date) {
-			rewritten_call = "CAST(" + rewritten_call + " AS DATE)";
-		}
-		result += rewritten_call;
+		result += BuildRewrittenFunctionCall(rewrite, dialect, std::move(args));
 		i = close_pos;
+	}
+	return result;
+}
+
+static string RewriteFunctionCalls(const string &sql, SqlDialect dialect) {
+	static const vector<InputFunctionRewrite> rewrites = {
+	    {"ifnull", "coalesce", InputFunctionRewriteKind::RENAME, false, InputDateFormatStyle::MYSQL_PERCENT, 1, false,
+	     false, ALL_INPUT_DIALECTS},
+	    {"nvl", "coalesce", InputFunctionRewriteKind::RENAME, false, InputDateFormatStyle::MYSQL_PERCENT, 1, false,
+	     false, ALL_INPUT_DIALECTS},
+	    {"date_format", "strftime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false, DialectBit(SqlDialect::MYSQL_MARIADB) | DialectBit(SqlDialect::TRINO_PRESTO)},
+	    {"str_to_date", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false, DialectBit(SqlDialect::MYSQL_MARIADB)},
+	    {"date_parse", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false, DialectBit(SqlDialect::TRINO_PRESTO)},
+	    {"date_format", "strftime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::JAVA, 1, false, false,
+	     DialectBit(SqlDialect::SPARK) | DialectBit(SqlDialect::HIVE)},
+	    {"to_timestamp", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::JAVA, 1, false,
+	     false, DialectBit(SqlDialect::SPARK) | DialectBit(SqlDialect::HIVE)},
+	    {"to_date", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::JAVA, 1, false, true,
+	     DialectBit(SqlDialect::SPARK) | DialectBit(SqlDialect::HIVE)},
+	    {"to_char", "strftime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::POSTGRES, 1, false, false,
+	     DialectBit(SqlDialect::POSTGRES) | DialectBit(SqlDialect::REDSHIFT)},
+	    {"to_timestamp", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::POSTGRES, 1, false,
+	     false, DialectBit(SqlDialect::POSTGRES) | DialectBit(SqlDialect::REDSHIFT)},
+	    {"to_date", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::POSTGRES, 1, false, true,
+	     DialectBit(SqlDialect::POSTGRES) | DialectBit(SqlDialect::REDSHIFT)},
+	    {"to_char", "strftime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::SNOWFLAKE, 1, false,
+	     false, DialectBit(SqlDialect::SNOWFLAKE)},
+	    {"to_timestamp", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::SNOWFLAKE, 1, false,
+	     false, DialectBit(SqlDialect::SNOWFLAKE)},
+	    {"to_date", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::SNOWFLAKE, 1, false, true,
+	     DialectBit(SqlDialect::SNOWFLAKE)},
+	    {"format_timestamp", "strftime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::BIGQUERY_PERCENT,
+	     0, true, false, DialectBit(SqlDialect::BIGQUERY)},
+	    {"format_date", "strftime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::BIGQUERY_PERCENT, 0,
+	     true, false, DialectBit(SqlDialect::BIGQUERY)},
+	    {"parse_timestamp", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::BIGQUERY_PERCENT,
+	     0, true, false, DialectBit(SqlDialect::BIGQUERY)},
+	    {"parse_date", "strptime", InputFunctionRewriteKind::RENAME, true, InputDateFormatStyle::BIGQUERY_PERCENT, 0,
+	     true, true, DialectBit(SqlDialect::BIGQUERY)},
+	    {"date_add", nullptr, InputFunctionRewriteKind::DATE_ADD_DAYS, false, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false, DialectBit(SqlDialect::SPARK) | DialectBit(SqlDialect::HIVE)},
+	    {"date_sub", nullptr, InputFunctionRewriteKind::DATE_SUB_DAYS, false, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false, DialectBit(SqlDialect::SPARK) | DialectBit(SqlDialect::HIVE)},
+	    {"date_add", nullptr, InputFunctionRewriteKind::DATE_ADD_INTERVAL, false, InputDateFormatStyle::MYSQL_PERCENT,
+	     1, false, false, DialectBit(SqlDialect::MYSQL_MARIADB) | DialectBit(SqlDialect::BIGQUERY)},
+	    {"date_sub", nullptr, InputFunctionRewriteKind::DATE_SUB_INTERVAL, false, InputDateFormatStyle::MYSQL_PERCENT,
+	     1, false, false, DialectBit(SqlDialect::MYSQL_MARIADB) | DialectBit(SqlDialect::BIGQUERY)},
+	    {"datediff", nullptr, InputFunctionRewriteKind::DATE_DIFF_DAYS, false, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false,
+	     DialectBit(SqlDialect::SPARK) | DialectBit(SqlDialect::HIVE) | DialectBit(SqlDialect::MYSQL_MARIADB)},
+	    {"date_diff", nullptr, InputFunctionRewriteKind::DATE_DIFF_UNIT_LAST, false,
+	     InputDateFormatStyle::MYSQL_PERCENT, 1, false, false, DialectBit(SqlDialect::BIGQUERY)},
+	    {"timestamp_diff", nullptr, InputFunctionRewriteKind::DATE_DIFF_UNIT_LAST, false,
+	     InputDateFormatStyle::MYSQL_PERCENT, 1, false, false, DialectBit(SqlDialect::BIGQUERY)},
+	    {"date_trunc", nullptr, InputFunctionRewriteKind::DATE_TRUNC_UNIT_SECOND, false,
+	     InputDateFormatStyle::MYSQL_PERCENT, 1, false, false, DialectBit(SqlDialect::BIGQUERY)},
+	    {"current_date", nullptr, InputFunctionRewriteKind::CURRENT_DATE, false, InputDateFormatStyle::MYSQL_PERCENT, 1,
+	     false, false, ALL_INPUT_DIALECTS},
+	    {"current_timestamp", nullptr, InputFunctionRewriteKind::CURRENT_TIMESTAMP, false,
+	     InputDateFormatStyle::MYSQL_PERCENT, 1, false, false, ALL_INPUT_DIALECTS},
+	};
+
+	string result = sql;
+	for (const auto &rewrite : rewrites) {
+		if (AppliesToDialect(rewrite, dialect)) {
+			result = RewriteFunctionCalls(result, dialect, rewrite);
+		}
 	}
 	return result;
 }
@@ -555,57 +845,328 @@ static string RewriteMysqlLimitComma(const string &sql, SqlDialect dialect) {
 	return result;
 }
 
+static bool TryReadNumericToken(const string &sql, idx_t pos, idx_t &end, string &token) {
+	idx_t start = pos;
+	end = pos;
+	while (end < sql.size() && (std::isdigit(static_cast<unsigned char>(sql[end])) || sql[end] == '.')) {
+		end++;
+	}
+	if (end == start) {
+		return false;
+	}
+	token = sql.substr(start, end - start);
+	return true;
+}
+
+static bool TryReadIdentifierToken(const string &sql, idx_t pos, idx_t &end, string &token) {
+	if (pos >= sql.size() || !IsIdentStart(sql[pos])) {
+		return false;
+	}
+	end = pos + 1;
+	while (end < sql.size() && IsIdentPart(sql[end])) {
+		end++;
+	}
+	token = sql.substr(pos, end - pos);
+	return true;
+}
+
+static bool IsIntervalUnit(const string &unit) {
+	string normalized = LowerCopy(unit);
+	return normalized == "year" || normalized == "years" || normalized == "month" || normalized == "months" ||
+	       normalized == "day" || normalized == "days" || normalized == "hour" || normalized == "hours" ||
+	       normalized == "minute" || normalized == "minutes" || normalized == "second" || normalized == "seconds";
+}
+
+static string SingularIntervalUnit(const string &unit) {
+	string normalized = LowerCopy(unit);
+	if (!normalized.empty() && normalized.back() == 's') {
+		normalized.pop_back();
+	}
+	return normalized;
+}
+
+static string RewriteIntervals(const string &sql, SqlDialect dialect) {
+	string result;
+	for (idx_t i = 0; i < sql.size(); i++) {
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
+			continue;
+		}
+		if (!MatchesKeywordAt(sql, i, "interval")) {
+			result += sql[i];
+			continue;
+		}
+
+		idx_t value_start = SkipWhitespace(sql, i + 8);
+		idx_t value_end = value_start;
+		string value;
+		string literal;
+		if (TryReadSingleQuotedLiteral(sql, value_start, value_end, literal)) {
+			value = literal;
+		} else if (!TryReadNumericToken(sql, value_start, value_end, value)) {
+			result += sql.substr(i, 8);
+			i += 7;
+			continue;
+		}
+
+		idx_t unit_start = SkipWhitespace(sql, value_end);
+		idx_t unit_end = unit_start;
+		string unit;
+		if (!TryReadIdentifierToken(sql, unit_start, unit_end, unit)) {
+			result += sql.substr(i, value_end - i);
+			i = value_end - 1;
+			continue;
+		}
+		if (!IsIntervalUnit(unit)) {
+			ThrowUnsupportedInputDialectFeature(dialect, "interval", "unsupported interval unit '" + unit + "'");
+		}
+
+		idx_t next = SkipWhitespace(sql, unit_end);
+		if (next < sql.size() && (IsIdentStart(sql[next]) || std::isdigit(static_cast<unsigned char>(sql[next])))) {
+			ThrowUnsupportedInputDialectFeature(dialect, "interval", "compound intervals are not supported");
+		}
+		result += "INTERVAL " + SingleQuotedSqlString(value) + " " + SingularIntervalUnit(unit);
+		i = unit_end - 1;
+	}
+	return result;
+}
+
+static idx_t FindTopLevelAs(const string &sql) {
+	idx_t depth = 0;
+	for (idx_t i = 0; i < sql.size(); i++) {
+		idx_t end;
+		if (TryReadSkippableSqlSpan(sql, i, end)) {
+			i = end - 1;
+			continue;
+		}
+		char c = sql[i];
+		if (c == '(') {
+			depth++;
+		} else if (c == ')') {
+			if (depth > 0) {
+				depth--;
+			}
+		} else if (depth == 0 && MatchesKeywordAt(sql, i, "as")) {
+			return i;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static string NormalizeCastType(const string &type_name, SqlDialect dialect) {
+	string trimmed = TrimCopy(type_name);
+	string normalized = LowerCopy(trimmed);
+	if (normalized == "string" || normalized == "nvarchar" || normalized == "nchar") {
+		return "VARCHAR";
+	}
+	if (normalized == "int64") {
+		return "BIGINT";
+	}
+	if (normalized == "float64") {
+		return "DOUBLE";
+	}
+	if (normalized == "bool") {
+		return "BOOLEAN";
+	}
+	if (normalized == "datetime") {
+		return "TIMESTAMP";
+	}
+	if (normalized == "numeric") {
+		return "DECIMAL";
+	}
+	if (StringUtil::StartsWith(normalized, "number(")) {
+		return "DECIMAL" + trimmed.substr(6);
+	}
+	if (StringUtil::StartsWith(normalized, "datetime64") || StringUtil::Contains(normalized, " unsigned")) {
+		ThrowUnsupportedInputDialectFeature(dialect, "cast_type", "unsupported input type '" + trimmed + "'");
+	}
+	return trimmed;
+}
+
+static string RewriteCastTypes(const string &sql, SqlDialect dialect) {
+	string result;
+	for (idx_t i = 0; i < sql.size(); i++) {
+		char c = sql[i];
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
+			continue;
+		}
+		if (!IsIdentStart(c)) {
+			result += c;
+			continue;
+		}
+		idx_t ident_end = i + 1;
+		while (ident_end < sql.size() && IsIdentPart(sql[ident_end])) {
+			ident_end++;
+		}
+		string ident = sql.substr(i, ident_end - i);
+		bool is_cast = EqualsLowercase(ident, "cast");
+		bool is_try_cast = EqualsLowercase(ident, "try_cast");
+		idx_t open_pos = SkipWhitespace(sql, ident_end);
+		if ((!is_cast && !is_try_cast) || open_pos >= sql.size() || sql[open_pos] != '(') {
+			result += ident;
+			i = ident_end - 1;
+			continue;
+		}
+		idx_t close_pos = FindMatchingParen(sql, open_pos);
+		if (close_pos == DConstants::INVALID_INDEX) {
+			ThrowUnsupportedInputDialectFeature(dialect, ident, "could not find matching ')'");
+		}
+		string body = sql.substr(open_pos + 1, close_pos - open_pos - 1);
+		idx_t as_pos = FindTopLevelAs(body);
+		if (as_pos == DConstants::INVALID_INDEX) {
+			result += sql.substr(i, close_pos - i + 1);
+			i = close_pos;
+			continue;
+		}
+		string expression = TrimCopy(body.substr(0, as_pos));
+		string type_name = TrimCopy(body.substr(as_pos + 2));
+		result += ident + "(" + expression + " AS " + NormalizeCastType(type_name, dialect) + ")";
+		i = close_pos;
+	}
+	return result;
+}
+
+static idx_t FindTopLevelKeyword(const string &sql, const string &keyword, idx_t start = 0) {
+	idx_t depth = 0;
+	for (idx_t i = start; i < sql.size(); i++) {
+		idx_t end;
+		if (TryReadSkippableSqlSpan(sql, i, end)) {
+			i = end - 1;
+			continue;
+		}
+		char c = sql[i];
+		if (c == '(') {
+			depth++;
+		} else if (c == ')') {
+			if (depth > 0) {
+				depth--;
+			}
+		} else if (depth == 0 && MatchesKeywordAt(sql, i, keyword)) {
+			return i;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static idx_t FindTopLevelGroupBy(const string &sql, idx_t start = 0) {
+	idx_t group_pos = FindTopLevelKeyword(sql, "group", start);
+	if (group_pos == DConstants::INVALID_INDEX) {
+		return DConstants::INVALID_INDEX;
+	}
+	idx_t by_pos = SkipWhitespace(sql, group_pos + 5);
+	if (MatchesKeywordAt(sql, by_pos, "by")) {
+		return group_pos;
+	}
+	return DConstants::INVALID_INDEX;
+}
+
+static idx_t NextClauseStart(const string &sql, idx_t start) {
+	vector<idx_t> candidates;
+	for (auto keyword : {"where", "group", "having", "qualify", "order", "limit", "union", "except", "intersect"}) {
+		idx_t pos = FindTopLevelKeyword(sql, keyword, start);
+		if (pos != DConstants::INVALID_INDEX) {
+			candidates.push_back(pos);
+		}
+	}
+	if (candidates.empty()) {
+		return sql.size();
+	}
+	return *std::min_element(candidates.begin(), candidates.end());
+}
+
+static bool ContainsIdentifierReference(const string &sql, const string &identifier) {
+	for (idx_t i = 0; i < sql.size(); i++) {
+		idx_t end;
+		if (TryReadSkippableSqlSpan(sql, i, end)) {
+			i = end - 1;
+			continue;
+		}
+		if (!IsIdentStart(sql[i])) {
+			continue;
+		}
+		idx_t ident_end = i + 1;
+		while (ident_end < sql.size() && IsIdentPart(sql[ident_end])) {
+			ident_end++;
+		}
+		if (EqualsLowercase(sql.substr(i, ident_end - i), LowerCopy(identifier))) {
+			return true;
+		}
+		i = ident_end - 1;
+	}
+	return false;
+}
+
+static bool TryExtractSelectAlias(const string &select_item, string &alias) {
+	idx_t as_pos = FindTopLevelAs(select_item);
+	if (as_pos == DConstants::INVALID_INDEX) {
+		return false;
+	}
+	string candidate = TrimCopy(select_item.substr(as_pos + 2));
+	if (!IsSafeIdentifierContent(candidate)) {
+		return false;
+	}
+	alias = candidate;
+	return true;
+}
+
+static void RejectRiskyAliasReferences(const string &sql, SqlDialect dialect) {
+	if (!MatchesKeywordAt(sql, SkipWhitespace(sql, 0), "select")) {
+		return;
+	}
+	idx_t from_pos = FindTopLevelKeyword(sql, "from");
+	if (from_pos == DConstants::INVALID_INDEX) {
+		return;
+	}
+	vector<string> aliases;
+	for (auto &item :
+	     SplitTopLevelArgs(sql.substr(SkipWhitespace(sql, 0) + 6, from_pos - (SkipWhitespace(sql, 0) + 6)))) {
+		string alias;
+		if (TryExtractSelectAlias(item, alias)) {
+			aliases.push_back(alias);
+		}
+	}
+	if (aliases.empty()) {
+		return;
+	}
+	for (auto clause : {"where", "having", "qualify"}) {
+		idx_t clause_pos = FindTopLevelKeyword(sql, clause, from_pos);
+		if (clause_pos == DConstants::INVALID_INDEX) {
+			continue;
+		}
+		idx_t clause_start = SkipWhitespace(sql, clause_pos + strlen(clause));
+		string clause_body = sql.substr(clause_start, NextClauseStart(sql, clause_start) - clause_start);
+		for (const auto &alias : aliases) {
+			if (ContainsIdentifierReference(clause_body, alias)) {
+				ThrowUnsupportedInputDialectFeature(dialect, "alias_semantics",
+				                                    "select alias '" + alias + "' referenced from " + clause);
+			}
+		}
+	}
+	idx_t group_pos = FindTopLevelGroupBy(sql, from_pos);
+	if (group_pos != DConstants::INVALID_INDEX) {
+		idx_t clause_start = SkipWhitespace(sql, SkipWhitespace(sql, group_pos + 5) + 2);
+		string clause_body = sql.substr(clause_start, NextClauseStart(sql, clause_start) - clause_start);
+		for (const auto &alias : aliases) {
+			if (ContainsIdentifierReference(clause_body, alias)) {
+				ThrowUnsupportedInputDialectFeature(dialect, "alias_semantics",
+				                                    "select alias '" + alias + "' referenced from group by");
+			}
+		}
+	}
+}
+
 string NormalizeInputSqlToDuckDB(const string &query, SqlDialect dialect) {
 	if (dialect == SqlDialect::DUCKDB) {
 		return query;
 	}
 
 	string result = NormalizeBacktickIdentifiers(query, dialect);
-	result = RewriteFunctionCalls(result, dialect, "ifnull", "coalesce", false);
-	result = RewriteFunctionCalls(result, dialect, "nvl", "coalesce", false);
+	result = NormalizeBracketIdentifiers(result, dialect);
+	result = RewriteIntervals(result, dialect);
+	result = RewriteCastTypes(result, dialect);
+	RejectRiskyAliasReferences(result, dialect);
+	result = RewriteFunctionCalls(result, dialect);
 	if (dialect == SqlDialect::MYSQL_MARIADB) {
-		result = RewriteFunctionCalls(result, dialect, "date_format", "strftime", true);
-		result = RewriteFunctionCalls(result, dialect, "str_to_date", "strptime", true);
 		result = RewriteMysqlLimitComma(result, dialect);
-		return result;
-	}
-	if (dialect == SqlDialect::TRINO_PRESTO) {
-		result = RewriteFunctionCalls(result, dialect, "date_format", "strftime", true);
-		result = RewriteFunctionCalls(result, dialect, "date_parse", "strptime", true);
-		return result;
-	}
-	if (dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE) {
-		result = RewriteFunctionCalls(result, dialect, "date_format", "strftime", true, InputDateFormatStyle::JAVA);
-		result = RewriteFunctionCalls(result, dialect, "to_timestamp", "strptime", true, InputDateFormatStyle::JAVA);
-		result = RewriteFunctionCalls(result, dialect, "to_date", "strptime", true, InputDateFormatStyle::JAVA, 1,
-		                              false, true);
-		return result;
-	}
-	if (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::REDSHIFT) {
-		result = RewriteFunctionCalls(result, dialect, "to_char", "strftime", true, InputDateFormatStyle::POSTGRES);
-		result =
-		    RewriteFunctionCalls(result, dialect, "to_timestamp", "strptime", true, InputDateFormatStyle::POSTGRES);
-		result = RewriteFunctionCalls(result, dialect, "to_date", "strptime", true, InputDateFormatStyle::POSTGRES, 1,
-		                              false, true);
-		return result;
-	}
-	if (dialect == SqlDialect::SNOWFLAKE) {
-		result = RewriteFunctionCalls(result, dialect, "to_char", "strftime", true, InputDateFormatStyle::SNOWFLAKE);
-		result =
-		    RewriteFunctionCalls(result, dialect, "to_timestamp", "strptime", true, InputDateFormatStyle::SNOWFLAKE);
-		result = RewriteFunctionCalls(result, dialect, "to_date", "strptime", true, InputDateFormatStyle::SNOWFLAKE, 1,
-		                              false, true);
-		return result;
-	}
-	if (dialect == SqlDialect::BIGQUERY) {
-		result = RewriteFunctionCalls(result, dialect, "format_timestamp", "strftime", true,
-		                              InputDateFormatStyle::BIGQUERY_PERCENT, 0, true);
-		result = RewriteFunctionCalls(result, dialect, "format_date", "strftime", true,
-		                              InputDateFormatStyle::BIGQUERY_PERCENT, 0, true);
-		result = RewriteFunctionCalls(result, dialect, "parse_timestamp", "strptime", true,
-		                              InputDateFormatStyle::BIGQUERY_PERCENT, 0, true);
-		result = RewriteFunctionCalls(result, dialect, "parse_date", "strptime", true,
-		                              InputDateFormatStyle::BIGQUERY_PERCENT, 0, true, true);
 		return result;
 	}
 	return result;

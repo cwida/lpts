@@ -168,6 +168,20 @@ static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunct
 	return std::move(result);
 }
 
+static unique_ptr<FunctionData> LptsNormalizeTableBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	auto query = StringValue::Get(input.inputs[0]);
+	SqlDialect input_dialect = ReadInputDialect(context);
+
+	auto result = make_uniq<LptsBindData>();
+	result->result_sql = NormalizeInputSqlToDuckDB(query, input_dialect);
+
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sql");
+
+	return std::move(result);
+}
+
 static unique_ptr<GlobalTableFunctionState> LptsTableInit(ClientContext &context, TableFunctionInitInput &input) {
 	return make_uniq<LptsGlobalState>();
 }
@@ -309,6 +323,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register table function lpts_query('query') for SELECT * FROM lpts_query(...)
 	TableFunction table_func("lpts_query", {LogicalType::VARCHAR}, LptsTableFunc, LptsTableBind, LptsTableInit);
 	loader.RegisterFunction(table_func);
+
+	// Register table function lpts_normalize_query('query') for input dialect golden tests/debugging
+	TableFunction normalize_table_func("lpts_normalize_query", {LogicalType::VARCHAR}, LptsTableFunc,
+	                                   LptsNormalizeTableBind, LptsTableInit);
+	loader.RegisterFunction(normalize_table_func);
 
 	// Register PRAGMA lpts_exec('query') — round-trip: plan → SQL → execute
 	auto lpts_exec_pragma = PragmaFunction::PragmaCall("lpts_exec", LptsExecPragmaFunction, {LogicalType::VARCHAR});
