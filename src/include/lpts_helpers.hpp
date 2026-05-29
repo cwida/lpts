@@ -10,7 +10,7 @@
 namespace duckdb {
 
 /// Convert a vector of strings into a separated list (e.g. "a, b, c").
-string VecToSeparatedList(vector<string> input_list, const string &separator = ", ");
+string VecToSeparatedList(const vector<string> &input_list, const string &separator = ", ");
 
 /// Quote an identifier for SQL output when needed.
 string QuoteIdentifier(const string &identifier);
@@ -31,9 +31,6 @@ string DialectVecToQuotedIdentifierList(const vector<string> &input_list, SqlDia
 string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect);
 string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
                                  SqlDialect dialect);
-
-/// Stable lower-case name for diagnostics.
-string SqlDialectToString(SqlDialect dialect);
 
 /// Throw a structured LPTS NotImplementedException with dialect and feature context.
 [[noreturn]] void ThrowLptsNotImplemented(const string &code, SqlDialect dialect, const string &feature_kind,

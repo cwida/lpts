@@ -145,6 +145,17 @@ struct LptsGlobalState : public GlobalTableFunctionState {
 	bool done = false;
 };
 
+static unique_ptr<FunctionData> BindSingleSqlResult(string result_sql, vector<LogicalType> &return_types,
+                                                    vector<string> &names) {
+	auto result = make_uniq<LptsBindData>();
+	result->result_sql = std::move(result_sql);
+
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sql");
+
+	return std::move(result);
+}
+
 static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto query = StringValue::Get(input.inputs[0]);
@@ -159,13 +170,7 @@ static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunct
 	auto ast = LogicalPlanToAst(context, plan, dialect);
 	auto cte_list = AstToCteList(*ast, dialect);
 
-	auto result = make_uniq<LptsBindData>();
-	result->result_sql = cte_list->ToQuery(true);
-
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("sql");
-
-	return std::move(result);
+	return BindSingleSqlResult(cte_list->ToQuery(true), return_types, names);
 }
 
 static unique_ptr<FunctionData> LptsNormalizeTableBind(ClientContext &context, TableFunctionBindInput &input,
@@ -173,13 +178,7 @@ static unique_ptr<FunctionData> LptsNormalizeTableBind(ClientContext &context, T
 	auto query = StringValue::Get(input.inputs[0]);
 	SqlDialect input_dialect = ReadInputDialect(context);
 
-	auto result = make_uniq<LptsBindData>();
-	result->result_sql = NormalizeInputSqlToDuckDB(query, input_dialect);
-
-	return_types.emplace_back(LogicalType::VARCHAR);
-	names.emplace_back("sql");
-
-	return std::move(result);
+	return BindSingleSqlResult(NormalizeInputSqlToDuckDB(query, input_dialect), return_types, names);
 }
 
 static unique_ptr<GlobalTableFunctionState> LptsTableInit(ClientContext &context, TableFunctionInitInput &input) {

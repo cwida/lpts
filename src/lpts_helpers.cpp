@@ -6,44 +6,7 @@
 
 namespace duckdb {
 
-bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect) {
-	return dialect == SqlDialect::SPARK || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY ||
-	       dialect == SqlDialect::MYSQL_MARIADB;
-}
-
-bool DialectUsesUnqualifiedTableNames(SqlDialect dialect) {
-	return dialect == SqlDialect::POSTGRES || dialect == SqlDialect::REDSHIFT;
-}
-
-bool DialectUsesSchemaQualifiedTableNames(SqlDialect dialect) {
-	return dialect == SqlDialect::HIVE || dialect == SqlDialect::MYSQL_MARIADB;
-}
-
-bool DialectUsesSingleQuotedTablePath(SqlDialect dialect) {
-	return dialect == SqlDialect::BIGQUERY;
-}
-
-string DialectQuoteIdent(const string &name, SqlDialect dialect) {
-	if (DialectUsesBacktickQuotedIdentifiers(dialect)) {
-		// Spark/Hive/BigQuery/MySQL/MariaDB use backticks; embedded backticks must be doubled.
-		std::ostringstream out;
-		out << '`';
-		for (char c : name) {
-			if (c == '`') {
-				out << '`' << '`';
-			} else {
-				out << c;
-			}
-		}
-		out << '`';
-		return out.str();
-	}
-	// DUCKDB / POSTGRES — fall back to DuckDB's helper, which only quotes when
-	// the identifier is a reserved keyword or contains special chars.
-	return KeywordHelper::WriteOptionallyQuoted(name);
-}
-
-string VecToSeparatedList(vector<string> input_list, const string &separator) {
+string VecToSeparatedList(const vector<string> &input_list, const string &separator) {
 	std::ostringstream ret_str;
 	for (size_t i = 0; i < input_list.size(); ++i) {
 		ret_str << input_list[i];
@@ -129,31 +92,6 @@ string DialectQualifiedTableName(const string &catalog, const string &schema, co
 	}
 	return DialectQuoteIdent(catalog, dialect) + "." + DialectQuoteIdent(schema, dialect) + "." +
 	       DialectQuoteTableWithOptionalSuffix(table_name, dialect);
-}
-
-string SqlDialectToString(SqlDialect dialect) {
-	switch (dialect) {
-	case SqlDialect::DUCKDB:
-		return "duckdb";
-	case SqlDialect::POSTGRES:
-		return "postgres";
-	case SqlDialect::SPARK:
-		return "spark";
-	case SqlDialect::HIVE:
-		return "hive";
-	case SqlDialect::TRINO_PRESTO:
-		return "trino_presto";
-	case SqlDialect::SNOWFLAKE:
-		return "snowflake";
-	case SqlDialect::BIGQUERY:
-		return "bigquery";
-	case SqlDialect::REDSHIFT:
-		return "redshift";
-	case SqlDialect::MYSQL_MARIADB:
-		return "mysql_mariadb";
-	default:
-		return "unknown";
-	}
 }
 
 [[noreturn]] void ThrowLptsNotImplemented(const string &code, SqlDialect dialect, const string &feature_kind,

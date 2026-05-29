@@ -31,6 +31,9 @@ SqlDialect ParseSqlDialect(const string &value);
 /// Throws InvalidInputException on unrecognised values.
 SqlDialect ParseSqlDialectSetting(const string &value, const string &setting_name);
 
+/// Stable lower-case name for diagnostics.
+string SqlDialectToString(SqlDialect dialect);
+
 /// Return whether the dialect quotes identifiers with backticks instead of ANSI double quotes.
 bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect);
 

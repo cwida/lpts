@@ -14,10 +14,15 @@ set(EXTENSION_SOURCES
     src/lpts_extension.cpp
     src/cte_nodes.cpp
     src/lpts_helpers.cpp
+    src/sql_dialect.cpp
     src/lpts_parser.cpp
+    src/lpts_sql_scanner.cpp
+    src/lpts_date_format.cpp
+    src/lpts_expression_renderer.cpp
     src/lpts_ast.cpp
     src/lpts_ast_renderer.cpp
-    src/lpts_pipeline.cpp
+    src/lpts_ast_builder.cpp
+    src/lpts_ast_flattener.cpp
     src/dialect_function_map.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
