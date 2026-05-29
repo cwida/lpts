@@ -8,8 +8,8 @@ stability release.
 
 ### Compatibility
 
-- DuckDB target: `v1.5.2`
-- extension-ci-tools target: `v1.5.2`
+- DuckDB target: `v1.5.3`
+- extension-ci-tools target: `v1.5-variegata`
 - Release tag: `v0.9.0`
 
 ### Public API
