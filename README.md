@@ -31,8 +31,8 @@ projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
 SELECT t1_name AS "name" FROM projection_1;
 ```
 
-LPTS plans the query through DuckDB with all DuckDB optimizers enabled, then
-serializes the optimized logical plan.
+LPTS plans the query through DuckDB, optimizes it, then serializes the optimized
+logical plan.
 
 ## Supported Dialects
 
@@ -49,9 +49,6 @@ The dialect settings accept these values:
 | BigQuery | `bigquery`, `bq` |
 | Redshift | `redshift` |
 | MySQL / MariaDB | `mysql`, `mariadb` |
-
-Trino and Presto share one renderer internally. MySQL and MariaDB also share one
-renderer internally.
 
 Check round-trip correctness with `lpts_check`:
 
@@ -82,6 +79,7 @@ true
   materialized CTEs, and subquery decorrelation.
 - Generate a CTE program that communicates the optimized execution shape.
 - Emit SQL for another engine with `lpts_dialect`.
+- Convert common SQL dialect syntax to DuckDB SQL with `lpts_input_dialect`.
 
 ## Supported Operators
 
@@ -100,13 +98,40 @@ Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 | `lpts_input_dialect` | VARCHAR | `duckdb` | Input dialect to normalize before DuckDB parses and plans the query |
 
 ```sql
+CREATE TABLE events (id INTEGER, ts TIMESTAMP, name VARCHAR);
+INSERT INTO events VALUES
+    (1, TIMESTAMP '2024-01-15 08:09:10', 'alpha'),
+    (11, TIMESTAMP '2024-01-16 11:12:13', 'beta');
+
 SET lpts_dialect = 'postgres';
-PRAGMA lpts('SELECT name FROM users WHERE age > 25');
+SELECT sql
+FROM lpts_query(
+    'SELECT strftime(ts, ''%Y-%m-%d'') AS day
+     FROM events
+     WHERE id > 10
+     ORDER BY day'
+);
+```
+
+```text
+WITH scan_0 (t0_ts) AS (SELECT ts FROM events WHERE id>10),
+projection_1 (t1_day) AS (SELECT to_char(t0_ts, 'YYYY-MM-DD') FROM scan_0),
+order_2 (t1_day) AS (SELECT t1_day FROM projection_1 ORDER BY t1_day ASC NULLS LAST)
+SELECT t1_day AS "day" FROM order_2;
 ```
 
 ```sql
 SET lpts_input_dialect = 'mysql';
-SELECT sql FROM lpts_normalize_query('SELECT `order` FROM users LIMIT 1, 2');
+SELECT sql
+FROM lpts_normalize_query(
+    'SELECT `order`, DATE_FORMAT(ts, ''%Y-%m-%d %H:%i:%s'') AS formatted
+     FROM events
+     LIMIT 5, 10'
+);
+```
+
+```text
+SELECT "order", strftime(ts, '%Y-%m-%d %H:%M:%S') AS formatted FROM events LIMIT 10 OFFSET 5
 ```
 
 ## Documentation
