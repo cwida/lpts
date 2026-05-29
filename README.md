@@ -62,6 +62,9 @@ The dialect settings accept these values:
 | `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
 | `lpts_normalize_query('query')` | Return input-dialect SQL normalized to DuckDB SQL |
 
+`lpts_check` can return `false` for nondeterministic queries, for example when
+row order or tie-breaking is not fully specified.
+
 ## Use Cases
 
 - Inspect optimized DuckDB plans as SQL.
