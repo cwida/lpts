@@ -1,7 +1,7 @@
 # LPTS
 
 A DuckDB extension for **optimized-plan inspection** and **cross-system SQL
-compilation**. LPTS takes DuckDB's post-optimizer logical plan and reconstructs
+transpilation**. LPTS takes DuckDB's post-optimizer logical plan and reconstructs
 equivalent SQL as a sequence of named CTEs.
 
 ## PRAGMA Syntax
@@ -16,6 +16,9 @@ Example:
 INSTALL lpts FROM community;
 LOAD lpts;
 
+SET lpts_input_dialect = 'duckdb';
+SET lpts_dialect = 'duckdb';
+
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 22), (3, 'Carol', 28);
 
@@ -28,48 +31,8 @@ projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
 SELECT t1_name AS "name" FROM projection_1;
 ```
 
-Check round-trip correctness:
-
-```sql
-PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
-```
-
-```text
-true
-```
-
 LPTS plans the query through DuckDB with all DuckDB optimizers enabled, then
 serializes the optimized logical plan.
-
-## Use Cases
-
-- Inspect optimized DuckDB plans as SQL.
-- Debug optimizer rewrites such as filter pushdown, join reordering, top-N,
-  materialized CTEs, and subquery decorrelation.
-- Generate a CTE program that communicates the optimized execution shape.
-- Emit SQL for another engine with `lpts_dialect`.
-- Normalize non-DuckDB SQL input before planning with `lpts_input_dialect`.
-
-## Pragmas and Functions
-
-| Function | Description |
-|---|---|
-| `PRAGMA lpts('query')` | Return generated CTE SQL |
-| `lpts_query('query')` | Table-function form of `PRAGMA lpts` |
-| `PRAGMA lpts_exec('query')` | Execute the generated SQL |
-| `PRAGMA lpts_check('query')` | Compare original and generated SQL with bag equality |
-| `PRAGMA print_ast('query')` | Print the AST to stdout |
-| `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
-| `lpts_normalize_query('query')` | Return input-dialect SQL normalized to DuckDB SQL |
-
-## Supported Operators
-
-LPTS is intended to cover all logical operators produced by optimized DuckDB
-SELECT plans. The current regression suite round-trips all 22 TPC-H queries and
-exercises joins, aggregates, windows, set operations, CTEs, recursive CTEs,
-table functions, DuckLake scans, and inserts.
-
-Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 
 ## Supported Dialects
 
@@ -89,6 +52,45 @@ The dialect settings accept these values:
 
 Trino and Presto share one renderer internally. MySQL and MariaDB also share one
 renderer internally.
+
+Check round-trip correctness with `lpts_check`:
+
+```sql
+PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
+```
+
+```text
+true
+```
+
+## Pragmas and Functions
+
+| Function | Description |
+|---|---|
+| `PRAGMA lpts('query')` | Return generated CTE SQL |
+| `lpts_query('query')` | Table-function form of `PRAGMA lpts` |
+| `PRAGMA lpts_exec('query')` | Execute the generated SQL |
+| `PRAGMA lpts_check('query')` | Compare original and generated SQL with bag equality |
+| `PRAGMA print_ast('query')` | Print the AST to stdout |
+| `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
+| `lpts_normalize_query('query')` | Return input-dialect SQL normalized to DuckDB SQL |
+
+## Use Cases
+
+- Inspect optimized DuckDB plans as SQL.
+- Debug optimizer rewrites such as filter pushdown, join reordering, top-N,
+  materialized CTEs, and subquery decorrelation.
+- Generate a CTE program that communicates the optimized execution shape.
+- Emit SQL for another engine with `lpts_dialect`.
+
+## Supported Operators
+
+LPTS is intended to cover all logical operators produced by optimized DuckDB
+SELECT plans. The current regression suite round-trips all 22 TPC-H queries and
+exercises joins, aggregates, windows, set operations, CTEs, recursive CTEs,
+table functions, DuckLake scans, and inserts.
+
+Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 
 ## Settings
 
