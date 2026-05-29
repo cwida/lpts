@@ -79,7 +79,7 @@ true
   materialized CTEs, and subquery decorrelation.
 - Generate a CTE program that communicates the optimized execution shape.
 - Emit SQL for another engine with `lpts_dialect`.
-- Convert common SQL dialect syntax to DuckDB SQL with `lpts_input_dialect`.
+- Convert other SQL dialect syntax to DuckDB SQL with `lpts_input_dialect`, to then execute it.
 
 ## Supported Operators
 
