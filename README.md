@@ -90,6 +90,12 @@ Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 |---|---|---|---|
 | `lpts_dialect` | VARCHAR | `duckdb` | Output dialect for generated SQL |
 | `lpts_input_dialect` | VARCHAR | `duckdb` | Input dialect to normalize before DuckDB parses and plans the query |
+| `lpts_enable_data_dependent_optimizers` | BOOLEAN | `false` | Allow LPTS planning to use optimizers that depend on current data, statistics, cardinality estimates, row groups, or runtime dynamic filters |
+
+By default, LPTS avoids data-dependent optimizers so generated SQL does not bake
+in snapshot-specific facts such as `WHERE false` from current table statistics.
+Enable `lpts_enable_data_dependent_optimizers` when you want DuckDB's full
+optimized plan shape and accept that the SQL may depend on planning-time data.
 
 ## Examples
 

@@ -21,6 +21,35 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/build_probe_side_optimizer.hpp"
+#include "duckdb/optimizer/column_lifetime_analyzer.hpp"
+#include "duckdb/optimizer/common_aggregate_optimizer.hpp"
+#include "duckdb/optimizer/common_subplan_optimizer.hpp"
+#include "duckdb/optimizer/cse_optimizer.hpp"
+#include "duckdb/optimizer/cte_filter_pusher.hpp"
+#include "duckdb/optimizer/cte_inlining.hpp"
+#include "duckdb/optimizer/deliminator.hpp"
+#include "duckdb/optimizer/empty_result_pullup.hpp"
+#include "duckdb/optimizer/expression_heuristics.hpp"
+#include "duckdb/optimizer/filter_pullup.hpp"
+#include "duckdb/optimizer/filter_pushdown.hpp"
+#include "duckdb/optimizer/in_clause_rewriter.hpp"
+#include "duckdb/optimizer/join_elimination.hpp"
+#include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
+#include "duckdb/optimizer/join_order/join_order_optimizer.hpp"
+#include "duckdb/optimizer/late_materialization.hpp"
+#include "duckdb/optimizer/limit_pushdown.hpp"
+#include "duckdb/optimizer/regex_range_filter.hpp"
+#include "duckdb/optimizer/remove_duplicate_groups.hpp"
+#include "duckdb/optimizer/remove_unused_columns.hpp"
+#include "duckdb/optimizer/row_group_pruner.hpp"
+#include "duckdb/optimizer/sampling_pushdown.hpp"
+#include "duckdb/optimizer/statistics_propagator.hpp"
+#include "duckdb/optimizer/sum_rewriter.hpp"
+#include "duckdb/optimizer/topn_optimizer.hpp"
+#include "duckdb/optimizer/topn_window_elimination.hpp"
+#include "duckdb/optimizer/unnest_rewriter.hpp"
+#include "duckdb/optimizer/window_self_join.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -39,27 +68,265 @@ static SqlDialect ReadDialect(ClientContext &context) {
 	return SqlDialect::DUCKDB;
 }
 
+static bool EnableDataDependentOptimizers(ClientContext &context) {
+	Value setting;
+	if (context.TryGetCurrentSetting("lpts_enable_data_dependent_optimizers", setting)) {
+		return setting.GetValue<bool>();
+	}
+	return false;
+}
+
+static const set<OptimizerType> &DataDependentOptimizers() {
+	static const set<OptimizerType> data_dependent_optimizers = {
+	    OptimizerType::JOIN_ORDER,
+	    OptimizerType::STATISTICS_PROPAGATION,
+	    OptimizerType::ROW_GROUP_PRUNER,
+	    OptimizerType::TOP_N,
+	    OptimizerType::TOP_N_WINDOW_ELIMINATION,
+	    OptimizerType::BUILD_SIDE_PROBE_SIDE,
+	    OptimizerType::COMPRESSED_MATERIALIZATION,
+	    OptimizerType::JOIN_FILTER_PUSHDOWN,
+	    OptimizerType::EXTENSION,
+	    OptimizerType::COMMON_SUBPLAN,
+	};
+	return data_dependent_optimizers;
+}
+
+static bool LptsOptimizerDisabled(ClientContext &context, OptimizerType type) {
+	if (DataDependentOptimizers().find(type) != DataDependentOptimizers().end()) {
+		return true;
+	}
+	return Optimizer::OptimizerDisabled(context, type);
+}
+
+static void LptsRunOptimizer(ClientContext &context, OptimizerType type, const std::function<void()> &callback) {
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	if (LptsOptimizerDisabled(context, type)) {
+		return;
+	}
+	callback();
+}
+
+static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &context, Binder &binder,
+                                                            unique_ptr<LogicalOperator> plan) {
+	switch (plan->type) {
+	case LogicalOperatorType::LOGICAL_TRANSACTION:
+	case LogicalOperatorType::LOGICAL_PRAGMA:
+	case LogicalOperatorType::LOGICAL_SET:
+	case LogicalOperatorType::LOGICAL_ATTACH:
+	case LogicalOperatorType::LOGICAL_UPDATE_EXTENSIONS:
+	case LogicalOperatorType::LOGICAL_CREATE_SECRET:
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
+		if (plan->children.empty()) {
+			return plan;
+		}
+		break;
+	default:
+		break;
+	}
+
+	Optimizer optimizer(binder, context);
+	LptsRunOptimizer(context, OptimizerType::EXPRESSION_REWRITER, [&]() { optimizer.rewriter.VisitOperator(*plan); });
+
+	LptsRunOptimizer(context, OptimizerType::CTE_INLINING, [&]() {
+		CTEInlining cte_inlining(optimizer);
+		plan = cte_inlining.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::SUM_REWRITER, [&]() {
+		SumRewriterOptimizer sum_rewriter(optimizer);
+		sum_rewriter.Optimize(plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::FILTER_PULLUP, [&]() {
+		FilterPullup filter_pullup;
+		plan = filter_pullup.Rewrite(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::FILTER_PUSHDOWN, [&]() {
+		FilterPushdown filter_pushdown(optimizer);
+		unordered_set<idx_t> top_bindings;
+		filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
+		plan = filter_pushdown.Rewrite(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::CTE_FILTER_PUSHER, [&]() {
+		CTEFilterPusher cte_filter_pusher(optimizer);
+		plan = cte_filter_pusher.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::REGEX_RANGE, [&]() {
+		RegexRangeFilter regex_range;
+		plan = regex_range.Rewrite(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::IN_CLAUSE, [&]() {
+		InClauseRewriter in_clause(context, optimizer);
+		plan = in_clause.Rewrite(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::DELIMINATOR, [&]() {
+		Deliminator deliminator;
+		plan = deliminator.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::CTE_INLINING, [&]() {
+		CTEInlining cte_inlining(optimizer);
+		plan = cte_inlining.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::EMPTY_RESULT_PULLUP, [&]() {
+		EmptyResultPullup empty_result_pullup;
+		plan = empty_result_pullup.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::WINDOW_SELF_JOIN, [&]() {
+		WindowSelfJoinOptimizer window_self_join(optimizer);
+		plan = window_self_join.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::JOIN_ORDER, [&]() {
+		JoinOrderOptimizer join_order(context);
+		plan = join_order.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::JOIN_ELIMINATION, [&]() {
+		JoinElimination join_elimination;
+		plan = join_elimination.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::UNNEST_REWRITER, [&]() {
+		UnnestRewriter unnest_rewriter;
+		plan = unnest_rewriter.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::UNUSED_COLUMNS, [&]() {
+		RemoveUnusedColumns unused(optimizer);
+		unused.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::DUPLICATE_GROUPS, [&]() {
+		RemoveDuplicateGroups duplicate_groups;
+		duplicate_groups.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::COMMON_SUBEXPRESSIONS, [&]() {
+		CommonSubExpressionOptimizer cse(binder);
+		cse.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::COLUMN_LIFETIME, [&]() {
+		ColumnLifetimeAnalyzer column_lifetime(optimizer, *plan, true);
+		column_lifetime.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::BUILD_SIDE_PROBE_SIDE, [&]() {
+		BuildProbeSideOptimizer build_probe_side(context, *plan);
+		build_probe_side.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::COMMON_SUBPLAN, [&]() {
+		CommonSubplanOptimizer common_subplan(optimizer);
+		plan = common_subplan.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::LIMIT_PUSHDOWN, [&]() {
+		LimitPushdown limit_pushdown;
+		plan = limit_pushdown.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::ROW_GROUP_PRUNER, [&]() {
+		RowGroupPruner row_group_pruner(context);
+		plan = row_group_pruner.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::SAMPLING_PUSHDOWN, [&]() {
+		SamplingPushdown sampling_pushdown;
+		plan = sampling_pushdown.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::TOP_N, [&]() {
+		TopN top_n(context);
+		plan = top_n.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::LATE_MATERIALIZATION, [&]() {
+		LateMaterialization late_materialization(optimizer);
+		plan = late_materialization.Optimize(std::move(plan));
+	});
+
+	column_binding_map_t<unique_ptr<BaseStatistics>> statistics_map;
+	LptsRunOptimizer(context, OptimizerType::STATISTICS_PROPAGATION, [&]() {
+		StatisticsPropagator propagator(optimizer, *plan);
+		propagator.PropagateStatistics(plan);
+		statistics_map = propagator.GetStatisticsMap();
+	});
+
+	LptsRunOptimizer(context, OptimizerType::TOP_N_WINDOW_ELIMINATION, [&]() {
+		TopNWindowElimination top_n_window(context, optimizer, &statistics_map);
+		plan = top_n_window.Optimize(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::COMMON_AGGREGATE, [&]() {
+		CommonAggregateOptimizer common_aggregate;
+		common_aggregate.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::COLUMN_LIFETIME, [&]() {
+		ColumnLifetimeAnalyzer column_lifetime(optimizer, *plan, true);
+		column_lifetime.VisitOperator(*plan);
+	});
+
+	LptsRunOptimizer(context, OptimizerType::REORDER_FILTER, [&]() {
+		ExpressionHeuristics reorder_filter(optimizer);
+		plan = reorder_filter.Rewrite(std::move(plan));
+	});
+
+	LptsRunOptimizer(context, OptimizerType::JOIN_FILTER_PUSHDOWN, [&]() {
+		JoinFilterPushdownOptimizer join_filter_pushdown(optimizer);
+		join_filter_pushdown.VisitOperator(*plan);
+	});
+
+	Planner::VerifyPlan(context, plan);
+	return plan;
+}
+
+static unique_ptr<LogicalOperator> LptsOptimizePlan(ClientContext &context, Binder &binder,
+                                                    unique_ptr<LogicalOperator> plan) {
+	if (EnableDataDependentOptimizers(context)) {
+		Optimizer optimizer(binder, context);
+		return optimizer.Optimize(std::move(plan));
+	}
+	return LptsOptimizeConservative(context, binder, std::move(plan));
+}
+
 /// Plan a query and run it through the optimizer, returning the optimized
 /// logical plan. This ensures LPTS sees the same plan DuckDB would execute.
 ///
-/// All optimizers are enabled. Key notes per optimizer:
+/// Data-independent optimizers are enabled by default. Data-dependent optimizers
+/// are disabled unless lpts_enable_data_dependent_optimizers is true. Key notes:
 ///   - CTE_INLINING: inlines CTEs into the query body; produces ordinary LogicalProjection
 ///     nodes (no new node types needed).
 ///   - MATERIALIZED_CTE: converts default CTEs to LogicalMaterializedCTE + LogicalCTERef;
 ///     both are handled by AstMaterializedCteNode / AstCteRefNode.
 ///   - COMMON_SUBPLAN: detects identical subplans and materializes them as
-///     LogicalMaterializedCTE + LogicalCTERef; handled by the same nodes above.
-///   - STATISTICS_PROPAGATION: LPTS handles LOGICAL_DUMMY_SCAN, LOGICAL_EMPTY_RESULT, and
-///     the LogicalExpressionGet+DummyScan pattern emitted by TryExecuteAggregates.
-///   - COMPRESSED_MATERIALIZATION: a sub-pass of STATISTICS_PROPAGATION that injects
-///     __internal_compress_* / __internal_decompress_* function calls.
-///     ExpressionToAliasedString() strips these wrappers transparently.
+///     LogicalMaterializedCTE + LogicalCTERef when data-dependent optimizers are enabled;
+///     handled by the same nodes above.
+///   - STATISTICS_PROPAGATION: when data-dependent optimizers are enabled, LPTS handles
+///     LOGICAL_DUMMY_SCAN, LOGICAL_EMPTY_RESULT, and the LogicalExpressionGet+DummyScan
+///     pattern emitted by TryExecuteAggregates.
+///   - COMPRESSED_MATERIALIZATION: when data-dependent optimizers are enabled, this sub-pass
+///     of STATISTICS_PROPAGATION injects __internal_compress_* / __internal_decompress_*
+///     function calls. ExpressionToAliasedString() strips these wrappers transparently.
 ///   - COLUMN_LIFETIME: sets projection_map on LogicalFilter, LogicalOrder, and
 ///     LogicalComparisonJoin to prune columns no longer referenced above those nodes.
 ///     FilterNode and OrderNode handle this by using an explicit SELECT column list
 ///     instead of SELECT *, so the CTE header column count always matches the body.
 ///   - REORDER_FILTER: only reorders expressions inside LogicalFilter nodes — safe.
-///   - JOIN_FILTER_PUSHDOWN: only attaches runtime metadata to join/scan nodes — safe.
+///   - JOIN_FILTER_PUSHDOWN: attaches runtime dynamic filters to join/scan nodes; disabled
+///     by default because LPTS serializes a static SQL string.
 static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
 	SqlDialect input_dialect = ReadInputDialect(context);
 	string normalized = NormalizeInputSqlToDuckDB(query, input_dialect);
@@ -71,11 +338,7 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	Planner planner(context);
 	planner.CreatePlan(parser.statements[0]->Copy());
 
-	auto &config = DBConfig::GetConfig(context);
-	auto saved = config.options.disabled_optimizers;
-
-	Optimizer optimizer(*planner.binder, context);
-	auto result = optimizer.Optimize(std::move(planner.plan));
+	auto result = LptsOptimizePlan(context, *planner.binder, std::move(planner.plan));
 
 #if LPTS_DEBUG
 	LPTS_DEBUG_PRINT("[LPTS] ===== Optimized logical plan =====");
@@ -83,8 +346,6 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	LPTS_DEBUG_PRINT("[LPTS] ===== end plan =====");
 #endif
 
-	// Restore original disabled_optimizers set
-	config.options.disabled_optimizers = saved;
 	return result;
 }
 
@@ -344,6 +605,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "'postgres', 'spark', 'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift', "
 	                          "'mysql', 'mariadb'",
 	                          LogicalType::VARCHAR, Value("duckdb"));
+	config.AddExtensionOption("lpts_enable_data_dependent_optimizers",
+	                          "Enable LPTS planning optimizers that depend on current data, statistics, "
+	                          "cardinality estimates, row groups, or runtime dynamic filters.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Register PRAGMA lpts('query')
 	auto pragma = PragmaFunction::PragmaCall("lpts", LptsPragmaFunction, {LogicalType::VARCHAR});

@@ -18,10 +18,16 @@ true
 
 # Select with filter on empty table — STATISTICS_PROPAGATION detects the table is empty
 # (column stats have inverted min/max), so it prunes the whole plan to EMPTY_RESULT.
+statement ok
+SET lpts_enable_data_dependent_optimizers = true;
+
 query I
 SELECT ast LIKE '%Get%' AND ast LIKE '%false%' AND instr(ast, chr(10)) > 0 FROM print_ast_query('SELECT * FROM users WHERE age > 25');
 ----
 true
+
+statement ok
+SET lpts_enable_data_dependent_optimizers = false;
 
 # Filter pushdown on a populated table — FILTER_PUSHDOWN folds the condition into
 # the scan's table_filters and STATISTICS_PROPAGATION keeps it (age range [20,30]
