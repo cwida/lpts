@@ -12,6 +12,9 @@ namespace duckdb {
 /// Convert a vector of strings into a separated list (e.g. "a, b, c").
 string VecToSeparatedList(const vector<string> &input_list, const string &separator = ", ");
 
+/// Convert a join condition list to SQL, using TRUE for conditionless joins.
+string JoinConditionsToSQL(const vector<string> &conditions);
+
 /// Quote an identifier for SQL output when needed.
 string QuoteIdentifier(const string &identifier);
 

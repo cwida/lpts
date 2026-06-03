@@ -17,6 +17,13 @@ string VecToSeparatedList(const vector<string> &input_list, const string &separa
 	return ret_str.str();
 }
 
+string JoinConditionsToSQL(const vector<string> &conditions) {
+	if (conditions.empty()) {
+		return "TRUE";
+	}
+	return VecToSeparatedList(conditions, " AND ");
+}
+
 string QuoteIdentifier(const string &identifier) {
 	return KeywordHelper::WriteOptionallyQuoted(identifier);
 }

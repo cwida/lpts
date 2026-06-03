@@ -48,6 +48,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_recursive_cte.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
+#include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
@@ -399,6 +400,16 @@ private:
 		return LptsExpressionRenderer::GroupingSetsToClause(group_names, grouping_sets);
 	}
 
+	void AppendJoinPredicateCondition(const unique_ptr<Expression> &predicate,
+	                                  const vector<ColumnBinding> &child_bindings,
+	                                  vector<string> &conditions) {
+		if (!predicate) {
+			return;
+		}
+		RegisterChildBindingFallbacks(*predicate, child_bindings);
+		conditions.push_back("(" + ExpressionToAliasedString(predicate) + ")");
+	}
+
 	//--------------------------------------------------------------------------
 	// IsCompressedMaterializationProjection
 	//
@@ -427,6 +438,61 @@ private:
 			return false; // non-passthrough, non-internal expression
 		}
 		return has_internal_func;
+	}
+
+	bool TryResolveProjectionColumnRef(const LogicalProjection &proj, const unique_ptr<Expression> &expr, idx_t ordinal,
+	                                   ColumnBinding &resolved) const {
+		if (expr->type != ExpressionType::BOUND_COLUMN_REF || proj.children.empty()) {
+			return false;
+		}
+		const auto child_bindings = proj.children[0]->GetColumnBindings();
+		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+		resolved = bcr.binding;
+		if (column_map.find(MappableColumnBinding(resolved)) == column_map.end()) {
+			if (resolved.column_index >= child_bindings.size()) {
+				return false;
+			}
+			resolved = child_bindings[resolved.column_index];
+		}
+		if (ordinal >= child_bindings.size()) {
+			return false;
+		}
+		const auto &expected = child_bindings[ordinal];
+		return resolved.table_index == expected.table_index && resolved.column_index == expected.column_index;
+	}
+
+	bool TrySkipIdentityProjection(const LogicalOperator *op, const LogicalProjection &proj) {
+		if (proj.children.size() != 1) {
+			return false;
+		}
+		auto extra_it = extra_projection_outputs.find(op);
+		if (extra_it != extra_projection_outputs.end() && !extra_it->second.empty()) {
+			return false;
+		}
+		const auto child_bindings = proj.children[0]->GetColumnBindings();
+		if (proj.expressions.size() != child_bindings.size()) {
+			return false;
+		}
+
+		vector<ColumnBinding> resolved_bindings;
+		resolved_bindings.reserve(proj.expressions.size());
+		for (idx_t i = 0; i < proj.expressions.size(); i++) {
+			ColumnBinding resolved;
+			if (!TryResolveProjectionColumnRef(proj, proj.expressions[i], i, resolved)) {
+				return false;
+			}
+			resolved_bindings.push_back(resolved);
+		}
+
+		for (idx_t i = 0; i < resolved_bindings.size(); i++) {
+			const auto &src = FindColumnBinding(resolved_bindings[i], "identity projection");
+			column_map[MappableColumnBinding(ColumnBinding(proj.table_index, i))] =
+			    make_uniq<ColStruct>(src->table_index, src->column_name, src->alias);
+		}
+		LPTS_DEBUG_PRINT("[LPTS-AST] Skipping identity projection (table_index=" +
+		                 std::to_string(proj.table_index) + ", columns=" + std::to_string(proj.expressions.size()) +
+		                 ")");
+		return true;
 	}
 
 	//--------------------------------------------------------------------------
@@ -524,7 +590,7 @@ private:
 	// Returns nullptr for nodes that should be skipped (e.g. compressed
 	// materialization projections).
 	//--------------------------------------------------------------------------
-	unique_ptr<AstNode> BuildNode(unique_ptr<LogicalOperator> &op) {
+	unique_ptr<AstNode> BuildNode(unique_ptr<LogicalOperator> &op, bool is_root) {
 		switch (op->type) {
 		//----------------------------------------------------------------------
 		case LogicalOperatorType::LOGICAL_GET: {
@@ -824,6 +890,10 @@ private:
 				return nullptr;
 			}
 
+			if (!is_root && TrySkipIdentityProjection(op.get(), proj)) {
+				return nullptr;
+			}
+
 			vector<string> expressions;
 			vector<string> cte_column_names;
 			unordered_set<string> seen_names;
@@ -1120,6 +1190,7 @@ private:
 				string cmp = ExpressionTypeToOperator(cond.comparison);
 				conditions.push_back("(" + lhs + " " + cmp + " " + rhs + ")");
 			}
+			AppendJoinPredicateCondition(join_op.predicate, child_bindings, conditions);
 
 			// MARK joins produce an extra boolean column indicating match existence.
 			// In SQL: LEFT JOIN + (right_key IS NOT NULL) as a computed column.
@@ -1581,6 +1652,14 @@ private:
 				string cmp = ExpressionTypeToOperator(cond.comparison);
 				conditions.push_back("(" + lhs + " " + cmp + " " + rhs + ")");
 			}
+			AppendJoinPredicateCondition(dj.predicate, child_bindings, conditions);
+			if (op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+				const LogicalDependentJoin &dependent_join = op->Cast<LogicalDependentJoin>();
+				AppendJoinPredicateCondition(dependent_join.join_condition, child_bindings, conditions);
+				for (const auto &expr : dependent_join.arbitrary_expressions) {
+					AppendJoinPredicateCondition(expr, child_bindings, conditions);
+				}
+			}
 
 			// Normalize join type for SQL output. RecursiveTraversal already ensures outer
 			// is children[0] (left) and inner is children[1] (right) regardless of
@@ -1640,7 +1719,7 @@ private:
 	// Bottom-up: process all children first, attach them to the current node,
 	// then create the current node.
 	//--------------------------------------------------------------------------
-	unique_ptr<AstNode> RecursiveTraversal(unique_ptr<LogicalOperator> &op) {
+	unique_ptr<AstNode> RecursiveTraversal(unique_ptr<LogicalOperator> &op, bool is_root = false) {
 		// 1. Recurse into children first (post-order).
 		vector<unique_ptr<AstNode>> child_nodes;
 		if ((op->type == LogicalOperatorType::LOGICAL_UNION || op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
@@ -1713,11 +1792,11 @@ private:
 			return std::move(rec_node);
 		} else {
 			for (auto &child : op->children) {
-				child_nodes.push_back(RecursiveTraversal(child));
+				child_nodes.push_back(RecursiveTraversal(child, false));
 			}
 		}
 		// 2. Build this node (column_map is now populated by children).
-		unique_ptr<AstNode> node = BuildNode(op);
+		unique_ptr<AstNode> node = BuildNode(op, is_root);
 		// A nullptr return means this node should be skipped (e.g. compressed
 		// materialization projection). Pass through the single child directly.
 		if (!node) {
@@ -1743,7 +1822,7 @@ public:
 	unique_ptr<AstNode> Build(unique_ptr<LogicalOperator> &plan) {
 		MarkAggregateReferencedBindings(plan.get());
 		MarkProjectionReferencedBindings(plan.get());
-		return RecursiveTraversal(plan);
+		return RecursiveTraversal(plan, true);
 	}
 };
 
@@ -1754,5 +1833,6 @@ unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalO
 	AstBuilder builder(context, dialect);
 	return builder.Build(plan);
 }
+
 
 } // namespace duckdb

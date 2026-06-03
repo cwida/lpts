@@ -219,7 +219,7 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 		join_str << right_cte_name << " ";
 		join_str << (join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI");
 		join_str << " JOIN " << left_cte_name;
-		join_str << " ON " << VecToSeparatedList(join_conditions, " AND ");
+		join_str << " ON " << JoinConditionsToSQL(join_conditions);
 		return join_str.str();
 	}
 
@@ -255,7 +255,7 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 		join_str << right_cte_name;
 	}
 	join_str << " ON ";
-	join_str << VecToSeparatedList(join_conditions, " AND ");
+	join_str << JoinConditionsToSQL(join_conditions);
 	return join_str.str();
 }
 
