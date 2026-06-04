@@ -401,8 +401,7 @@ private:
 	}
 
 	void AppendJoinPredicateCondition(const unique_ptr<Expression> &predicate,
-	                                  const vector<ColumnBinding> &child_bindings,
-	                                  vector<string> &conditions) {
+	                                  const vector<ColumnBinding> &child_bindings, vector<string> &conditions) {
 		if (!predicate) {
 			return;
 		}
@@ -489,9 +488,8 @@ private:
 			column_map[MappableColumnBinding(ColumnBinding(proj.table_index, i))] =
 			    make_uniq<ColStruct>(src->table_index, src->column_name, src->alias);
 		}
-		LPTS_DEBUG_PRINT("[LPTS-AST] Skipping identity projection (table_index=" +
-		                 std::to_string(proj.table_index) + ", columns=" + std::to_string(proj.expressions.size()) +
-		                 ")");
+		LPTS_DEBUG_PRINT("[LPTS-AST] Skipping identity projection (table_index=" + std::to_string(proj.table_index) +
+		                 ", columns=" + std::to_string(proj.expressions.size()) + ")");
 		return true;
 	}
 
@@ -1833,6 +1831,5 @@ unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalO
 	AstBuilder builder(context, dialect);
 	return builder.Build(plan);
 }
-
 
 } // namespace duckdb
