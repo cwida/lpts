@@ -225,17 +225,45 @@ class JoinNode : public CteNode {
 	JoinType join_type;
 	vector<string> join_conditions;
 	string mark_expression; ///< For MARK→LEFT conversion: computed boolean column expression.
+	bool is_asof;
 
 public:
 	~JoinNode() override = default;
 	// Constructor.
 	JoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
-	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "")
+	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "", bool _is_asof = false)
 	    : CteNode(index, "join_" + std::to_string(index), std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)), join_type(_join_type),
-	      join_conditions(std::move(_join_conditions)), mark_expression(std::move(_mark_expression)) {
+	      join_conditions(std::move(_join_conditions)), mark_expression(std::move(_mark_expression)),
+	      is_asof(_is_asof) {
 	}
 	// Functions.
+	string ToQuery(SqlDialect dialect) override;
+};
+
+class PositionalJoinNode : public CteNode {
+	string left_cte_name, right_cte_name;
+
+public:
+	~PositionalJoinNode() override = default;
+	PositionalJoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name,
+	                   string _right_cte_name)
+	    : CteNode(index, "positional_join_" + std::to_string(index), std::move(cte_column_names)),
+	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)) {
+	}
+	string ToQuery(SqlDialect dialect) override;
+};
+
+class SampleNode : public CteNode {
+	string child_cte_name;
+	string sample_clause;
+
+public:
+	~SampleNode() override = default;
+	SampleNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, string _sample_clause)
+	    : CteNode(index, "sample_" + std::to_string(index), std::move(cte_column_names)),
+	      child_cte_name(std::move(_child_cte_name)), sample_clause(std::move(_sample_clause)) {
+	}
 	string ToQuery(SqlDialect dialect) override;
 };
 

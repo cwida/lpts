@@ -84,6 +84,55 @@ PRAGMA lpts_check('SELECT u.name, o.amount FROM users u FULL OUTER JOIN orders o
 ----
 true
 
+# --- ASOF JOIN: nearest prior row on the RHS ---
+
+statement ok
+CREATE TABLE trades(symbol VARCHAR, ts TIMESTAMP, qty INTEGER);
+
+statement ok
+CREATE TABLE prices(symbol VARCHAR, ts TIMESTAMP, price INTEGER);
+
+statement ok
+INSERT INTO trades VALUES
+	('A', '2026-01-01 10:05:00', 10),
+	('A', '2026-01-01 10:20:00', 20),
+	('B', '2026-01-01 10:10:00', 30);
+
+statement ok
+INSERT INTO prices VALUES
+	('A', '2026-01-01 10:00:00', 100),
+	('A', '2026-01-01 10:15:00', 110),
+	('B', '2026-01-01 10:00:00', 200);
+
+query I
+PRAGMA lpts_check('SELECT t.symbol, t.ts, p.price FROM trades t ASOF JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT t.symbol, t.ts, p.price FROM trades t ASOF LEFT JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts');
+----
+true
+
+# --- POSITIONAL JOIN: row-wise pairing ---
+
+statement ok
+CREATE TABLE pos_left(a INTEGER);
+
+statement ok
+CREATE TABLE pos_right(b VARCHAR);
+
+statement ok
+INSERT INTO pos_left VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO pos_right VALUES ('x'), ('y');
+
+query I
+PRAGMA lpts_check('SELECT a, b FROM pos_left POSITIONAL JOIN pos_right ORDER BY a NULLS LAST, b NULLS LAST');
+----
+true
+
 # --- JOIN with computed expression in projection ---
 
 statement ok

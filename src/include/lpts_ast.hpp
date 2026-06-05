@@ -165,16 +165,55 @@ public:
 	vector<string> conditions;       ///< Join conditions as strings (e.g. "(t0_id = t1_user_id)").
 	vector<string> cte_column_names; ///< All output column names (left ++ right + mark if MARK join).
 	string mark_expression;          ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" expression.
+	bool is_asof;                    ///< True for DuckDB ASOF JOIN.
 
 	AstJoinNode(JoinType join_type, vector<string> conditions, vector<string> cte_column_names,
-	            string mark_expression = "")
+	            string mark_expression = "", bool is_asof = false)
 	    : join_type(join_type), conditions(std::move(conditions)), cte_column_names(std::move(cte_column_names)),
-	      mark_expression(std::move(mark_expression)) {
+	      mark_expression(std::move(mark_expression)), is_asof(is_asof) {
 	}
 
 	string ToString(int indent = 0) const override;
 	string NodeType() const override {
 		return "Join";
+	}
+	vector<string> OutputColumnNames() const override {
+		return cte_column_names;
+	}
+	InsertionOrderPreservingMap<string> GetExtraInfo() const override;
+};
+
+/// POSITIONAL JOIN node.
+class AstPositionalJoinNode : public AstNode {
+public:
+	vector<string> cte_column_names; ///< All output column names (left ++ right).
+
+	explicit AstPositionalJoinNode(vector<string> cte_column_names) : cte_column_names(std::move(cte_column_names)) {
+	}
+
+	string ToString(int indent = 0) const override;
+	string NodeType() const override {
+		return "PositionalJoin";
+	}
+	vector<string> OutputColumnNames() const override {
+		return cte_column_names;
+	}
+	InsertionOrderPreservingMap<string> GetExtraInfo() const override;
+};
+
+/// TABLESAMPLE / USING SAMPLE node.
+class AstSampleNode : public AstNode {
+public:
+	string sample_clause;            ///< e.g. "reservoir(20 ROWS) REPEATABLE (11)".
+	vector<string> cte_column_names; ///< passthrough from child.
+
+	AstSampleNode(string sample_clause, vector<string> cte_column_names)
+	    : sample_clause(std::move(sample_clause)), cte_column_names(std::move(cte_column_names)) {
+	}
+
+	string ToString(int indent = 0) const override;
+	string NodeType() const override {
+		return "Sample";
 	}
 	vector<string> OutputColumnNames() const override {
 		return cte_column_names;

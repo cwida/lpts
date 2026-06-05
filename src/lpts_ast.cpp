@@ -180,7 +180,7 @@ InsertionOrderPreservingMap<string> AstAggregateNode::GetExtraInfo() const {
 //------------------------------------------------------------------------------
 
 string AstJoinNode::ToString(int indent) const {
-	string result = Indent(indent) + "Join";
+	string result = Indent(indent) + (is_asof ? "AsofJoin" : "Join");
 	result += " (" + JoinTypeToString(join_type) + ", conditions=" + std::to_string(conditions.size()) + ")";
 	for (size_t i = 0; i < conditions.size(); i++) {
 		result += "\n" + Indent(indent + 2) + "on: " + conditions[i];
@@ -193,10 +193,57 @@ string AstJoinNode::ToString(int indent) const {
 
 InsertionOrderPreservingMap<string> AstJoinNode::GetExtraInfo() const {
 	InsertionOrderPreservingMap<string> info;
-	info.insert("Type", JoinTypeToString(join_type));
+	info.insert("Type", is_asof ? "ASOF " + JoinTypeToString(join_type) : JoinTypeToString(join_type));
 	for (size_t i = 0; i < conditions.size(); i++) {
 		info.insert("On [" + std::to_string(i) + "]", conditions[i]);
 	}
+	return info;
+}
+
+//------------------------------------------------------------------------------
+// AstPositionalJoinNode
+//------------------------------------------------------------------------------
+
+string AstPositionalJoinNode::ToString(int indent) const {
+	string result = Indent(indent) + "PositionalJoin";
+	result += " (columns=" + std::to_string(cte_column_names.size()) + ")";
+	for (auto &child : children) {
+		result += "\n" + child->ToString(indent + 2);
+	}
+	return result;
+}
+
+InsertionOrderPreservingMap<string> AstPositionalJoinNode::GetExtraInfo() const {
+	InsertionOrderPreservingMap<string> info;
+	info.insert("Type", "POSITIONAL JOIN");
+	string cols = "[";
+	for (size_t i = 0; i < cte_column_names.size(); i++) {
+		if (i > 0) {
+			cols += ", ";
+		}
+		cols += cte_column_names[i];
+	}
+	cols += "]";
+	info.insert("Columns", std::move(cols));
+	return info;
+}
+
+//------------------------------------------------------------------------------
+// AstSampleNode
+//------------------------------------------------------------------------------
+
+string AstSampleNode::ToString(int indent) const {
+	string result = Indent(indent) + "Sample";
+	result += " (" + sample_clause + ")";
+	for (auto &child : children) {
+		result += "\n" + child->ToString(indent + 2);
+	}
+	return result;
+}
+
+InsertionOrderPreservingMap<string> AstSampleNode::GetExtraInfo() const {
+	InsertionOrderPreservingMap<string> info;
+	info.insert("Sample", sample_clause);
 	return info;
 }
 

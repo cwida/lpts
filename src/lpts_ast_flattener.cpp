@@ -186,8 +186,38 @@ private:
 			D_ASSERT(ast_node.children.size() == 2);
 			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
 			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
+			if (join.is_asof) {
+				if (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT) {
+					throw NotImplementedException("AstToInlineSQL: ASOF JOIN type %s is not supported",
+					                              EnumUtil::ToString(join.join_type));
+				}
+				string join_kw = join.join_type == JoinType::LEFT ? "ASOF LEFT JOIN" : "ASOF JOIN";
+				string sql = "SELECT " + VecToSeparatedList(join.cte_column_names) + " FROM (" + left_sql + ") " +
+				             join_kw + " (" + right_sql + ")";
+				if (!join.conditions.empty()) {
+					sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
+				}
+				return sql;
+			}
 			return InlineJoinSql(join.join_type, join.cte_column_names, left_sql, right_sql, join.conditions,
 			                     join.mark_expression, "JOIN");
+		}
+
+		if (type == "PositionalJoin") {
+			const AstPositionalJoinNode &join = static_cast<const AstPositionalJoinNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
+			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
+			return "SELECT " + VecToSeparatedList(join.cte_column_names) + " FROM (" + left_sql +
+			       ") POSITIONAL JOIN (" + right_sql + ")";
+		}
+
+		if (type == "Sample") {
+			const AstSampleNode &sample = static_cast<const AstSampleNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 1);
+			return "SELECT " + VecToSeparatedList(sample.cte_column_names) + " FROM (" +
+			       AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ") USING SAMPLE " +
+			       sample.sample_clause;
 		}
 
 		if (type == "DelimJoin") {
@@ -499,7 +529,18 @@ private:
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
 			return make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], children_names[1],
-			                           join.join_type, join.conditions, join.mark_expression);
+			                           join.join_type, join.conditions, join.mark_expression, join.is_asof);
+		}
+
+		if (type == "PositionalJoin") {
+			const AstPositionalJoinNode &join = static_cast<const AstPositionalJoinNode &>(ast_node);
+			return make_uniq<PositionalJoinNode>(my_index, join.cte_column_names, children_names[0], children_names[1]);
+		}
+
+		if (type == "Sample") {
+			const AstSampleNode &sample = static_cast<const AstSampleNode &>(ast_node);
+			const auto &cols = sample.cte_column_names.empty() ? children_column_lists[0] : sample.cte_column_names;
+			return make_uniq<SampleNode>(my_index, cols, children_names[0], sample.sample_clause);
 		}
 
 		if (type == "Union") {

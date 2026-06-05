@@ -44,6 +44,8 @@
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
+#include "duckdb/planner/operator/logical_positional_join.hpp"
+#include "duckdb/planner/operator/logical_sample.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_recursive_cte.hpp"
@@ -200,6 +202,30 @@ private:
 			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", EnumUtil::ToString(join_type),
 			                        context, "SEMI/ANTI JOIN SQL syntax is not portable for this dialect");
 		}
+	}
+
+	static string SampleMethodToSql(SampleMethod method) {
+		switch (method) {
+		case SampleMethod::SYSTEM_SAMPLE:
+			return "system";
+		case SampleMethod::BERNOULLI_SAMPLE:
+			return "bernoulli";
+		case SampleMethod::RESERVOIR_SAMPLE:
+			return "reservoir";
+		default:
+			throw NotImplementedException("LPTS SAMPLE: sample method %s is not implemented",
+			                              EnumUtil::ToString(method));
+		}
+	}
+
+	static string SampleOptionsToSql(const SampleOptions &options) {
+		string clause = SampleMethodToSql(options.method);
+		clause += "(" + options.sample_size.ToSQLString();
+		clause += options.is_percentage ? " PERCENT)" : " ROWS)";
+		if (options.seed.IsValid()) {
+			clause += " REPEATABLE (" + std::to_string(options.GetSeed()) + ")";
+		}
+		return clause;
 	}
 
 	/// Query the current snapshot_id for a DuckLake catalog.
@@ -1175,9 +1201,17 @@ private:
 		}
 
 		//----------------------------------------------------------------------
-		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_ASOF_JOIN: {
 			const LogicalComparisonJoin &join_op = op->Cast<LogicalComparisonJoin>();
-			ValidateJoinTypeForDialect(join_op.join_type, dialect, "LOGICAL_COMPARISON_JOIN");
+			const bool is_asof = op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN;
+			ValidateJoinTypeForDialect(join_op.join_type, dialect,
+			                           is_asof ? "LOGICAL_ASOF_JOIN" : "LOGICAL_COMPARISON_JOIN");
+			if (is_asof && dialect != SqlDialect::DUCKDB) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
+				                        LogicalOperatorToString(op->type), "AstBuilder",
+				                        "ASOF JOIN SQL syntax is DuckDB-specific");
+			}
 			vector<string> conditions;
 			vector<ColumnBinding> child_bindings = ChildBindings(*op);
 			for (const auto &cond : join_op.conditions) {
@@ -1226,7 +1260,7 @@ private:
 				LPTS_DEBUG_PRINT("[LPTS-AST] MARK join: converting to LEFT join, mark_expr='" + mark_expr + "'");
 			}
 			return make_uniq<AstJoinNode>(sql_join_type, std::move(conditions), std::move(cte_column_names),
-			                              std::move(mark_expr));
+			                              std::move(mark_expr), is_asof);
 		}
 
 		//----------------------------------------------------------------------
@@ -1252,6 +1286,32 @@ private:
 			vector<string> cross_condition = {"(TRUE)"};
 			vector<string> cte_column_names = OutputColumnNames(*op, "cross product output");
 			return make_uniq<AstJoinNode>(JoinType::INNER, std::move(cross_condition), std::move(cte_column_names));
+		}
+
+		//----------------------------------------------------------------------
+		case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN: {
+			if (dialect != SqlDialect::DUCKDB) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
+				                        LogicalOperatorToString(op->type), "AstBuilder",
+				                        "POSITIONAL JOIN SQL syntax is DuckDB-specific");
+			}
+			vector<string> cte_column_names = OutputColumnNames(*op, "positional join output");
+			return make_uniq<AstPositionalJoinNode>(std::move(cte_column_names));
+		}
+
+		//----------------------------------------------------------------------
+		case LogicalOperatorType::LOGICAL_SAMPLE: {
+			if (dialect != SqlDialect::DUCKDB) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
+				                        LogicalOperatorToString(op->type), "AstBuilder",
+				                        "USING SAMPLE SQL syntax is DuckDB-specific");
+			}
+			const LogicalSample &sample = op->Cast<LogicalSample>();
+			if (!sample.sample_options) {
+				throw InternalException("LPTS SAMPLE: missing sample options");
+			}
+			vector<string> cte_column_names = OutputColumnNames(*op, "sample output");
+			return make_uniq<AstSampleNode>(SampleOptionsToSql(*sample.sample_options), std::move(cte_column_names));
 		}
 
 		//----------------------------------------------------------------------
@@ -1693,10 +1753,7 @@ private:
 			                                   std::move(delim_tis), std::move(mark_col_expr));
 		}
 
-		case LogicalOperatorType::LOGICAL_SAMPLE:
 		case LogicalOperatorType::LOGICAL_PIVOT:
-		case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
-		case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 		case LogicalOperatorType::LOGICAL_JOIN:
 		case LogicalOperatorType::LOGICAL_DELETE:
 		case LogicalOperatorType::LOGICAL_UPDATE:

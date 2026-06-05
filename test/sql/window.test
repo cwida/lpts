@@ -43,6 +43,13 @@ PRAGMA lpts_check('SELECT grp, id, rn FROM (SELECT grp, id, row_number() OVER (P
 ----
 true
 
+# --- repeatable SAMPLE feeding a window ---
+
+query I
+PRAGMA lpts_check('SELECT grp, id, val, row_number() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rn FROM window_items USING SAMPLE reservoir(4 ROWS) REPEATABLE (11) ORDER BY grp, rn');
+----
+true
+
 # --- lead()/lag() with offset and default ---
 
 query I

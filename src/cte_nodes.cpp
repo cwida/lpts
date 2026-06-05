@@ -27,6 +27,13 @@ bool GetNodeColumnsAreExpressions(const string &table_name) {
 	return table_name == "(SELECT 1)";
 }
 
+void RequireDuckDBDialect(SqlDialect dialect, const string &node_name, const string &feature) {
+	if (dialect == SqlDialect::DUCKDB) {
+		return;
+	}
+	throw NotImplementedException("LPTS %s: %s is only implemented for the DuckDB dialect", node_name, feature);
+}
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -201,6 +208,13 @@ string AggregateNode::ToQuery(SqlDialect dialect) {
 }
 
 string JoinNode::ToQuery(SqlDialect dialect) {
+	if (is_asof) {
+		RequireDuckDBDialect(dialect, "JoinNode", "ASOF JOIN");
+		if (join_type != JoinType::INNER && join_type != JoinType::LEFT) {
+			throw NotImplementedException("LPTS ASOF JOIN: join type %s is not implemented",
+			                              EnumUtil::ToString(join_type));
+		}
+	}
 	std::ostringstream join_str;
 	// Use explicit column list instead of SELECT * to avoid including
 	// duplicate join key columns from both sides of the join.
@@ -216,6 +230,9 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	// Emit as "right SEMI/ANTI JOIN left" so the preserved side is on the left in SQL.
 	// cte_column_list already contains only the preserved side's columns (from GetColumnBindings).
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		if (is_asof) {
+			throw NotImplementedException("LPTS ASOF JOIN: RIGHT_SEMI/RIGHT_ANTI are not implemented");
+		}
 		join_str << right_cte_name << " ";
 		join_str << (join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI");
 		join_str << " JOIN " << left_cte_name;
@@ -225,8 +242,15 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 
 	join_str << left_cte_name;
 	join_str << " ";
+	if (is_asof) {
+		join_str << "ASOF ";
+	}
 	switch (join_type) {
 	case JoinType::INNER:
+		if (!is_asof) {
+			join_str << EnumUtil::ToString(join_type);
+		}
+		break;
 	case JoinType::LEFT:
 	case JoinType::RIGHT:
 	case JoinType::OUTER:
@@ -257,6 +281,22 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	join_str << " ON ";
 	join_str << JoinConditionsToSQL(join_conditions);
 	return join_str.str();
+}
+
+string PositionalJoinNode::ToQuery(SqlDialect dialect) {
+	RequireDuckDBDialect(dialect, "PositionalJoinNode", "POSITIONAL JOIN");
+	std::ostringstream join_str;
+	join_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM ";
+	join_str << left_cte_name << " POSITIONAL JOIN " << right_cte_name;
+	return join_str.str();
+}
+
+string SampleNode::ToQuery(SqlDialect dialect) {
+	RequireDuckDBDialect(dialect, "SampleNode", "USING SAMPLE");
+	std::ostringstream sample_str;
+	sample_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM ";
+	sample_str << child_cte_name << " USING SAMPLE " << sample_clause;
+	return sample_str.str();
 }
 
 string UnionNode::ToQuery(SqlDialect dialect) {
