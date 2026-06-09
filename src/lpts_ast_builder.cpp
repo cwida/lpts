@@ -1337,7 +1337,10 @@ private:
 			vector<string> cte_column_names;
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &setop_bindings = op->GetColumnBindings();
-			for (size_t i = 0; i < lhs_bindings.size(); ++i) {
+			if (lhs_bindings.size() < setop_bindings.size()) {
+				throw InternalException("LPTS set operation: left child exposes fewer columns than set operation output");
+			}
+			for (size_t i = 0; i < setop_bindings.size(); ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "setop lhs");
 				auto new_col = make_uniq<ColStruct>(table_index, lhs_col->column_name, lhs_col->alias);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());

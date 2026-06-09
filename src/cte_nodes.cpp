@@ -329,13 +329,13 @@ string ExceptNode::ToQuery(SqlDialect dialect) {
 
 string CteSetOperationNode::ToQuery(SqlDialect dialect) {
 	std::ostringstream setop_str;
-	setop_str << "SELECT * FROM ";
+	setop_str << "SELECT " << VecToSeparatedList(left_select_columns) << " FROM ";
 	setop_str << left_cte_name;
 	setop_str << " " << op_name;
 	if (is_all) {
 		setop_str << " ALL";
 	}
-	setop_str << " SELECT * FROM ";
+	setop_str << " SELECT " << VecToSeparatedList(right_select_columns) << " FROM ";
 	setop_str << right_cte_name;
 	return setop_str.str();
 }

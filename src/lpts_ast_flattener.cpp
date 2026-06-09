@@ -580,8 +580,17 @@ private:
 			if (children_names.size() != 2) {
 				throw InternalException("AstFlattener: EXCEPT/INTERSECT expected exactly two children");
 			}
+			if (children_column_lists[0].size() < s.cte_column_names.size() ||
+			    children_column_lists[1].size() < s.cte_column_names.size()) {
+				throw InternalException("AstFlattener: EXCEPT/INTERSECT child has fewer columns than output");
+			}
+			vector<string> left_select_columns(children_column_lists[0].begin(),
+			                                  children_column_lists[0].begin() + s.cte_column_names.size());
+			vector<string> right_select_columns(children_column_lists[1].begin(),
+			                                   children_column_lists[1].begin() + s.cte_column_names.size());
 			return make_uniq<CteSetOperationNode>(my_index, s.cte_column_names, children_names[0], children_names[1],
-			                                      s.op_name, s.is_all);
+			                                      s.op_name, std::move(left_select_columns),
+			                                      std::move(right_select_columns), s.is_all);
 		}
 
 		if (type == "Order") {

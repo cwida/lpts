@@ -307,15 +307,19 @@ class CteSetOperationNode : public CteNode {
 	string left_cte_name;
 	string right_cte_name;
 	string op_name;
+	vector<string> left_select_columns;
+	vector<string> right_select_columns;
 	const bool is_all;
 
 public:
 	~CteSetOperationNode() override = default;
 	CteSetOperationNode(const size_t index, vector<string> cte_column_names, string _left_cte_name,
-	                    string _right_cte_name, string _op_name, const bool all)
+	                    string _right_cte_name, string _op_name, vector<string> _left_select_columns,
+	                    vector<string> _right_select_columns, const bool all)
 	    : CteNode(index, "setop_" + std::to_string(index), std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)),
-	      op_name(std::move(_op_name)), is_all(all) {
+	      op_name(std::move(_op_name)), left_select_columns(std::move(_left_select_columns)),
+	      right_select_columns(std::move(_right_select_columns)), is_all(all) {
 	}
 	string ToQuery(SqlDialect dialect) override;
 };
