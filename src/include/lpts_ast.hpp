@@ -98,8 +98,12 @@ public:
 class AstFilterNode : public AstNode {
 public:
 	vector<string> conditions; ///< Filter expressions (e.g. "age > 25").
+	/// COLUMN_LIFETIME projection_map: when non-empty, the filter prunes its child's columns to this
+	/// subset (indices into the child's output). Empty means pass every child column through.
+	vector<idx_t> projection_map;
 
-	explicit AstFilterNode(vector<string> conditions) : conditions(std::move(conditions)) {
+	explicit AstFilterNode(vector<string> conditions, vector<idx_t> projection_map = {})
+	    : conditions(std::move(conditions)), projection_map(std::move(projection_map)) {
 	}
 
 	string ToString(int indent = 0) const override;
@@ -108,7 +112,16 @@ public:
 	}
 	vector<string> OutputColumnNames() const override {
 		D_ASSERT(children.size() == 1);
-		return children[0]->OutputColumnNames();
+		auto child_cols = children[0]->OutputColumnNames();
+		if (projection_map.empty()) {
+			return child_cols;
+		}
+		vector<string> pruned;
+		pruned.reserve(projection_map.size());
+		for (auto idx : projection_map) {
+			pruned.push_back(child_cols[idx]);
+		}
+		return pruned;
 	}
 	InsertionOrderPreservingMap<string> GetExtraInfo() const override;
 };

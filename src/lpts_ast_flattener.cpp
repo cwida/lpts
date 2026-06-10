@@ -155,7 +155,20 @@ private:
 		if (type == "Filter") {
 			const AstFilterNode &filter = static_cast<const AstFilterNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
-			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			// Honor a COLUMN_LIFETIME projection_map: select only the kept child columns instead of
+			// SELECT *, so pruned columns don't leak out of an inlined filter subtree.
+			string select_list = "*";
+			if (!filter.projection_map.empty()) {
+				auto child_cols = ast_node.children[0]->OutputColumnNames();
+				vector<string> pruned;
+				pruned.reserve(filter.projection_map.size());
+				for (auto idx : filter.projection_map) {
+					pruned.push_back(child_cols[idx]);
+				}
+				select_list = VecToSeparatedList(pruned);
+			}
+			string sql =
+			    "SELECT " + select_list + " FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 			if (!filter.conditions.empty()) {
 				sql += " WHERE ";
 				for (size_t i = 0; i < filter.conditions.size(); i++) {
@@ -511,7 +524,17 @@ private:
 			// Filters are pass-through operators: SELECT * keeps the child's column
 			// layout. Preserve it so a filter-rooted subtree can produce a valid
 			// FinalReadNode instead of an empty SELECT list.
-			return make_uniq<FilterNode>(my_index, children_column_lists[0], children_names[0], filter.conditions);
+			// COLUMN_LIFETIME may set a projection_map that prunes columns at the filter; honor it so the
+			// emitted column list matches the filter's real output (otherwise pruned columns leak upward).
+			vector<string> filter_columns = children_column_lists[0];
+			if (!filter.projection_map.empty()) {
+				filter_columns.clear();
+				filter_columns.reserve(filter.projection_map.size());
+				for (auto idx : filter.projection_map) {
+					filter_columns.push_back(children_column_lists[0][idx]);
+				}
+			}
+			return make_uniq<FilterNode>(my_index, std::move(filter_columns), children_names[0], filter.conditions);
 		}
 
 		if (type == "Project") {
@@ -585,9 +608,9 @@ private:
 				throw InternalException("AstFlattener: EXCEPT/INTERSECT child has fewer columns than output");
 			}
 			vector<string> left_select_columns(children_column_lists[0].begin(),
-			                                  children_column_lists[0].begin() + s.cte_column_names.size());
+			                                   children_column_lists[0].begin() + s.cte_column_names.size());
 			vector<string> right_select_columns(children_column_lists[1].begin(),
-			                                   children_column_lists[1].begin() + s.cte_column_names.size());
+			                                    children_column_lists[1].begin() + s.cte_column_names.size());
 			return make_uniq<CteSetOperationNode>(my_index, s.cte_column_names, children_names[0], children_names[1],
 			                                      s.op_name, std::move(left_select_columns),
 			                                      std::move(right_select_columns), s.is_all);

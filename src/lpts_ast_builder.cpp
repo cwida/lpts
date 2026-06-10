@@ -823,7 +823,7 @@ private:
 			for (const unique_ptr<Expression> &expr : filter_op.expressions) {
 				conditions.emplace_back(ExpressionToAliasedString(expr));
 			}
-			return make_uniq<AstFilterNode>(std::move(conditions));
+			return make_uniq<AstFilterNode>(std::move(conditions), filter_op.projection_map);
 		}
 
 		//----------------------------------------------------------------------
@@ -1338,7 +1338,8 @@ private:
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &setop_bindings = op->GetColumnBindings();
 			if (lhs_bindings.size() < setop_bindings.size()) {
-				throw InternalException("LPTS set operation: left child exposes fewer columns than set operation output");
+				throw InternalException(
+				    "LPTS set operation: left child exposes fewer columns than set operation output");
 			}
 			for (size_t i = 0; i < setop_bindings.size(); ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "setop lhs");
