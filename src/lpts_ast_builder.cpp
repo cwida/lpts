@@ -465,6 +465,42 @@ private:
 		return has_internal_func;
 	}
 
+	//--------------------------------------------------------------------------
+	// IsOrderPreservingCompressedProjection
+	//
+	// True iff expression i of the compressed-materialization projection (after
+	// unwrapping the compress/decompress call) is a column ref to the child's
+	// binding at ordinal i. Only then is the pass-through skip valid: skipping a
+	// projection that reorders columns breaks the positional contract of the
+	// emitted CTE (its consumers, e.g. INSERT ... SELECT *, read by position).
+	//--------------------------------------------------------------------------
+	static bool IsOrderPreservingCompressedProjection(const LogicalProjection &proj) {
+		if (proj.children.empty()) {
+			return false;
+		}
+		const auto child_bindings = proj.children[0]->GetColumnBindings();
+		if (proj.expressions.size() != child_bindings.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < proj.expressions.size(); i++) {
+			const Expression *expr = proj.expressions[i].get();
+			if (expr->type == ExpressionType::BOUND_FUNCTION) {
+				auto &func = expr->Cast<BoundFunctionExpression>();
+				if (func.children.empty()) {
+					return false;
+				}
+				expr = func.children[0].get();
+			}
+			if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+				return false;
+			}
+			if (expr->Cast<BoundColumnRefExpression>().binding != child_bindings[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	bool TryResolveProjectionColumnRef(const LogicalProjection &proj, const unique_ptr<Expression> &expr, idx_t ordinal,
 	                                   ColumnBinding &resolved) const {
 		if (expr->type != ExpressionType::BOUND_COLUMN_REF || proj.children.empty()) {
@@ -884,7 +920,15 @@ private:
 			// that are internal-only and cannot appear in user-facing SQL.
 			// We remap bindings to point through to the source columns and return nullptr
 			// to signal RecursiveTraversal to pass through the child node directly.
-			if (IsCompressedMaterializationProjection(proj)) {
+			//
+			// The pass-through is only valid when the projection preserves its child's column ORDER
+			// (modulo the compress/decompress wrappers). Plans rewritten after optimization (e.g.
+			// OpenIVM's delta rewrite appends a multiplicity column to the projection while the
+			// aggregate below emits it as a group column in the middle of its output) can make a
+			// decompress projection genuinely reorder columns; skipping it then breaks the positional
+			// contract of the emitted CTE (e.g. INSERT ... SELECT *). In that case fall through to the
+			// regular projection path below — ExpressionToAliasedString strips the internal wrappers.
+			if (IsCompressedMaterializationProjection(proj) && IsOrderPreservingCompressedProjection(proj)) {
 				LPTS_DEBUG_PRINT("[LPTS-AST] Skipping compressed materialization projection (table_index=" +
 				                 std::to_string(table_index) + ")");
 				for (size_t i = 0; i < proj.expressions.size(); ++i) {
