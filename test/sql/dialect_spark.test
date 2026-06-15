@@ -75,7 +75,7 @@ SELECT sql LIKE '%date_format(%' AS spark_strftime FROM lpts_query('SELECT strft
 true
 
 query I
-SELECT sql LIKE '%date_format(t0_ts, ''yyyy-MM-dd'')%' AS spark_strftime_format FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+SELECT sql LIKE '%date_format(ts, ''yyyy-MM-dd'')%' AS spark_strftime_format FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
 ----
 true
 
@@ -97,7 +97,7 @@ SELECT sql LIKE '%transform(%' AS spark_list_transform FROM lpts_query('SELECT l
 true
 
 query I
-SELECT sql LIKE '%transform(t0_vals, x -> (x + 1))%' AS spark_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS spark_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
 ----
 true
 

@@ -53,6 +53,8 @@ string FinalReadNode::ToQuery(SqlDialect dialect) {
 	merged_list.reserve(col_count);
 	for (size_t i = 0; i < final_column_list.size(); ++i) {
 		string final_name = DialectQuoteIdent(final_column_list[i], dialect);
+		// A redundant "x AS x" (when the column already matches the final name) is collapsed
+		// globally in CteList::ToQuery via SwallowSelfAlias.
 		merged_list.emplace_back(child_cte_column_list[i] + " AS " + final_name);
 	}
 	std::ostringstream sql_str;
@@ -406,6 +408,35 @@ string DelimGetNode::ToQuery(SqlDialect dialect) {
 	return s.str();
 }
 
+string MergedSelectNode::ToQuery(SqlDialect dialect) {
+	std::ostringstream s;
+	s << "SELECT " << VecToSeparatedList(select_exprs) << " FROM " << from_clause;
+	if (!where_conditions.empty()) {
+		s << " WHERE ";
+		// Parenthesize each condition so precedence is preserved when ANDing
+		// conditions that may contain OR (mirrors FilterNode::ToQuery).
+		for (size_t i = 0; i < where_conditions.size(); i++) {
+			if (i > 0) {
+				s << " AND ";
+			}
+			s << "(" << where_conditions[i] << ")";
+		}
+	}
+	if (!group_by_text.empty()) {
+		s << " GROUP BY " << group_by_text;
+	}
+	if (!order_items.empty()) {
+		s << " ORDER BY " << VecToSeparatedList(order_items);
+	}
+	if (!limit_str.empty()) {
+		s << " LIMIT " << limit_str;
+	}
+	if (!offset_str.empty()) {
+		s << " OFFSET " << offset_str;
+	}
+	return s.str();
+}
+
 string RecursiveCteNode::ToQuery(SqlDialect dialect) {
 	string union_kw = union_all ? "\nUNION ALL\n" : "\nUNION\n";
 	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + recursive_step_sql;
@@ -426,6 +457,37 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 		}
 	}
 
+	// Build a "de-prefix" rename map for column identifiers: a generated t{N}_{bare} column name
+	// collapses to its bare {bare} form when that bare is globally unique across all introduced
+	// column names and is a safe unquoted identifier. This drops the t{N}_ prefix wherever it isn't
+	// needed to disambiguate. CTE names are NOT collapsed; a column whose full name happens to equal
+	// a CTE name is left alone so the shared token isn't rewritten.
+	unordered_set<string> cte_names;
+	for (const auto &node : nodes) {
+		cte_names.insert(node->cte_name);
+	}
+	unordered_map<string, int> bare_count;
+	unordered_set<string> seen_full;
+	for (const auto &node : nodes) {
+		for (const auto &col : node->cte_column_list) {
+			if (seen_full.insert(col).second) {
+				bare_count[StripGeneratedTablePrefix(col)]++;
+			}
+		}
+	}
+	unordered_map<string, string> rename;
+	for (const auto &full : seen_full) {
+		if (!HasGeneratedTablePrefix(full) || cte_names.count(full)) {
+			continue;
+		}
+		const string bare = StripGeneratedTablePrefix(full);
+		// Unsafe to expose bare: a reserved keyword / non-identifier (QuoteIdentifier would quote it)
+		// or a name that itself looks like a generated prefix. Keep those prefixed.
+		if (bare_count[bare] == 1 && QuoteIdentifier(bare) == bare && !HasGeneratedTablePrefix(bare)) {
+			rename[full] = bare;
+		}
+	}
+
 	std::ostringstream sql_str;
 	if (!nodes.empty()) {
 		sql_str << (has_recursive_cte ? "WITH RECURSIVE " : "WITH ");
@@ -443,7 +505,13 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	}
 	sql_str << final_node->ToQuery(dialect);
 	sql_str << ";";
-	return sql_str.str();
+
+	string result = sql_str.str();
+	if (!rename.empty()) {
+		result = SubstituteColumnTokens(result, rename);
+	}
+	// Drop any "x AS x" that the de-prefixing (or pass-through naming) produced.
+	return SwallowSelfAlias(result);
 }
 
 } // namespace duckdb

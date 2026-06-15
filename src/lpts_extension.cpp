@@ -68,6 +68,15 @@ static SqlDialect ReadDialect(ClientContext &context) {
 	return SqlDialect::DUCKDB;
 }
 
+// Helper: read lpts_merge_pipeline from the session settings (defaults to true).
+static bool ReadMergePipeline(ClientContext &context) {
+	Value setting;
+	if (context.TryGetCurrentSetting("lpts_merge_pipeline", setting)) {
+		return setting.GetValue<bool>();
+	}
+	return true;
+}
+
 static bool EnableDataDependentOptimizers(ClientContext &context) {
 	Value setting;
 	if (context.TryGetCurrentSetting("lpts_enable_data_dependent_optimizers", setting)) {
@@ -387,7 +396,7 @@ static string LptsPragmaFunction(ClientContext &context, const FunctionParameter
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
+	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
 	string result_sql = cte_list->ToQuery(true);
 
 	// Return a substitute query that displays the result
@@ -434,7 +443,7 @@ static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunct
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
+	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
 
 	return BindSingleSqlResult(cte_list->ToQuery(true), return_types, names);
 }
@@ -475,7 +484,7 @@ static string LptsExecPragmaFunction(ClientContext &context, const FunctionParam
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
+	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
 	return cte_list->ToQuery(true);
 }
 
@@ -497,7 +506,7 @@ static string LptsCheckPragmaFunction(ClientContext &context, const FunctionPara
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
+	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
 	string lpts_sql = cte_list->ToQuery(true);
 
 	// Normalize the original query to DuckDB's first parsed statement before embedding
@@ -609,6 +618,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Enable LPTS planning optimizers that depend on current data, statistics, "
 	                          "cardinality estimates, row groups, or runtime dynamic filters.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("lpts_merge_pipeline",
+	                          "Fuse chains of single-child pipeline operators (Limit/OrderBy/Project/Aggregate/"
+	                          "Filter, and pushdown-free base-table scans) into one flat SELECT per query block "
+	                          "instead of one CTE per operator.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Register PRAGMA lpts('query')
 	auto pragma = PragmaFunction::PragmaCall("lpts", LptsPragmaFunction, {LogicalType::VARCHAR});

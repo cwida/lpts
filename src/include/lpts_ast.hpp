@@ -132,9 +132,12 @@ public:
 	vector<string> expressions;      ///< Projected expressions / column references (child CTE names).
 	vector<string> cte_column_names; ///< CTE-scoped output names (e.g. "t1_name").
 	size_t table_index;
+	bool is_window; ///< True when this projection carries window (OVER) expressions; a fusion boundary.
 
-	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, size_t table_index)
-	    : expressions(std::move(expressions)), cte_column_names(std::move(cte_column_names)), table_index(table_index) {
+	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, size_t table_index,
+	               bool is_window = false)
+	    : expressions(std::move(expressions)), cte_column_names(std::move(cte_column_names)), table_index(table_index),
+	      is_window(is_window) {
 	}
 
 	string ToString(int indent = 0) const override;

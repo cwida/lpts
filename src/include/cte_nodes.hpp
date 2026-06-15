@@ -20,12 +20,12 @@ namespace duckdb {
 // The bottom-up traversal of the logical plan guarantees that each CTE only
 // references CTEs defined before it.
 //
-// Example: "SELECT name FROM users WHERE age > 25" produces:
+// Example: "SELECT name FROM users WHERE age > 25" produces (CTEs named t{index}_{operator}):
 //
-//   WITH scan_0(t0_name, t0_age) AS (SELECT name, age FROM memory.main.users),
-//        filter_1 AS (SELECT * FROM scan_0 WHERE (t0_age) > (25)),
-//        projection_2(t2_name) AS (SELECT t0_name FROM filter_1)
-//   SELECT t2_name AS name FROM projection_2;
+//   WITH t0_scan(t0_name, t0_age) AS (SELECT name, age FROM memory.main.users),
+//        t1_filter AS (SELECT * FROM t0_scan WHERE (t0_age) > (25)),
+//        t2_projection(t2_name) AS (SELECT t0_name FROM t1_filter)
+//   SELECT t2_name AS name FROM t2_projection;
 //
 // Class hierarchy:
 //   CteBaseNode (base)
@@ -53,7 +53,7 @@ public:
 	// Constructor.
 	explicit CteBaseNode(const size_t index) : idx(index) {
 	}
-	const size_t idx; // Unique index used for naming (e.g. scan_0, filter_1).
+	const size_t idx; // Unique index used for naming (e.g. t0_scan, t1_filter).
 };
 
 /// Virtual class for terminal/root nodes (SELECT result or INSERT).
@@ -128,10 +128,10 @@ public:
 	}
 	// Requires ToQuery() to be implemented by derived classes.
 	/// Create a CTE-like string for the Node (excluding the WITH keyword).
-	/// Example output: "scan_0(t0_name, t0_age) AS (SELECT name, age FROM ...)"
+	/// Example output: "t0_scan(t0_name, t0_age) AS (SELECT name, age FROM ...)"
 	string ToCteQuery(SqlDialect dialect);
 	// Attributes.
-	/// The name of the CTE (e.g. "scan_0", "filter_1").
+	/// The name of the CTE (e.g. "t0_scan", "t1_filter").
 	string cte_name;
 	/// The "external" names of the CTE columns (the names ancestors use to reference them).
 	vector<string> cte_column_list;
@@ -155,9 +155,9 @@ public:
 	                 string _table_name, const size_t _table_index, vector<string> _table_filters,
 	                 vector<string> _column_names, string _input_cte_name = string(),
 	                 idx_t _table_function_output_count = DConstants::INVALID_INDEX)
-	    : CteNode(index, "scan_" + std::to_string(index), std::move(cte_column_names)), catalog(std::move(_catalog)),
-	      schema(std::move(_schema)), table_name(std::move(_table_name)), table_index(_table_index),
-	      table_filters(std::move(_table_filters)), column_names(std::move(_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_scan", std::move(cte_column_names)),
+	      catalog(std::move(_catalog)), schema(std::move(_schema)), table_name(std::move(_table_name)),
+	      table_index(_table_index), table_filters(std::move(_table_filters)), column_names(std::move(_column_names)),
 	      input_cte_name(std::move(_input_cte_name)), table_function_output_count(_table_function_output_count) {
 	}
 	// Functions.
@@ -173,7 +173,7 @@ public:
 	~FilterNode() override = default;
 	// Constructor.
 	FilterNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _conditions)
-	    : CteNode(index, "filter_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_filter", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), conditions(std::move(_conditions)) {
 	}
 	// Functions.
@@ -191,7 +191,7 @@ public:
 	// Constructor.
 	ProjectNode(const size_t index, vector<string> cte_column_names, string _child_cte_name,
 	            vector<string> _column_names, const size_t _table_index)
-	    : CteNode(index, "projection_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_projection", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), column_names(std::move(_column_names)),
 	      table_index(_table_index) {
 	}
@@ -211,7 +211,7 @@ public:
 	// Constructor.
 	AggregateNode(const size_t index, vector<string> cte_column_names, string _child_cte_name,
 	              vector<string> _group_names, string _group_by_clause, vector<string> _aggregate_names)
-	    : CteNode(index, "aggregate_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_aggregate", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), group_by_columns(std::move(_group_names)),
 	      group_by_clause(std::move(_group_by_clause)), aggregate_expressions(std::move(_aggregate_names)) {
 	}
@@ -232,7 +232,7 @@ public:
 	// Constructor.
 	JoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
 	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "", bool _is_asof = false)
-	    : CteNode(index, "join_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_join", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)), join_type(_join_type),
 	      join_conditions(std::move(_join_conditions)), mark_expression(std::move(_mark_expression)),
 	      is_asof(_is_asof) {
@@ -248,7 +248,7 @@ public:
 	~PositionalJoinNode() override = default;
 	PositionalJoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name,
 	                   string _right_cte_name)
-	    : CteNode(index, "positional_join_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_positional_join", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
@@ -261,7 +261,7 @@ class SampleNode : public CteNode {
 public:
 	~SampleNode() override = default;
 	SampleNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, string _sample_clause)
-	    : CteNode(index, "sample_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_sample", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), sample_clause(std::move(_sample_clause)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
@@ -277,7 +277,7 @@ public:
 	// Constructor.
 	UnionNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
 	          const bool union_all)
-	    : CteNode(index, "union_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_union", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)),
 	      is_union_all(union_all) {
 	}
@@ -295,7 +295,7 @@ public:
 	// Constructor.
 	ExceptNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
 	           const bool except_all)
-	    : CteNode(index, "except_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_except", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)),
 	      is_except_all(except_all) {
 	}
@@ -316,7 +316,7 @@ public:
 	CteSetOperationNode(const size_t index, vector<string> cte_column_names, string _left_cte_name,
 	                    string _right_cte_name, string _op_name, vector<string> _left_select_columns,
 	                    vector<string> _right_select_columns, const bool all)
-	    : CteNode(index, "setop_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_setop", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)),
 	      op_name(std::move(_op_name)), left_select_columns(std::move(_left_select_columns)),
 	      right_select_columns(std::move(_right_select_columns)), is_all(all) {
@@ -331,7 +331,7 @@ class OrderNode : public CteNode {
 public:
 	~OrderNode() override = default;
 	OrderNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _order_items)
-	    : CteNode(index, "order_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_order", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
@@ -349,7 +349,7 @@ public:
 	~LimitNode() override = default;
 	LimitNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, string _limit_str,
 	          string _offset_str, bool _limit_needs_child_scalar, bool _offset_needs_child_scalar)
-	    : CteNode(index, "limit_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_limit", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), limit_str(std::move(_limit_str)),
 	      offset_str(std::move(_offset_str)), limit_needs_child_scalar(_limit_needs_child_scalar),
 	      offset_needs_child_scalar(_offset_needs_child_scalar) {
@@ -368,7 +368,7 @@ public:
 	~TopNNode() override = default;
 	TopNNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _order_items,
 	         idx_t _limit, idx_t _offset)
-	    : CteNode(index, "topn_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_topn", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)), limit(_limit),
 	      offset(_offset) {
 	}
@@ -382,7 +382,7 @@ class DistinctNode : public CteNode {
 public:
 	~DistinctNode() override = default;
 	DistinctNode(const size_t index, vector<string> cte_column_names, string _child_cte_name)
-	    : CteNode(index, "distinct_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_distinct", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
@@ -399,7 +399,7 @@ public:
 	~DelimGetNode() override = default;
 	DelimGetNode(const size_t index, vector<string> cte_column_names, string _source_cte_name,
 	             vector<string> _source_cols)
-	    : CteNode(index, "scan_" + std::to_string(index), std::move(cte_column_names)),
+	    : CteNode(index, "t" + std::to_string(index) + "_scan", std::move(cte_column_names)),
 	      source_cte_name(std::move(_source_cte_name)), source_cols(std::move(_source_cols)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
@@ -419,9 +419,45 @@ public:
 	~RecursiveCteNode() override = default;
 	RecursiveCteNode(const size_t index, vector<string> stripped_cols, string _anchor_cte_name,
 	                 vector<string> _anchor_cols, string _recursive_step_sql, bool _union_all)
-	    : CteNode(index, "recursive_cte_" + std::to_string(index), std::move(stripped_cols)),
+	    : CteNode(index, "t" + std::to_string(index) + "_recursive_cte", std::move(stripped_cols)),
 	      anchor_cte_name(std::move(_anchor_cte_name)), anchor_cols(std::move(_anchor_cols)),
 	      recursive_step_sql(std::move(_recursive_step_sql)), union_all(_union_all) {
+	}
+	string ToQuery(SqlDialect dialect) override;
+};
+
+/// Merged pipeline block — a single flat SELECT that fuses a chain of single-child
+/// pipeline operators (Limit / OrderBy / Project / Aggregate / Project / Filter,
+/// and optionally an absorbed pushdown-free base-table scan) into one statement:
+///
+///   SELECT <select_exprs> FROM <from_clause>
+///     [WHERE (c1) AND (c2) ...] [GROUP BY <group_by_text>]
+///     [ORDER BY <order_items>] [LIMIT <limit>] [OFFSET <offset>]
+///
+/// All clause strings are already fully rendered (column references folded into
+/// their defining expressions and dialect-qualified) when the node is built.
+///
+/// Only built when ≥2 components are actually fused (pipeline operators, plus an
+/// absorbed base-table scan); a single unfused operator goes through its own CteNode
+/// instead. Always named "block_N".
+class MergedSelectNode : public CteNode {
+	vector<string> select_exprs;     ///< Final SELECT list, each item already "<expr> AS <out_col>".
+	string from_clause;              ///< Table reference or child CTE name.
+	vector<string> where_conditions; ///< Folded WHERE conditions (ANDed, each parenthesized).
+	string group_by_text;            ///< Folded GROUP BY body, or empty.
+	vector<string> order_items;      ///< Folded ORDER BY items, or empty.
+	string limit_str;                ///< e.g. "10", or empty.
+	string offset_str;               ///< e.g. "5", or empty.
+
+public:
+	~MergedSelectNode() override = default;
+	MergedSelectNode(const size_t index, vector<string> cte_column_names, vector<string> _select_exprs,
+	                 string _from_clause, vector<string> _where_conditions, string _group_by_text,
+	                 vector<string> _order_items, string _limit_str, string _offset_str)
+	    : CteNode(index, "t" + std::to_string(index) + "_block", std::move(cte_column_names)),
+	      select_exprs(std::move(_select_exprs)), from_clause(std::move(_from_clause)),
+	      where_conditions(std::move(_where_conditions)), group_by_text(std::move(_group_by_text)),
+	      order_items(std::move(_order_items)), limit_str(std::move(_limit_str)), offset_str(std::move(_offset_str)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
 };

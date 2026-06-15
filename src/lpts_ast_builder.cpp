@@ -84,7 +84,7 @@ private:
 	/// Metadata for one column as it flows through the plan.
 	struct ColStruct {
 		const idx_t table_index;
-		string column_name; ///< Original physical column name.
+		string column_name; ///< Original physical column name (or computed-expression fragment).
 		string alias;       ///< Optional alias for expressions. Empty if not set.
 
 		ColStruct(const idx_t _table_index, string _column_name, string _alias)
@@ -907,7 +907,10 @@ private:
 
 			LPTS_DEBUG_PRINT("[LPTS-AST] Built LOGICAL_WINDOW with " + std::to_string(window.expressions.size()) +
 			                 " window expressions");
-			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index);
+			// Mark as a window projection so pipeline fusion treats it as a boundary
+			// (window/OVER expressions must not be folded into WHERE/GROUP BY contexts).
+			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index,
+			                                 /*is_window=*/true);
 		}
 
 		//----------------------------------------------------------------------
@@ -981,25 +984,24 @@ private:
 						}
 					}
 					const unique_ptr<ColStruct> &desc = FindColumnBinding(lookup_binding, "projection");
-					expressions.push_back(desc->ToUniqueColumnName());
-					string col_name = desc->column_name;
-					string alias = desc->alias;
-					// Deduplicate: joins can produce same-named columns from different tables.
-					// Build unique CTE column name; append _N suffix on collision.
-					string base = alias.empty() ? col_name : alias;
-					string deduped = base;
-					string unique_name = "t" + to_string(table_index) + "_" + deduped;
-					for (size_t suffix = i; seen_names.count(unique_name); suffix++) {
-						deduped = base + "_" + to_string(suffix);
-						unique_name = "t" + to_string(table_index) + "_" + deduped;
-					}
-					seen_names.insert(unique_name);
-					if (alias.empty()) {
-						col_name = deduped;
+					const string src_name = desc->ToUniqueColumnName();
+					expressions.push_back(src_name);
+					// DuckDB auto-populates a column ref's alias with either the source column name or the
+					// original expression rendering (which contains '('). Treat the alias as a genuine user
+					// rename only when it is paren-free AND differs from the column's own name; such a rename
+					// gets a fresh t{index}_alias, otherwise reuse the source column's identity unchanged.
+					const string origin_base = SanitizeIdentifierFragment(StripTablePrefix(src_name));
+					unique_ptr<ColStruct> new_col;
+					if (expr->HasAlias() && expr->GetAlias().find('(') == string::npos &&
+					    SanitizeIdentifierFragment(expr->GetAlias()) != origin_base) {
+						new_col = MakeDedupedColumn(table_index, expr->GetAlias(), "", seen_names, i);
+					} else if (!seen_names.count(src_name)) {
+						seen_names.insert(src_name);
+						new_col = make_uniq<ColStruct>(desc->table_index, desc->column_name, desc->alias);
 					} else {
-						alias = deduped;
+						// Same source column projected twice (e.g. SELECT a, a): mint a fresh prefixed name.
+						new_col = MakeDedupedColumn(table_index, origin_base, "", seen_names, i);
 					}
-					auto new_col = make_uniq<ColStruct>(table_index, col_name, alias);
 					cte_column_names.push_back(new_col->ToUniqueColumnName());
 					column_map[MappableColumnBinding(new_cb)] = std::move(new_col);
 				} else {
@@ -1008,11 +1010,16 @@ private:
 					}
 					string expr_str = ExpressionToAliasedString(expr);
 					expressions.emplace_back(expr_str);
-					string scalar_alias = expr->HasAlias() ? expr->GetAlias() : "scalar_" + std::to_string(i);
-					string unique_name = "t" + to_string(table_index) + "_" + scalar_alias;
+					// A real user alias (paren-free; DuckDB auto-aliases with the rendered expression,
+					// which contains '(') gets t{index}_alias; otherwise an invented t{index}_scalar_Y.
+					const string base_alias = (expr->HasAlias() && expr->GetAlias().find('(') == string::npos)
+					                              ? expr->GetAlias()
+					                              : "scalar_" + std::to_string(i);
+					string scalar_alias = base_alias;
+					string unique_name = "t" + to_string(table_index) + "_" + SanitizeIdentifierFragment(scalar_alias);
 					for (size_t suffix = i; seen_names.count(unique_name); suffix++) {
-						scalar_alias = "scalar_" + to_string(i) + "_" + to_string(suffix);
-						unique_name = "t" + to_string(table_index) + "_" + scalar_alias;
+						scalar_alias = base_alias + "_" + to_string(suffix);
+						unique_name = "t" + to_string(table_index) + "_" + SanitizeIdentifierFragment(scalar_alias);
 					}
 					seen_names.insert(unique_name);
 					auto new_col = make_uniq<ColStruct>(table_index, expr_str, std::move(scalar_alias));
@@ -1191,9 +1198,25 @@ private:
 					}
 					agg_str << " FILTER (WHERE " << ExpressionToAliasedString(ba.filter) << ")";
 				}
-				string agg_alias = "aggregate_" + std::to_string(i);
 				agg_expressions.push_back(agg_str.str());
-				auto new_col = MakeDedupedColumn(agg_table_index, agg_str.str(), std::move(agg_alias), seen_names, i);
+				// Name (always t{index}_ prefixed for global uniqueness): a real user alias wins;
+				// otherwise "{func}_{input col}" — e.g. count_star, count_distinct_l_quantity, sum_a
+				// (just the func name for complex/multi args). DuckDB auto-populates the alias with the
+				// function rendering (which contains '('), so treat only a paren-free alias as user-set.
+				string agg_fragment;
+				if (expr->HasAlias() && expr->GetAlias().find('(') == string::npos) {
+					agg_fragment = expr->GetAlias();
+				} else {
+					agg_fragment = StringUtil::Lower(agg_name);
+					if (ba.IsDistinct()) {
+						agg_fragment += "_distinct";
+					}
+					if (ba.children.size() == 1 && ba.children[0]->type == ExpressionType::BOUND_COLUMN_REF &&
+					    !child_exprs.empty()) {
+						agg_fragment += "_" + LptsExpressionRenderer::StripTablePrefix(child_exprs[0]);
+					}
+				}
+				auto new_col = MakeDedupedColumn(agg_table_index, agg_fragment, "", seen_names, i);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());
 				column_map[MappableColumnBinding(ColumnBinding(agg_table_index, i))] = std::move(new_col);
 			}

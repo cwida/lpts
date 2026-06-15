@@ -11,14 +11,15 @@ namespace duckdb {
 // as CTE node objects that can be serialized to SQL.
 //
 // Each AstNode type maps to a specific CteNode type. CTE names are assigned
-// using the same monotonically increasing counter as the original pipeline,
-// generating scan_N, filter_N, projection_N, etc.
+// using a monotonically increasing counter, in the form t{N}_{operator}
+// (t0_scan, t1_filter, t2_projection, t3_block, ...).
 //==============================================================================
 class AstFlattener {
 private:
 	size_t node_count = 0;
 	vector<unique_ptr<CteNode>> cte_nodes;
 	SqlDialect dialect;             // Controls dialect-specific SQL rendering.
+	bool merge_pipeline = true;     // Fuse single-child pipeline chains into one flat SELECT.
 	bool has_recursive_cte = false; // True when a RecursiveCteNode has been pushed.
 
 	/// Maps LogicalMaterializedCTE::table_index → (lpts_cte_name, lpts_cte_column_list)
@@ -352,6 +353,233 @@ private:
 	}
 
 	//--------------------------------------------------------------------------
+	// TryFlattenMergedPipeline: fuse a maximal chain of single-child pipeline
+	// operators into ONE flat SELECT (a MergedSelectNode), instead of emitting
+	// one CTE per operator.
+	//
+	// Canonical operator order, OUTER → INNER:
+	//   Limit → OrderBy → Project(top) → Aggregate → Project(bottom) → Filter
+	// plus, at the bottom, an absorbed pushdown-free base-table scan (DuckDB).
+	//
+	// Realizing one flat SELECT requires FOLDING: each operator's expressions
+	// reference its child's output column names, so we substitute those names
+	// with their defining expressions while walking inner → outer, keeping a
+	// `col_map` of output_col_name → expr (in terms of the FROM-source columns).
+	//
+	// Returns nullptr when `ast_node` does not begin a mergeable chain (zero
+	// operators consumed) — the caller then falls through to the per-operator path.
+	//--------------------------------------------------------------------------
+	unique_ptr<CteNode> TryFlattenMergedPipeline(const AstNode &ast_node) {
+		// Fixed slots in canonical outer→inner order. Project appears twice
+		// (above and below the aggregate).
+		enum { S_LIMIT = 0, S_ORDER, S_PROJ_TOP, S_AGG, S_PROJ_BOTTOM, S_FILTER };
+
+		const AstLimitNode *limit_n = nullptr;
+		const AstOrderNode *order_n = nullptr;
+		const AstProjectNode *proj_top = nullptr;
+		const AstAggregateNode *agg_n = nullptr;
+		const AstProjectNode *proj_bottom = nullptr;
+		const AstFilterNode *filter_n = nullptr;
+
+		// 1. Walk down, assigning each operator to the next available slot in
+		//    canonical order. Stop (boundary) on out-of-order/duplicate slots,
+		//    non-pipeline operators, window projections, or scalar-limits.
+		int next_slot = S_LIMIT;
+		int consumed = 0;
+		const AstNode *cur = &ast_node;
+		while (cur->children.size() == 1) {
+			const string &t = cur->NodeType();
+			int chosen = -1;
+			if (t == "Limit") {
+				const auto &l = static_cast<const AstLimitNode &>(*cur);
+				// A child-scalar LIMIT/OFFSET needs a separate child CTE to read from — cannot fold.
+				if (l.limit_needs_child_scalar || l.offset_needs_child_scalar) {
+					break;
+				}
+				if (next_slot <= S_LIMIT) {
+					chosen = S_LIMIT;
+					limit_n = &l;
+				}
+			} else if (t == "Order") {
+				if (next_slot <= S_ORDER) {
+					chosen = S_ORDER;
+					order_n = &static_cast<const AstOrderNode &>(*cur);
+				}
+			} else if (t == "Aggregate") {
+				if (next_slot <= S_AGG) {
+					chosen = S_AGG;
+					agg_n = &static_cast<const AstAggregateNode &>(*cur);
+				}
+			} else if (t == "Filter") {
+				if (next_slot <= S_FILTER) {
+					chosen = S_FILTER;
+					filter_n = &static_cast<const AstFilterNode &>(*cur);
+				}
+			} else if (t == "Project") {
+				const auto &p = static_cast<const AstProjectNode &>(*cur);
+				if (p.is_window) {
+					break; // window/OVER expressions must not be folded — keep separate.
+				}
+				if (next_slot <= S_PROJ_TOP) {
+					chosen = S_PROJ_TOP;
+					proj_top = &p;
+				} else if (next_slot <= S_PROJ_BOTTOM) {
+					chosen = S_PROJ_BOTTOM;
+					proj_bottom = &p;
+				}
+			} else {
+				break; // non-pipeline operator → boundary (the FROM input).
+			}
+			if (chosen < 0) {
+				break; // out-of-order or duplicate slot → boundary.
+			}
+			next_slot = chosen + 1;
+			consumed++;
+			cur = cur->children[0].get();
+		}
+
+		if (consumed == 0) {
+			return nullptr; // not a mergeable chain — let the per-operator path handle it.
+		}
+
+		// 2. Decide whether the bottom scan can be absorbed into the FROM clause. Absorb only a
+		//    simple physical table with no pushdown (DuckDB dialect): everything else (table
+		//    functions, "(SELECT 1)", ducklake, pushdown scans, other dialects) keeps
+		//    GetNode::ToQuery as the single source of truth and stays its own CTE.
+		//    Compute this first, with no side effects, so the early-out below is clean.
+		const AstNode &input = *cur;
+		const AstGetNode *absorb_get = nullptr;
+		if (input.NodeType() == "Get") {
+			const auto &g = static_cast<const AstGetNode &>(input);
+			const bool simple_table = dialect == SqlDialect::DUCKDB && !g.catalog.empty() && g.table_filters.empty() &&
+			                          g.table_name.find('(') == string::npos && g.table_name != "(SELECT 1)" &&
+			                          g.table_name.find("ducklake_table_") == string::npos &&
+			                          g.table_function_output_count == DConstants::INVALID_INDEX &&
+			                          g.column_names.size() == g.cte_column_names.size();
+			if (simple_table) {
+				absorb_get = &g;
+			}
+		}
+
+		// Only build a merged block when we actually fuse ≥2 components: pipeline operators plus
+		// an absorbed scan. A single operator with no scan to absorb has nothing to merge, so we
+		// return nullptr and let the per-operator path emit its normally-named CTE
+		// (filter_/projection_/aggregate_/order_/limit_).
+		const int n_ops = (limit_n ? 1 : 0) + (order_n ? 1 : 0) + (proj_top ? 1 : 0) + (agg_n ? 1 : 0) +
+		                  (proj_bottom ? 1 : 0) + (filter_n ? 1 : 0);
+		if (n_ops + (absorb_get ? 1 : 0) < 2) {
+			return nullptr;
+		}
+
+		// Materialize the FROM input: absorb the base-table scan, else recurse to a child CTE.
+		unordered_map<string, string> col_map; // visible col name → folded expr over FROM source.
+		vector<string> visible;                // visible column names, in order.
+		string from_clause;
+		if (absorb_get) {
+			from_clause =
+			    DialectQualifiedTableName(absorb_get->catalog, absorb_get->schema, absorb_get->table_name, dialect);
+			for (size_t i = 0; i < absorb_get->cte_column_names.size(); i++) {
+				col_map[absorb_get->cte_column_names[i]] = DialectQuoteIdent(absorb_get->column_names[i], dialect);
+				visible.push_back(absorb_get->cte_column_names[i]);
+			}
+		} else {
+			unique_ptr<CteNode> input_cte = FlattenNode(input);
+			from_clause = input_cte->cte_name;
+			visible = input_cte->cte_column_list;
+			for (const auto &c : input_cte->cte_column_list) {
+				col_map[c] = c;
+			}
+			cte_nodes.push_back(std::move(input_cte));
+		}
+
+		// 3. Fold operators inner → outer, accumulating clauses and updating col_map/visible.
+		vector<string> where_conditions;
+		string group_by_text;
+		vector<string> order_items;
+		string limit_out;
+		string offset_out;
+
+		if (filter_n) {
+			for (const auto &c : filter_n->conditions) {
+				where_conditions.push_back(SubstituteColumnTokens(c, col_map));
+			}
+			// Honor COLUMN_LIFETIME pruning when the filter is the outermost op; an
+			// overlying projection would override `visible` anyway.
+			if (!filter_n->projection_map.empty()) {
+				vector<string> pruned;
+				pruned.reserve(filter_n->projection_map.size());
+				for (auto idx : filter_n->projection_map) {
+					pruned.push_back(visible[idx]);
+				}
+				visible = std::move(pruned);
+			}
+		}
+		if (proj_bottom) {
+			unordered_map<string, string> nm;
+			vector<string> nv;
+			for (size_t i = 0; i < proj_bottom->cte_column_names.size(); i++) {
+				nm[proj_bottom->cte_column_names[i]] = SubstituteColumnTokens(proj_bottom->expressions[i], col_map);
+				nv.push_back(proj_bottom->cte_column_names[i]);
+			}
+			col_map = std::move(nm);
+			visible = std::move(nv);
+		}
+		if (agg_n) {
+			group_by_text = SubstituteColumnTokens(agg_n->group_by_clause, col_map);
+			unordered_map<string, string> nm;
+			vector<string> nv;
+			// Output columns are group keys first, then aggregate expressions
+			// (mirrors AggregateNode::ToQuery / AstToInlineSQL ordering).
+			for (size_t i = 0; i < agg_n->group_by_columns.size(); i++) {
+				nm[agg_n->cte_column_names[i]] = SubstituteColumnTokens(agg_n->group_by_columns[i], col_map);
+				nv.push_back(agg_n->cte_column_names[i]);
+			}
+			for (size_t j = 0; j < agg_n->aggregate_expressions.size(); j++) {
+				const string &out = agg_n->cte_column_names[agg_n->group_by_columns.size() + j];
+				nm[out] = SubstituteColumnTokens(agg_n->aggregate_expressions[j], col_map);
+				nv.push_back(out);
+			}
+			col_map = std::move(nm);
+			visible = std::move(nv);
+		}
+		if (proj_top) {
+			unordered_map<string, string> nm;
+			vector<string> nv;
+			for (size_t i = 0; i < proj_top->cte_column_names.size(); i++) {
+				nm[proj_top->cte_column_names[i]] = SubstituteColumnTokens(proj_top->expressions[i], col_map);
+				nv.push_back(proj_top->cte_column_names[i]);
+			}
+			col_map = std::move(nm);
+			visible = std::move(nv);
+		}
+		if (order_n) {
+			for (const auto &it : order_n->order_items) {
+				order_items.push_back(SubstituteColumnTokens(it, col_map));
+			}
+		}
+		if (limit_n) {
+			limit_out = limit_n->limit_str;
+			offset_out = limit_n->offset_str;
+		}
+
+		// 4. Build the final SELECT list and the merged node.
+		vector<string> select_exprs;
+		select_exprs.reserve(visible.size());
+		for (const auto &col : visible) {
+			auto it = col_map.find(col);
+			const string expr = (it != col_map.end()) ? it->second : col;
+			// A redundant "x AS x" is collapsed globally in CteList::ToQuery via SwallowSelfAlias.
+			select_exprs.push_back(expr + " AS " + col);
+		}
+		const size_t my_index = node_count++;
+		LPTS_DEBUG_PRINT("[LPTS-CTE] MergedSelect: block_" + std::to_string(my_index) +
+		                 " n_ops=" + std::to_string(n_ops) + " from='" + from_clause + "'");
+		return make_uniq<MergedSelectNode>(
+		    my_index, std::move(visible), std::move(select_exprs), std::move(from_clause), std::move(where_conditions),
+		    std::move(group_by_text), std::move(order_items), std::move(limit_out), std::move(offset_out));
+	}
+
+	//--------------------------------------------------------------------------
 	// FlattenNode: post-order walk → produce CteNode for each AstNode
 	//--------------------------------------------------------------------------
 	unique_ptr<CteNode> FlattenNode(const AstNode &ast_node) {
@@ -465,7 +693,7 @@ private:
 			// 3. Assign the recursive CTE's index and name; register in cte_index_to_body_info
 			//    so self-referencing CteRef nodes inside the recursive step can resolve to it.
 			const size_t rec_index = node_count++;
-			const string rec_name = "recursive_cte_" + std::to_string(rec_index);
+			const string rec_name = "t" + std::to_string(rec_index) + "_recursive_cte";
 			cte_index_to_body_info[rec.cte_table_index] = {rec_name, stripped_cols};
 			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: " + rec_name + " anchor='" + anchor_cte_name +
 			                 "' stripped_cols=[" + VecToSeparatedList(stripped_cols) + "]");
@@ -486,6 +714,15 @@ private:
 			                 rec_name + "'");
 			return make_uniq<GetNode>(scan_index, rec.output_col_names, "", "", rec_name, 0, vector<string>(),
 			                          stripped_cols);
+		}
+
+		// Pipeline fusion: try to collapse a chain of single-child pipeline operators
+		// into one flat SELECT. Runs after the special-ordering cases above (which must
+		// keep their bespoke flattening) and before the generic per-operator path.
+		if (merge_pipeline) {
+			if (auto merged = TryFlattenMergedPipeline(ast_node)) {
+				return merged;
+			}
 		}
 
 		// 1. Recurse into children first (post-order), remembering each child's CTE
@@ -646,7 +883,8 @@ private:
 	}
 
 public:
-	explicit AstFlattener(SqlDialect dialect = SqlDialect::DUCKDB) : dialect(dialect) {
+	explicit AstFlattener(SqlDialect dialect = SqlDialect::DUCKDB, bool merge_pipeline = true)
+	    : dialect(dialect), merge_pipeline(merge_pipeline) {
 	}
 
 	/// Flatten the AST rooted at `root` into a CteList.
@@ -676,13 +914,20 @@ public:
 		                                     : last_cte->cte_column_list;
 
 		for (const string &cte_col : cte_cols) {
-			// cte_col = "t1_name"  →  strip "tN_" prefix to get user-visible name.
-			const size_t underscore_pos = cte_col.find('_');
-			if (underscore_pos != string::npos && underscore_pos + 1 < cte_col.size()) {
-				final_column_list.push_back(cte_col.substr(underscore_pos + 1));
-			} else {
-				final_column_list.push_back(cte_col);
+			// Strip exactly one leading "t<digits>_" prefix (a generated table prefix) to recover the
+			// user-visible name (t1_name → name, t3_count_star → count_star). Bare names such as user
+			// aliases (e.g. "total_rev") have no such prefix and are left untouched.
+			size_t strip = 0;
+			if (cte_col.size() > 2 && cte_col[0] == 't') {
+				size_t d = 1;
+				while (d < cte_col.size() && cte_col[d] >= '0' && cte_col[d] <= '9') {
+					d++;
+				}
+				if (d > 1 && d < cte_col.size() && cte_col[d] == '_') {
+					strip = d + 1;
+				}
 			}
+			final_column_list.push_back(strip > 0 ? cte_col.substr(strip) : cte_col);
 		}
 
 		const size_t final_index = node_count++;
@@ -696,8 +941,8 @@ public:
 //==============================================================================
 // Phase 2 entry point
 //==============================================================================
-unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect) {
-	AstFlattener flattener(dialect);
+unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect, bool merge_pipeline) {
+	AstFlattener flattener(dialect, merge_pipeline);
 	return flattener.Flatten(root);
 }
 
