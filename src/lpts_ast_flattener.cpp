@@ -370,13 +370,15 @@ private:
 	// operators consumed) — the caller then falls through to the per-operator path.
 	//--------------------------------------------------------------------------
 	unique_ptr<CteNode> TryFlattenMergedPipeline(const AstNode &ast_node) {
-		// Fixed slots in canonical outer→inner order. Project appears twice
-		// (above and below the aggregate).
-		enum { S_LIMIT = 0, S_ORDER, S_PROJ_TOP, S_AGG, S_PROJ_BOTTOM, S_FILTER };
+		// Fixed slots in canonical outer→inner order. Project appears twice (above and below the
+		// aggregate). A filter appears twice too: a HAVING filter sits directly above the aggregate
+		// (post-aggregation), and a WHERE filter sits below it (pre-aggregation).
+		enum { S_LIMIT = 0, S_ORDER, S_PROJ_TOP, S_HAVING, S_AGG, S_PROJ_BOTTOM, S_FILTER };
 
 		const AstLimitNode *limit_n = nullptr;
 		const AstOrderNode *order_n = nullptr;
 		const AstProjectNode *proj_top = nullptr;
+		const AstFilterNode *having_n = nullptr;
 		const AstAggregateNode *agg_n = nullptr;
 		const AstProjectNode *proj_bottom = nullptr;
 		const AstFilterNode *filter_n = nullptr;
@@ -411,7 +413,13 @@ private:
 					agg_n = &static_cast<const AstAggregateNode &>(*cur);
 				}
 			} else if (t == "Filter") {
-				if (next_slot <= S_FILTER) {
+				// A filter directly above an aggregate is a HAVING filter (post-aggregation); only
+				// admit it when there is a GROUP BY/aggregate below. Otherwise it is a WHERE filter.
+				const bool is_having = cur->children[0]->NodeType() == "Aggregate" && next_slot <= S_HAVING;
+				if (is_having) {
+					chosen = S_HAVING;
+					having_n = &static_cast<const AstFilterNode &>(*cur);
+				} else if (next_slot <= S_FILTER) {
 					chosen = S_FILTER;
 					filter_n = &static_cast<const AstFilterNode &>(*cur);
 				}
@@ -465,8 +473,8 @@ private:
 		// an absorbed scan. A single operator with no scan to absorb has nothing to merge, so we
 		// return nullptr and let the per-operator path emit its normally-named CTE
 		// (filter_/projection_/aggregate_/order_/limit_).
-		const int n_ops = (limit_n ? 1 : 0) + (order_n ? 1 : 0) + (proj_top ? 1 : 0) + (agg_n ? 1 : 0) +
-		                  (proj_bottom ? 1 : 0) + (filter_n ? 1 : 0);
+		const int n_ops = (limit_n ? 1 : 0) + (order_n ? 1 : 0) + (proj_top ? 1 : 0) + (having_n ? 1 : 0) +
+		                  (agg_n ? 1 : 0) + (proj_bottom ? 1 : 0) + (filter_n ? 1 : 0);
 		if (n_ops + (absorb_get ? 1 : 0) < 2) {
 			return nullptr;
 		}
@@ -494,6 +502,7 @@ private:
 
 		// 3. Fold operators inner → outer, accumulating clauses and updating col_map/visible.
 		vector<string> where_conditions;
+		vector<string> having_conditions;
 		string group_by_text;
 		vector<string> order_items;
 		string limit_out;
@@ -542,6 +551,21 @@ private:
 			col_map = std::move(nm);
 			visible = std::move(nv);
 		}
+		if (having_n) {
+			// HAVING sits directly above the aggregate, so its conditions reference the aggregate's
+			// output columns — fold them with the post-aggregate map.
+			for (const auto &c : having_n->conditions) {
+				having_conditions.push_back(SubstituteColumnTokens(c, col_map));
+			}
+			if (!having_n->projection_map.empty()) {
+				vector<string> pruned;
+				pruned.reserve(having_n->projection_map.size());
+				for (auto idx : having_n->projection_map) {
+					pruned.push_back(visible[idx]);
+				}
+				visible = std::move(pruned);
+			}
+		}
 		if (proj_top) {
 			unordered_map<string, string> nm;
 			vector<string> nv;
@@ -567,16 +591,35 @@ private:
 		select_exprs.reserve(visible.size());
 		for (const auto &col : visible) {
 			auto it = col_map.find(col);
-			const string expr = (it != col_map.end()) ? it->second : col;
-			// A redundant "x AS x" is collapsed globally in CteList::ToQuery via SwallowSelfAlias.
-			select_exprs.push_back(expr + " AS " + col);
+			// Raw expression; MergedSelectNode aliases it to the output name (cte_column_list = visible),
+			// and a redundant "x AS x" is collapsed globally via SwallowSelfAlias.
+			select_exprs.push_back((it != col_map.end()) ? it->second : col);
 		}
 		const size_t my_index = node_count++;
 		LPTS_DEBUG_PRINT("[LPTS-CTE] MergedSelect: block_" + std::to_string(my_index) +
 		                 " n_ops=" + std::to_string(n_ops) + " from='" + from_clause + "'");
-		return make_uniq<MergedSelectNode>(
-		    my_index, std::move(visible), std::move(select_exprs), std::move(from_clause), std::move(where_conditions),
-		    std::move(group_by_text), std::move(order_items), std::move(limit_out), std::move(offset_out));
+		return make_uniq<MergedSelectNode>(my_index, std::move(visible), std::move(select_exprs),
+		                                   std::move(from_clause), std::move(where_conditions),
+		                                   std::move(having_conditions), std::move(group_by_text),
+		                                   std::move(order_items), std::move(limit_out), std::move(offset_out));
+	}
+
+	/// Mark a join's right (inner) side — which is always materialized in its own CTE — by appending
+	/// "_materialized_for_join" to that CTE's name. Returns the new name. The right input is referenced
+	/// only by this join, so renaming the node here keeps every reference consistent. DuckDB output
+	/// only; other dialects keep the plain CTE name.
+	string MarkRightSideMaterialized(const string &right_cte_name) {
+		if (dialect != SqlDialect::DUCKDB) {
+			return right_cte_name;
+		}
+		static const string kSuffix = "_materialized_for_join";
+		for (auto &node : cte_nodes) {
+			if (node->cte_name == right_cte_name) {
+				node->cte_name = right_cte_name + kSuffix;
+				return node->cte_name;
+			}
+		}
+		return right_cte_name; // not found (e.g. shared/registered CTE) — leave unchanged.
 	}
 
 	//--------------------------------------------------------------------------
@@ -646,9 +689,10 @@ private:
 
 			// 4. Create the DELIM_JOIN as a regular JOIN CTE.
 			const size_t my_index = node_count++;
+			const string right_name = MarkRightSideMaterialized(right_cte_name);
 			LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: join_" + std::to_string(my_index) + " LEFT='" + left_cte_name +
-			                 "' RIGHT='" + right_cte_name + "' mark_expr='" + dj.mark_expression + "'");
-			return make_uniq<JoinNode>(my_index, dj.cte_column_names, left_cte_name, right_cte_name, dj.join_type,
+			                 "' RIGHT='" + right_name + "' mark_expr='" + dj.mark_expression + "'");
+			return make_uniq<JoinNode>(my_index, dj.cte_column_names, left_cte_name, right_name, dj.join_type,
 			                           dj.conditions, dj.mark_expression);
 		}
 
@@ -788,13 +832,15 @@ private:
 
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
-			return make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], children_names[1],
-			                           join.join_type, join.conditions, join.mark_expression, join.is_asof);
+			const string right_name = MarkRightSideMaterialized(children_names[1]);
+			return make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], right_name, join.join_type,
+			                           join.conditions, join.mark_expression, join.is_asof);
 		}
 
 		if (type == "PositionalJoin") {
 			const AstPositionalJoinNode &join = static_cast<const AstPositionalJoinNode &>(ast_node);
-			return make_uniq<PositionalJoinNode>(my_index, join.cte_column_names, children_names[0], children_names[1]);
+			const string right_name = MarkRightSideMaterialized(children_names[1]);
+			return make_uniq<PositionalJoinNode>(my_index, join.cte_column_names, children_names[0], right_name);
 		}
 
 		if (type == "Sample") {

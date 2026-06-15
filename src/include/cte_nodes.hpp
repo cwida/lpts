@@ -42,6 +42,21 @@ namespace duckdb {
 //       └── ExceptNode     — EXCEPT / EXCEPT ALL
 //==============================================================================
 
+/// Structured SELECT-block clauses for a node that renders as a plain SELECT. Used by both the
+/// single-line and the pretty-printed serializers so there is one source of truth per node.
+/// `select_exprs` is positionally aligned with the node's `cte_column_list` (its output names).
+struct SelectParts {
+	bool distinct = false;
+	vector<string> select_exprs; ///< Raw SELECT expressions (no "AS"), aligned with cte_column_list.
+	string from;                 ///< FROM source (table ref, CTE name, "a JOIN b ON ...", "x USING SAMPLE ...").
+	vector<string> where_conds;  ///< Raw WHERE conditions (parens added by the renderer).
+	string group_by;             ///< GROUP BY body, or empty.
+	vector<string> having_conds; ///< Raw HAVING conditions (parens added by the renderer).
+	vector<string> order_items;  ///< ORDER BY items, or empty.
+	string limit;                ///< Rendered LIMIT expression, or empty.
+	string offset;               ///< Rendered OFFSET expression, or empty.
+};
+
 /// Base node for all nodes in the CTE list. Virtual class.
 class CteBaseNode {
 public:
@@ -73,6 +88,12 @@ class FinalReadNode : public RootNode {
 
 public:
 	vector<string> final_column_list;
+	const string &ChildCteName() const {
+		return child_cte_name;
+	}
+	const vector<string> &ChildCteColumnList() const {
+		return child_cte_column_list;
+	}
 	~FinalReadNode() override = default;
 	// Constructor. Creates the root representation of a SELECT node.
 	FinalReadNode(const size_t index, string _child_cte_name, vector<string> _child_cte_column_list,
@@ -130,6 +151,20 @@ public:
 	/// Create a CTE-like string for the Node (excluding the WITH keyword).
 	/// Example output: "t0_scan(t0_name, t0_age) AS (SELECT name, age FROM ...)"
 	string ToCteQuery(SqlDialect dialect);
+
+	/// Structured SELECT clauses for this node when it renders as a plain SELECT block. Returns false
+	/// for nodes that don't (set operations, recursive CTEs, mark joins, table functions, SELECT *).
+	/// Used both to inline this node as the final SELECT and to pretty-print it.
+	virtual bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
+		(void)dialect;
+		(void)out;
+		return false;
+	}
+
+	/// Single-line "SELECT-list items + tail" view, derived from BuildSelectParts (tail begins with
+	/// " FROM ..."). Returns false when BuildSelectParts does. `items` aligns with cte_column_list.
+	bool SelectListAndTail(SqlDialect dialect, vector<string> &items, string &tail, bool &distinct) const;
+
 	// Attributes.
 	/// The name of the CTE (e.g. "t0_scan", "t1_filter").
 	string cte_name;
@@ -150,6 +185,7 @@ class GetNode : public CteNode {
 
 public:
 	~GetNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
 	explicit GetNode(const size_t index, vector<string> cte_column_names, string _catalog, string _schema,
 	                 string _table_name, const size_t _table_index, vector<string> _table_filters,
@@ -171,6 +207,7 @@ class FilterNode : public CteNode {
 
 public:
 	~FilterNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
 	FilterNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _conditions)
 	    : CteNode(index, "t" + std::to_string(index) + "_filter", std::move(cte_column_names)),
@@ -188,6 +225,7 @@ class ProjectNode : public CteNode {
 
 public:
 	~ProjectNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
 	ProjectNode(const size_t index, vector<string> cte_column_names, string _child_cte_name,
 	            vector<string> _column_names, const size_t _table_index)
@@ -208,6 +246,7 @@ class AggregateNode : public CteNode {
 
 public:
 	~AggregateNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
 	AggregateNode(const size_t index, vector<string> cte_column_names, string _child_cte_name,
 	              vector<string> _group_names, string _group_by_clause, vector<string> _aggregate_names)
@@ -229,6 +268,7 @@ class JoinNode : public CteNode {
 
 public:
 	~JoinNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
 	JoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
 	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "", bool _is_asof = false)
@@ -260,6 +300,7 @@ class SampleNode : public CteNode {
 
 public:
 	~SampleNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	SampleNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, string _sample_clause)
 	    : CteNode(index, "t" + std::to_string(index) + "_sample", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), sample_clause(std::move(_sample_clause)) {
@@ -330,6 +371,7 @@ class OrderNode : public CteNode {
 	vector<string> order_items; ///< e.g. "t1_age DESC", "t0_name ASC"
 public:
 	~OrderNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	OrderNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _order_items)
 	    : CteNode(index, "t" + std::to_string(index) + "_order", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), order_items(std::move(_order_items)) {
@@ -347,6 +389,7 @@ class LimitNode : public CteNode {
 
 public:
 	~LimitNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	LimitNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, string _limit_str,
 	          string _offset_str, bool _limit_needs_child_scalar, bool _offset_needs_child_scalar)
 	    : CteNode(index, "t" + std::to_string(index) + "_limit", std::move(cte_column_names)),
@@ -366,6 +409,7 @@ class TopNNode : public CteNode {
 
 public:
 	~TopNNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	TopNNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, vector<string> _order_items,
 	         idx_t _limit, idx_t _offset)
 	    : CteNode(index, "t" + std::to_string(index) + "_topn", std::move(cte_column_names)),
@@ -381,6 +425,7 @@ class DistinctNode : public CteNode {
 
 public:
 	~DistinctNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	DistinctNode(const size_t index, vector<string> cte_column_names, string _child_cte_name)
 	    : CteNode(index, "t" + std::to_string(index) + "_distinct", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)) {
@@ -431,7 +476,7 @@ public:
 /// and optionally an absorbed pushdown-free base-table scan) into one statement:
 ///
 ///   SELECT <select_exprs> FROM <from_clause>
-///     [WHERE (c1) AND (c2) ...] [GROUP BY <group_by_text>]
+///     [WHERE (c1) AND (c2) ...] [GROUP BY <group_by_text>] [HAVING (h1) AND (h2) ...]
 ///     [ORDER BY <order_items>] [LIMIT <limit>] [OFFSET <offset>]
 ///
 /// All clause strings are already fully rendered (column references folded into
@@ -441,23 +486,26 @@ public:
 /// absorbed base-table scan); a single unfused operator goes through its own CteNode
 /// instead. Always named "block_N".
 class MergedSelectNode : public CteNode {
-	vector<string> select_exprs;     ///< Final SELECT list, each item already "<expr> AS <out_col>".
-	string from_clause;              ///< Table reference or child CTE name.
-	vector<string> where_conditions; ///< Folded WHERE conditions (ANDed, each parenthesized).
-	string group_by_text;            ///< Folded GROUP BY body, or empty.
-	vector<string> order_items;      ///< Folded ORDER BY items, or empty.
-	string limit_str;                ///< e.g. "10", or empty.
-	string offset_str;               ///< e.g. "5", or empty.
+	vector<string> select_exprs;      ///< Raw SELECT expressions; output names are in cte_column_list.
+	string from_clause;               ///< Table reference or child CTE name.
+	vector<string> where_conditions;  ///< Folded WHERE conditions (ANDed, each parenthesized).
+	vector<string> having_conditions; ///< Folded HAVING conditions (ANDed, each parenthesized).
+	string group_by_text;             ///< Folded GROUP BY body, or empty.
+	vector<string> order_items;       ///< Folded ORDER BY items, or empty.
+	string limit_str;                 ///< e.g. "10", or empty.
+	string offset_str;                ///< e.g. "5", or empty.
 
 public:
 	~MergedSelectNode() override = default;
+	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	MergedSelectNode(const size_t index, vector<string> cte_column_names, vector<string> _select_exprs,
-	                 string _from_clause, vector<string> _where_conditions, string _group_by_text,
-	                 vector<string> _order_items, string _limit_str, string _offset_str)
+	                 string _from_clause, vector<string> _where_conditions, vector<string> _having_conditions,
+	                 string _group_by_text, vector<string> _order_items, string _limit_str, string _offset_str)
 	    : CteNode(index, "t" + std::to_string(index) + "_block", std::move(cte_column_names)),
 	      select_exprs(std::move(_select_exprs)), from_clause(std::move(_from_clause)),
-	      where_conditions(std::move(_where_conditions)), group_by_text(std::move(_group_by_text)),
-	      order_items(std::move(_order_items)), limit_str(std::move(_limit_str)), offset_str(std::move(_offset_str)) {
+	      where_conditions(std::move(_where_conditions)), having_conditions(std::move(_having_conditions)),
+	      group_by_text(std::move(_group_by_text)), order_items(std::move(_order_items)),
+	      limit_str(std::move(_limit_str)), offset_str(std::move(_offset_str)) {
 	}
 	string ToQuery(SqlDialect dialect) override;
 };

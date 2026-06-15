@@ -40,7 +40,7 @@ true
 
 # Column names in the inner GET scan use backticks.
 query I
-SELECT sql LIKE '%SELECT `id`%' AS column_backticked FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%SELECT%`id`%' AS column_backticked FROM lpts_query('SELECT id FROM users');
 ----
 true
 

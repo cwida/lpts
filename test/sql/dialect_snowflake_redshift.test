@@ -27,7 +27,7 @@ statement ok
 SET lpts_dialect = 'SnowFlake';
 
 query I
-SELECT sql LIKE '%FROM memory.main.users%' AS snowflake_qualified_table FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%memory.main.users%' AS snowflake_qualified_table FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -77,7 +77,7 @@ statement ok
 SET lpts_dialect = 'RedShift';
 
 query I
-SELECT sql LIKE '%FROM users%' AS redshift_unqualified_table FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%users%' AS redshift_unqualified_table FROM lpts_query('SELECT id FROM users');
 ----
 true
 

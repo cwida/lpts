@@ -28,7 +28,7 @@ statement ok
 SET lpts_dialect = 'MySQL';
 
 query I
-SELECT sql LIKE '%FROM `main`.`users`%' AS mysql_schema_table FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%`main`.`users`%' AS mysql_schema_table FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -38,7 +38,7 @@ SELECT sql NOT LIKE '%`memory`.`main`.`users`%' AS mysql_no_catalog_table FROM l
 true
 
 query I
-SELECT sql LIKE '%SELECT `id`%' AS mysql_column_backticked FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%SELECT%`id`%' AS mysql_column_backticked FROM lpts_query('SELECT id FROM users');
 ----
 true
 

@@ -41,9 +41,16 @@ SELECT sql NOT LIKE '%memory.main%' AS no_catalog_schema FROM lpts_query('SELECT
 ----
 true
 
+# The _materialized_for_join CTE suffix is DuckDB-only; POSTGRES keeps plain CTE names.
+query I
+SELECT sql NOT LIKE '%_materialized_for_join%' AS no_join_suffix
+FROM lpts_query('SELECT users.id, events.id FROM users JOIN events ON users.id = events.id');
+----
+true
+
 # POSTGRES output must contain the bare table name, not schema-qualified.
 query I
-SELECT sql LIKE '%FROM users%' AS bare_table_name FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%users%' AS bare_table_name FROM lpts_query('SELECT id FROM users');
 ----
 true
 

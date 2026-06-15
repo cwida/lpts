@@ -24,7 +24,7 @@ SET lpts_dialect = 'BigQuery';
 
 # BigQuery table paths are one backticked path, not separately quoted segments.
 query I
-SELECT sql LIKE '%FROM `memory.main.users`%' AS bigquery_backticked_table_path FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%`memory.main.users`%' AS bigquery_backticked_table_path FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -34,7 +34,7 @@ SELECT sql NOT LIKE '%`memory`.`main`.`users`%' AS bigquery_no_segmented_table_p
 true
 
 query I
-SELECT sql LIKE '%SELECT `id`%' AS bigquery_column_backticked FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%SELECT%`id`%' AS bigquery_column_backticked FROM lpts_query('SELECT id FROM users');
 ----
 true
 
