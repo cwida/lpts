@@ -32,7 +32,7 @@ SELECT t1_name AS "name" FROM projection_1;
 ```
 
 LPTS plans the query through DuckDB, optimizes it, then serializes the optimized
-logical plan. For more details, check the [related report](TODO).
+logical plan. For more details, check the [related report](LPTS_Research_Project_Report.pdf).
 
 ## Supported Dialects
 
