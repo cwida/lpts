@@ -15,6 +15,16 @@
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/simplified_token.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -598,6 +608,209 @@ static void RegisterPragmaFunctionWithDescription(ExtensionLoader &loader, Pragm
 }
 
 //------------------------------------------------------------------------------
+// EXPLAIN (FORMAT SQL) <query> support.
+//
+// DuckDB has no "sql" EXPLAIN format. `EXPLAIN (FORMAT SQL) <q>` is not a libpg
+// syntax error: libpg parses it, then the transform stage throws
+// "Invalid Input Error: "sql" is not a valid FORMAT argument". That happens
+// inside the parse-succeeded branch of Parser::ParseQuery, so the
+// parse_function/plan_function parser-extension flow (which only fires when
+// libpg parsing *fails*) never sees it.
+//
+// The hook that does run before libpg is parser_override (FALLBACK mode): it is
+// tried first, and returning the default ParserOverrideResult() (DISPLAY_ORIGINAL_ERROR)
+// makes parsing fall through to normal libpg unchanged. We claim only the exact
+// `EXPLAIN ( FORMAT SQL ) <inner>` prefix and turn it into a *real* ExplainStatement, so
+// that DuckDB and every client (CLI, JDBC, Python, ...) treat it exactly like a native
+// EXPLAIN. The parser_override has no ClientContext (so it cannot run LPTS); it carries the
+// inner query through a sentinel string constant, and a companion optimizer extension below
+// runs LPTS and replaces the explain output with the generated SQL.
+//------------------------------------------------------------------------------
+
+// Detect the `EXPLAIN ( FORMAT SQL )` prefix using DuckDB's tokenizer so that
+// comments and whitespace are handled the same way the real parser handles them.
+// On a match, inner_out receives the query text following the closing ')'.
+static bool MatchExplainFormatSql(const string &query, string &inner_out) {
+	auto raw_tokens = Parser::Tokenize(query);
+
+	// Collect non-comment tokens together with their recovered text. SimplifiedToken
+	// only carries a type and a byte offset, so the text of token i is the substring
+	// from its start up to the next token's start (or end of string), trimmed.
+	struct Tok {
+		SimplifiedTokenType type;
+		idx_t start;
+		string text;
+	};
+	vector<Tok> toks;
+	for (idx_t i = 0; i < raw_tokens.size(); i++) {
+		if (raw_tokens[i].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT) {
+			continue;
+		}
+		idx_t start = raw_tokens[i].start;
+		idx_t end = (i + 1 < raw_tokens.size()) ? raw_tokens[i + 1].start : query.size();
+		string text = query.substr(start, end - start);
+		StringUtil::Trim(text);
+		toks.push_back({raw_tokens[i].type, start, std::move(text)});
+	}
+
+	if (toks.size() < 5) {
+		return false;
+	}
+
+	auto is_word = [](SimplifiedTokenType t) {
+		return t == SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD ||
+		       t == SimplifiedTokenType::SIMPLIFIED_TOKEN_IDENTIFIER;
+	};
+	auto is_operator = [&](idx_t idx, char c) {
+		return toks[idx].type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR && query[toks[idx].start] == c;
+	};
+
+	// Match: EXPLAIN ( FORMAT SQL )
+	if (!is_word(toks[0].type) || !StringUtil::CIEquals(toks[0].text, "explain")) {
+		return false;
+	}
+	if (!is_operator(1, '(')) {
+		return false;
+	}
+	if (!is_word(toks[2].type) || !StringUtil::CIEquals(toks[2].text, "format")) {
+		return false;
+	}
+	if (!is_word(toks[3].type) || !StringUtil::CIEquals(toks[3].text, "sql")) {
+		return false;
+	}
+	if (!is_operator(4, ')')) {
+		return false;
+	}
+
+	// Everything after the closing ')' is the query to explain.
+	idx_t inner_start = toks[4].start + 1;
+	if (inner_start >= query.size()) {
+		return false;
+	}
+	string inner = query.substr(inner_start);
+	StringUtil::Trim(inner);
+	if (inner.empty()) {
+		return false;
+	}
+	inner_out = std::move(inner);
+	return true;
+}
+
+// Sentinel that tags an ExplainStatement as ours and carries the inner query. We embed
+// `<sentinel><inner query>` as a string constant in the explain's inner statement; the
+// optimizer extension below recognizes the sentinel, recovers the inner query, and replaces
+// the explain output with the LPTS SQL. The 0x1F (unit separator) bytes make accidental
+// collision with a user's own constant effectively impossible.
+static const char *const LPTS_EXPLAIN_SQL_SENTINEL = "\x1F"
+                                                     "LPTS_EXPLAIN_FORMAT_SQL"
+                                                     "\x1F";
+
+// parser_override callback: intercept `EXPLAIN (FORMAT SQL) <inner>` and turn it into a real
+// ExplainStatement, so the CLI renders it borderless and all clients see EXPLAIN's 2-column
+// result. We cannot run LPTS here (no ClientContext), so we carry the inner query through the
+// sentinel constant and do the conversion in the optimizer extension (which has a context).
+static ParserOverrideResult LptsExplainSqlOverride(ParserExtensionInfo *info, const string &query,
+                                                   ParserOptions &options) {
+	string inner;
+	try {
+		if (!MatchExplainFormatSql(query, inner)) {
+			// Not our query — fall through to the normal DuckDB parser.
+			return ParserOverrideResult();
+		}
+	} catch (...) {
+		// Tokenization failed; let the normal parser report the real error.
+		return ParserOverrideResult();
+	}
+
+	try {
+		LPTS_DEBUG_PRINT("[LPTS] EXPLAIN (FORMAT SQL) intercepted, inner query: " + inner);
+		// Build a trivial inner statement whose single constant carries the sentinel + inner query.
+		// EXPLAIN of this binds to a tiny plan that the optimizer extension replaces wholesale.
+		string carrier = "SELECT '" + EscapeSingleQuotes(string(LPTS_EXPLAIN_SQL_SENTINEL) + inner) + "'";
+		Parser parser(options);
+		parser.ParseQuery(carrier);
+		if (parser.statements.empty()) {
+			return ParserOverrideResult();
+		}
+		auto explain = make_uniq<ExplainStatement>(std::move(parser.statements[0]), ExplainType::EXPLAIN_STANDARD);
+		vector<unique_ptr<SQLStatement>> statements;
+		statements.push_back(std::move(explain));
+		return ParserOverrideResult(std::move(statements));
+	} catch (std::exception &ex) {
+		return ParserOverrideResult(ex);
+	}
+}
+
+// Recursively search a logical operator subtree for a VARCHAR constant beginning with the
+// LPTS sentinel. On success, returns true and sets inner_out to the carried inner query.
+static bool FindLptsExplainSentinel(LogicalOperator &op, string &inner_out) {
+	const string sentinel = LPTS_EXPLAIN_SQL_SENTINEL;
+	bool found = false;
+	for (auto &expr : op.expressions) {
+		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
+			if (found || child.type != ExpressionType::VALUE_CONSTANT) {
+				return;
+			}
+			auto &constant = child.Cast<BoundConstantExpression>();
+			if (constant.value.type().id() != LogicalTypeId::VARCHAR || constant.value.IsNull()) {
+				return;
+			}
+			auto str = StringValue::Get(constant.value);
+			if (StringUtil::StartsWith(str, sentinel)) {
+				inner_out = str.substr(sentinel.size());
+				found = true;
+			}
+		});
+		if (found) {
+			return true;
+		}
+	}
+	for (auto &child : op.children) {
+		if (FindLptsExplainSentinel(*child, inner_out)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Optimizer extension: when the plan is an EXPLAIN carrying our sentinel, run the LPTS pipeline
+// on the inner query and replace the whole plan with a single ("logical_plan", <SQL>) row. The
+// statement type stays EXPLAIN_STATEMENT, so the CLI renders the value verbatim (borderless).
+static void LptsExplainSqlOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (plan->type != LogicalOperatorType::LOGICAL_EXPLAIN) {
+		return;
+	}
+	string inner;
+	if (!FindLptsExplainSentinel(*plan, inner)) {
+		// A normal EXPLAIN, not ours — leave it untouched.
+		return;
+	}
+	LPTS_DEBUG_PRINT("[LPTS] EXPLAIN (FORMAT SQL) optimizer hook, inner query: " + inner);
+
+	// Run the exact same pipeline as PRAGMA lpts. Any failure (catalog error, unsupported
+	// operator, ...) propagates as a normal query error, just like the inner query would error.
+	auto inner_plan = PlanQuery(input.context, inner);
+	SqlDialect dialect = ReadDialect(input.context);
+	auto ast = LogicalPlanToAst(input.context, inner_plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
+	string sql = cte_list->ToQuery(true);
+
+	vector<LogicalType> types {LogicalType::VARCHAR, LogicalType::VARCHAR};
+	auto collection = make_uniq<ColumnDataCollection>(input.context, types);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(input.context), types);
+	// Key "logical_opt" makes the CLI print the "Optimized Logical Plan" caption, which is
+	// accurate: LPTS serializes the optimized logical plan. Clients see it as explain_value.
+	chunk.SetValue(0, 0, Value("logical_opt"));
+	chunk.SetValue(1, 0, Value(sql));
+	chunk.SetCardinality(1);
+	collection->Append(chunk);
+
+	idx_t table_index = input.optimizer.binder.GenerateTableIndex();
+	plan = make_uniq<LogicalColumnDataGet>(table_index, std::move(types), std::move(collection));
+}
+
+//------------------------------------------------------------------------------
 // Extension loading
 //------------------------------------------------------------------------------
 
@@ -675,6 +888,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    loader, std::move(print_ast_table),
 	    "Table-function form of PRAGMA print_ast. Returns the rendered AST tree as a single ast column.",
 	    {"SELECT ast FROM print_ast_query('SELECT name FROM users WHERE age > 25')"});
+
+	// Enable `EXPLAIN (FORMAT SQL) <query>`. Two cooperating hooks, no submodule changes:
+	//   1. A parser override (FALLBACK mode: consulted before normal parsing, declines everything
+	//      except our exact prefix) rewrites the query into a real ExplainStatement carrying the
+	//      inner query via a sentinel constant — so it is a genuine EXPLAIN for every client.
+	//   2. An optimizer extension recognizes that sentinel, runs LPTS, and replaces the explain
+	//      output with the generated SQL.
+	ParserExtension explain_sql_ext;
+	explain_sql_ext.parser_override = LptsExplainSqlOverride;
+	ParserExtension::Register(config, std::move(explain_sql_ext));
+	config.SetOptionByName("allow_parser_override_extension", Value("fallback"));
+
+	OptimizerExtension explain_sql_opt;
+	explain_sql_opt.pre_optimize_function = LptsExplainSqlOptimize;
+	OptimizerExtension::Register(config, std::move(explain_sql_opt));
 }
 
 void LptsExtension::Load(ExtensionLoader &loader) {

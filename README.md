@@ -34,6 +34,34 @@ SELECT t1_name AS "name" FROM projection_1;
 LPTS plans the query through DuckDB, optimizes it, then serializes the optimized
 logical plan. For more details, check the [related report](LPTS_Research_Project_Report.pdf).
 
+## `EXPLAIN (FORMAT SQL)`
+
+LPTS extends DuckDB's `EXPLAIN` with a `SQL` format. `EXPLAIN (FORMAT SQL) <query>`
+returns the optimized logical plan rendered as equivalent CTE SQL — the same output as
+`PRAGMA lpts`, but exposed as a first-class `EXPLAIN` statement (similar to the
+plan-as-SQL output in Umbra).
+
+```sql
+EXPLAIN (FORMAT SQL) SELECT name FROM users WHERE age > 25;
+```
+
+```text
+┌─────────────────────────────┐
+│┌───────────────────────────┐│
+││  Optimized Logical Plan   ││
+│└───────────────────────────┘│
+└─────────────────────────────┘
+WITH scan_0 (t0_name) AS (SELECT "name" FROM memory.main.users WHERE age>25),
+projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
+SELECT t1_name AS "name" FROM projection_1;
+```
+
+Because it is a genuine `EXPLAIN` statement, every client treats it like any other
+`EXPLAIN`: the CLI prints the SQL as plain multi-line text (no result box), while JDBC,
+Python, and other clients receive the standard two-column (`explain_key`, `explain_value`)
+EXPLAIN result with the SQL in `explain_value`. It honors `lpts_dialect` just like
+`PRAGMA lpts`, and a query that cannot be planned or converted raises a normal error.
+
 ## Supported Dialects
 
 The dialect settings accept these values:
@@ -54,6 +82,7 @@ The dialect settings accept these values:
 
 | Function | Description |
 |---|---|
+| `EXPLAIN (FORMAT SQL) query` | Explain a query as equivalent CTE SQL, via a real `EXPLAIN` statement |
 | `PRAGMA lpts('query')` | Return generated CTE SQL |
 | `lpts_query('query')` | Table-function form of `PRAGMA lpts` |
 | `PRAGMA lpts_exec('query')` | Execute the generated SQL |
