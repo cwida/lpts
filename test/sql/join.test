@@ -374,3 +374,15 @@ true
 query ITRI
 PRAGMA lpts_exec('SELECT a, b, c, d FROM typed LIMIT 0');
 ----
+
+# --- the right (inner) side of a join is materialized in a CTE marked with a suffix ---
+query I
+SELECT sql LIKE '%_materialized_for_join (%' AND sql LIKE '%JOIN%_materialized_for_join %'
+FROM lpts_query('SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id');
+----
+true

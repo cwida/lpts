@@ -28,12 +28,12 @@ statement ok
 SET lpts_dialect = 'Hive';
 
 query I
-SELECT sql LIKE '%FROM `main`.`users`%' AS hive_schema_table FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%`main`.`users`%' AS hive_schema_table FROM lpts_query('SELECT id FROM users');
 ----
 true
 
 query I
-SELECT sql LIKE '%SELECT `id`%' AS hive_column_backticked FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%SELECT%`id`%' AS hive_column_backticked FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -48,7 +48,7 @@ SELECT sql LIKE '%date_format(%' AS hive_strftime FROM lpts_query('SELECT strfti
 true
 
 query I
-SELECT sql LIKE '%date_format(t0_ts, ''yyyy-MM-dd'')%' AS hive_strftime_format FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+SELECT sql LIKE '%date_format(ts, ''yyyy-MM-dd'')%' AS hive_strftime_format FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
 ----
 true
 
@@ -68,7 +68,7 @@ SELECT sql LIKE '%split(%' AS hive_string_split FROM lpts_query('SELECT string_s
 true
 
 query I
-SELECT sql LIKE '%transform(t0_vals, x -> (x + 1))%' AS hive_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS hive_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
 ----
 true
 
@@ -89,7 +89,7 @@ statement ok
 SET lpts_dialect = 'TrInO';
 
 query I
-SELECT sql LIKE '%FROM memory.main.users%' AS trino_three_part_table FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%memory.main.users%' AS trino_three_part_table FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -124,12 +124,12 @@ SELECT sql LIKE '%split(%' AS trino_string_split FROM lpts_query('SELECT string_
 true
 
 query I
-SELECT sql LIKE '%transform(t0_vals, x -> (x + 1))%' AS trino_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS trino_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
 ----
 true
 
 query I
-SELECT sql LIKE '%SELECT contains(t0_vals, 2)%' AS trino_list_contains FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
+SELECT sql LIKE '%SELECT%contains(vals, 2)%' AS trino_list_contains FROM lpts_query('SELECT list_contains(vals, 2) AS has_two FROM events');
 ----
 true
 

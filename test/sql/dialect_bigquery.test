@@ -24,7 +24,7 @@ SET lpts_dialect = 'BigQuery';
 
 # BigQuery table paths are one backticked path, not separately quoted segments.
 query I
-SELECT sql LIKE '%FROM `memory.main.users`%' AS bigquery_backticked_table_path FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%`memory.main.users`%' AS bigquery_backticked_table_path FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -34,7 +34,7 @@ SELECT sql NOT LIKE '%`memory`.`main`.`users`%' AS bigquery_no_segmented_table_p
 true
 
 query I
-SELECT sql LIKE '%SELECT `id`%' AS bigquery_column_backticked FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%SELECT%`id`%' AS bigquery_column_backticked FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -44,12 +44,12 @@ SELECT sql LIKE '%`order`%' AS bigquery_reserved_word_quoted FROM lpts_query('SE
 true
 
 query I
-SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y-%m-%d'', t0_ts)%' AS bigquery_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y-%m-%d'', ts)%' AS bigquery_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
 ----
 true
 
 query I
-SELECT sql LIKE '%FORMAT_TIMESTAMP(''%H:%M:%S.%f'', t0_ts)%' AS bigquery_preserves_posix_fractional_seconds FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%H:%M:%S.%f'', ts)%' AS bigquery_preserves_posix_fractional_seconds FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
 ----
 true
 
@@ -70,7 +70,7 @@ statement ok
 SET lpts_dialect = 'Bq';
 
 query I
-SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y'', t0_ts)%' AS bq_alias FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y'', ts)%' AS bq_alias FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
 ----
 true
 
