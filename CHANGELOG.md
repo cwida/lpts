@@ -321,8 +321,8 @@
 - `EXPLAIN (FORMAT SQL) <query>` renders the optimized logical plan as equivalent CTE SQL
   (the same output as `PRAGMA lpts`), exposed as a genuine `EXPLAIN` statement. The CLI
   prints it as plain multi-line text and other clients (JDBC, Python, ...) receive the
-  standard two-column `explain_key`/`explain_value` EXPLAIN result, similar to Umbra's
-  plan-as-SQL output. Honors `lpts_dialect`. Implemented without changes to DuckDB core.
+  standard two-column `explain_key`/`explain_value` EXPLAIN result. Honors `lpts_dialect`.
+  Implemented without changes to DuckDB core.
 
 ### Changed
 
