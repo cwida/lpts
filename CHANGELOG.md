@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Bumped the DuckDB target from `v1.5.3` to `v1.5.4` (submodule and CI). The 1.5.4
+  optimizer pushes trivial projections/filters into the scan, so single-table
+  `EXPLAIN (FORMAT SQL)` plans may collapse to a plain `SELECT` with no CTE; round-trip
+  correctness is unchanged.
+
 ### Added
 
 - `EXPLAIN (FORMAT SQL) <query>` renders the optimized logical plan as equivalent CTE SQL
