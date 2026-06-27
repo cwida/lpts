@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(build/release/duckdb)"
+      "Bash(build/release/duckdb)",
+      "Bash(LPTS_CHECK_TRACE=1 build/release/duckdb -unsigned)",
+      "Bash(build/release/duckdb -unsigned)",
+      "Bash(build/release/test/unittest --help)",
+      "Bash(build/release/test/unittest --list-test-names-only)"
     ]
   }
 }
