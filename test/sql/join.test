@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR);
 
 statement ok
@@ -19,70 +22,58 @@ INSERT INTO orders VALUES (1, 1, 100.0), (2, 1, 200.0), (3, 2, 150.0);
 # --- INNER JOIN: only rows with matches on both sides ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id');
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;
 ----
 Alice	100.0
 Alice	200.0
 Bob	150.0
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;
 
 # --- INNER JOIN with filter: WHERE applied after join ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100');
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100;
 ----
 Alice	200.0
 Bob	150.0
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100;
 
 # --- LEFT JOIN: all left rows kept; Carol has no orders so amount is NULL ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id');
+SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;
 ----
 Alice	100.0
 Alice	200.0
 Bob	150.0
 Carol	NULL
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;
 
 # --- LEFT JOIN with IS NULL: find users with no orders ---
 
 query I
-PRAGMA lpts_exec('SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.id IS NULL');
+SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.id IS NULL;
 ----
 Carol
 
-query I
-PRAGMA lpts_check('SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.id IS NULL');
-----
-true
+statement ok
+SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.id IS NULL;
 
 # --- RIGHT JOIN: DuckDB rewrites internally; all order rows kept ---
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u RIGHT JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u RIGHT JOIN orders o ON u.id = o.user_id;
 
 # --- FULL OUTER JOIN: all rows from both sides ---
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id;
 
 # --- ASOF JOIN: nearest prior row on the RHS ---
 
@@ -104,15 +95,11 @@ INSERT INTO prices VALUES
 	('A', '2026-01-01 10:15:00', 110),
 	('B', '2026-01-01 10:00:00', 200);
 
-query I
-PRAGMA lpts_check('SELECT t.symbol, t.ts, p.price FROM trades t ASOF JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts');
-----
-true
+statement ok
+SELECT t.symbol, t.ts, p.price FROM trades t ASOF JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts;
 
-query I
-PRAGMA lpts_check('SELECT t.symbol, t.ts, p.price FROM trades t ASOF LEFT JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts');
-----
-true
+statement ok
+SELECT t.symbol, t.ts, p.price FROM trades t ASOF LEFT JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts;
 
 # --- POSITIONAL JOIN: row-wise pairing ---
 
@@ -128,10 +115,8 @@ INSERT INTO pos_left VALUES (1), (2), (3);
 statement ok
 INSERT INTO pos_right VALUES ('x'), ('y');
 
-query I
-PRAGMA lpts_check('SELECT a, b FROM pos_left POSITIONAL JOIN pos_right ORDER BY a NULLS LAST, b NULLS LAST');
-----
-true
+statement ok
+SELECT a, b FROM pos_left POSITIONAL JOIN pos_right ORDER BY a NULLS LAST, b NULLS LAST;
 
 # --- JOIN with computed expression in projection ---
 
@@ -148,92 +133,72 @@ statement ok
 INSERT INTO bonus VALUES ('eng', 5000), ('sales', 6000);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT s.id, s.salary + b.amount FROM staff s JOIN bonus b ON s.dept = b.dept');
+SELECT s.id, s.salary + b.amount FROM staff s JOIN bonus b ON s.dept = b.dept;
 ----
 1	55000
 2	66000
 3	60000
 
-query I
-PRAGMA lpts_check('SELECT s.id, s.salary + b.amount FROM staff s JOIN bonus b ON s.dept = b.dept');
-----
-true
+statement ok
+SELECT s.id, s.salary + b.amount FROM staff s JOIN bonus b ON s.dept = b.dept;
 
 # --- JOIN on string column ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT s.dept, s.salary FROM staff s JOIN bonus b ON s.dept = b.dept');
+SELECT s.dept, s.salary FROM staff s JOIN bonus b ON s.dept = b.dept;
 ----
 eng	50000
 eng	55000
 sales	60000
 
-query I
-PRAGMA lpts_check('SELECT s.dept, s.salary FROM staff s JOIN bonus b ON s.dept = b.dept');
-----
-true
+statement ok
+SELECT s.dept, s.salary FROM staff s JOIN bonus b ON s.dept = b.dept;
 
 # --- JOIN with GROUP BY on joined result ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT s.dept, sum(s.salary) FROM staff s JOIN bonus b ON s.dept = b.dept GROUP BY s.dept');
+SELECT s.dept, sum(s.salary) FROM staff s JOIN bonus b ON s.dept = b.dept GROUP BY s.dept;
 ----
 eng	105000
 sales	60000
 
-query I
-PRAGMA lpts_check('SELECT s.dept, sum(s.salary) FROM staff s JOIN bonus b ON s.dept = b.dept GROUP BY s.dept');
-----
-true
+statement ok
+SELECT s.dept, sum(s.salary) FROM staff s JOIN bonus b ON s.dept = b.dept GROUP BY s.dept;
 
 # --- Self-join: join a table with itself ---
 
-query I
-PRAGMA lpts_check('SELECT a.name, b.name FROM users a JOIN users b ON a.id != b.id AND a.id < b.id');
-----
-true
+statement ok
+SELECT a.name, b.name FROM users a JOIN users b ON a.id != b.id AND a.id < b.id;
 
 # Duplicate column names across tables (projection deduplication)
-query I
-PRAGMA lpts_check('SELECT u.id, o.id FROM users u INNER JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.id, o.id FROM users u INNER JOIN orders o ON u.id = o.user_id;
 
-query I
-PRAGMA lpts_check('SELECT u.id, o.id, s.id FROM users u, orders o, staff s');
-----
-true
+statement ok
+SELECT u.id, o.id, s.id FROM users u, orders o, staff s;
 
 # Self-join (same table twice — same column names)
-query I
-PRAGMA lpts_check('SELECT a.id, b.id, a.name FROM users a INNER JOIN users b ON a.id = b.id');
-----
-true
+statement ok
+SELECT a.id, b.id, a.name FROM users a INNER JOIN users b ON a.id = b.id;
 
 # --- CROSS JOIN: Cartesian product ---
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u CROSS JOIN orders o');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u CROSS JOIN orders o;
 
 # --- Implicit join syntax (comma): equivalent to CROSS JOIN ---
 
-query I
-PRAGMA lpts_check('SELECT u.name, s.salary FROM users u, staff s');
-----
-true
+statement ok
+SELECT u.name, s.salary FROM users u, staff s;
 
 # --- Three-way JOIN ---
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount, s.salary FROM users u JOIN orders o ON u.id = o.user_id JOIN staff s ON u.id = s.id');
-----
-true
+statement ok
+SELECT u.name, o.amount, s.salary FROM users u JOIN orders o ON u.id = o.user_id JOIN staff s ON u.id = s.id;
 
 # --- UNION ALL of two JOIN results ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id');
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;
 ----
 Alice	100.0
 Alice	100.0
@@ -242,10 +207,8 @@ Alice	200.0
 Bob	150.0
 Bob	150.0
 
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;
 
 # ============================================================
 # MARK JOIN: IN subquery
@@ -266,34 +229,28 @@ INSERT INTO t2 VALUES (1), (3);
 # --- IN subquery: rows in t1 whose id appears in t2 ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2)');
+SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2);
 ----
 1	10
 3	30
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2)');
-----
-true
+statement ok
+SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2);
 
 # --- NOT IN subquery: rows in t1 whose id does not appear in t2 ---
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t1 WHERE id NOT IN (SELECT id FROM t2)');
+SELECT id, val FROM t1 WHERE id NOT IN (SELECT id FROM t2);
 ----
 2	20
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t1 WHERE id NOT IN (SELECT id FROM t2)');
-----
-true
+statement ok
+SELECT id, val FROM t1 WHERE id NOT IN (SELECT id FROM t2);
 
 # --- IN subquery with aggregate ---
 
-query I
-PRAGMA lpts_check('SELECT id FROM t1 WHERE id IN (SELECT MAX(id) FROM t2)');
-----
-true
+statement ok
+SELECT id FROM t1 WHERE id IN (SELECT MAX(id) FROM t2);
 
 # ============================================================
 # MARK JOIN: duplicate RHS values must not produce extra rows
@@ -311,15 +268,13 @@ INSERT INTO t2_dups VALUES (1), (1), (3);
 
 # Without SELECT DISTINCT on the RHS, id=1 would appear twice in the output.
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2_dups)');
+SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2_dups);
 ----
 1	10
 3	30
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2_dups)');
-----
-true
+statement ok
+SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2_dups);
 
 # ============================================================
 # LOGICAL_EMPTY_RESULT: optimizer collapses to empty
@@ -327,35 +282,29 @@ true
 
 # --- LIMIT 0 on a join ---
 
-query I
-PRAGMA lpts_check('SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 0');
-----
-true
+statement ok
+SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 0;
 
 query II
-PRAGMA lpts_exec('SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 0');
+SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.id = t2.id LIMIT 0;
 ----
 
 # --- Unsatisfiable WHERE clause ---
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t1 WHERE 1 = 2');
-----
-true
+statement ok
+SELECT id, val FROM t1 WHERE 1 = 2;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t1 WHERE 1 = 2');
+SELECT id, val FROM t1 WHERE 1 = 2;
 ----
 
 # --- Empty result on one side of a JOIN ---
 
-query I
-PRAGMA lpts_check('SELECT t1.id FROM t1 JOIN (SELECT id FROM t2 WHERE 1 = 2) sub ON t1.id = sub.id');
-----
-true
+statement ok
+SELECT t1.id FROM t1 JOIN (SELECT id FROM t2 WHERE 1 = 2) sub ON t1.id = sub.id;
 
 query I
-PRAGMA lpts_exec('SELECT t1.id FROM t1 JOIN (SELECT id FROM t2 WHERE 1 = 2) sub ON t1.id = sub.id');
+SELECT t1.id FROM t1 JOIN (SELECT id FROM t2 WHERE 1 = 2) sub ON t1.id = sub.id;
 ----
 
 # --- Empty result with multiple column types ---
@@ -366,13 +315,11 @@ CREATE TABLE typed (a INTEGER, b VARCHAR, c DOUBLE, d BOOLEAN);
 statement ok
 INSERT INTO typed VALUES (1, 'hello', 3.14, true);
 
-query I
-PRAGMA lpts_check('SELECT a, b, c, d FROM typed LIMIT 0');
-----
-true
+statement ok
+SELECT a, b, c, d FROM typed LIMIT 0;
 
 query ITRI
-PRAGMA lpts_exec('SELECT a, b, c, d FROM typed LIMIT 0');
+SELECT a, b, c, d FROM typed LIMIT 0;
 ----
 
 # --- the right (inner) side of a join is materialized in a CTE marked with a suffix ---
@@ -382,7 +329,5 @@ FROM lpts_query('SELECT users.name, orders.amount FROM users JOIN orders ON user
 ----
 true
 
-query I
-PRAGMA lpts_check('SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id');
-----
-true
+statement ok
+SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id;

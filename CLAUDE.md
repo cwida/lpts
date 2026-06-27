@@ -17,13 +17,13 @@ git submodule update --init .claude/skills/shared
 
 When you're stuck — either unable to fix a bug after 2-3 attempts, or tempted to work around the actual problem by redefining the objective — **stop and ask the user for directions**. Explain clearly what the specific problem is (e.g., "AstToCteList produces wrong column names for a 3-way join — should I fix the AstJoinNode output ordering or adjust the CTE binding map?"). The user knows this codebase deeply and can often point you to the right solution in one sentence. Do not silently change the goal, declare something impossible, or add bloated workarounds without consulting first. We work as a team.
 
-Always test your changes with real queries (e.g., create a table, run `PRAGMA lpts(...)`, check the SQL output, then run `PRAGMA lpts_exec(...)` to verify results) before declaring success, not just unit tests.
+Always test your changes with real queries (e.g., create a table, run `PRAGMA lpts(...)` to check the SQL output, then `SET lpts_check = true` and run the query directly to verify round-trip correctness) before declaring success, not just unit tests.
 
 **Only run the SQLStorm benchmark when a feature is fully done or before pushing.** Do not run it during iterative development — it takes several minutes even at the smallest scale factor. Run it like this:
 ```bash
 build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10
 ```
-The benchmark runs all 17036 SQLStorm TPC-H queries through `lpts_check` and prints a summary (success %, not-implemented breakdown, etc.). A regression — fewer `SUCCESS` results than the previous baseline — must be investigated before pushing.
+The benchmark runs all 17036 SQLStorm TPC-H queries with `lpts_check` enabled (each query re-run under `SET lpts_check = true` for round-trip verification) and prints a summary (success %, not-implemented breakdown, etc.). A regression — fewer `SUCCESS` results than the previous baseline — must be investigated before pushing.
 
 Never execute git commands that could lose code. Always ask the user for permission on those.
 
@@ -32,7 +32,7 @@ Never execute git commands that could lose code. Always ask the user for permiss
 - **New features must have tests.** Ask the user whether to create a new test file or extend an existing one in `test/sql/`.
 - **Never remove a failing test to "fix" a failure.** If a test fails, fix the underlying bug. Tests exist for a reason.
 - **Only change `src/` and `test/` files** unless explicitly told otherwise. Do not touch CMakeLists.txt, Makefile, vcpkg.json, or any other project infrastructure files.
-- **Every `lpts_check` test in a test file MUST verify round-trip correctness**, not just that the function runs without error. The result must be `true` — meaning the LPTS-generated SQL, when executed, returns the same bag of results as the original query.
+- **Every test file MUST verify round-trip correctness**, not just that queries run without error. Set `SET lpts_check = true` once after `require lpts`, then run the query directly — LPTS transparently compares the original and the rewritten query and raises an error on a mismatch.
 - **Before implementing anything, search the existing codebase** for similar patterns or solutions. Check `src/logical_plan_to_sql.cpp` (`CreateCteNode`) as the canonical reference for operator-specific logic. Reuse before reinventing.
 - **Use helper functions.** Factor shared logic into helpers. Check `src/lpts_helpers.cpp` and `src/include/lpts_helpers.hpp` for existing utilities (`VecToSeparatedList`, `EscapeSingleQuotes`, etc.).
 - **Never edit the `duckdb/` submodule.** The DuckDB source is read-only. All LPTS logic lives in `src/` and `test/`.
@@ -76,8 +76,8 @@ make shell
 # Inside the shell:
 D CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 D PRAGMA lpts('SELECT name FROM users WHERE age > 25');
-D PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');   -- must return true
-D PRAGMA lpts_exec('SELECT name FROM users WHERE age > 25');    -- must match original
+D SET lpts_check = true;                                        -- turn on round-trip checking
+D SELECT name FROM users WHERE age > 25;                        -- runs normally; raises if rewritten wrong
 ```
 
 ## Architecture
@@ -106,8 +106,10 @@ Flattens the AST tree (post-order / bottom-up) into an ordered list of `CteNode`
 |---|---|---|
 | `PRAGMA lpts('query')` | Interactive | Returns CTE SQL for the given query |
 | `lpts_query('query')` | Table function / tests | Same as above, usable in SELECT |
-| `PRAGMA lpts_exec('query')` | Interactive / tests | Runs LPTS-transformed query, returns results |
-| `PRAGMA lpts_check('query')` | Tests | Round-trip check: returns `true` if LPTS output matches original query |
+| `PRAGMA print_ast('query')` | Interactive | Prints the AST tree |
+| `print_ast_query('query')` | Table function / tests | AST tree as a table row |
+| `lpts_normalize_query('query')` | Table function / tests | Input-dialect SQL normalized to DuckDB SQL |
+| `SET lpts_check = true` | Interactive / tests | Round-trip check: every top-level `SELECT` runs normally and raises if LPTS rewrites it wrong |
 
 Both `lpts` and `lpts_query` call the same pipeline:
 ```cpp
@@ -192,7 +194,8 @@ CteBaseNode (base)
 | `test/sql/functions.test` | Scalar functions, casts |
 | `test/sql/lambda.test` | Lambda expressions |
 | `test/sql/print_ast.test` | AST `ToString()` output |
-| `test/sql/pragmas.test` | `lpts_exec`, `lpts_check` round-trip correctness |
+| `test/sql/check_mode.test` | `lpts_check` round-trip correctness (canonical example) |
+| `test/sql/pragmas.test` | Public function metadata (5 functions) |
 
 ### Test structure conventions
 
@@ -205,31 +208,35 @@ Each test uses the DuckDB SQL logic test format:
 require lpts
 
 statement ok
+SET lpts_check = true;
+
+statement ok
 CREATE TABLE t (id INT, val INT);
 
-query I
-PRAGMA lpts_check('SELECT * FROM t');
-----
-true
+statement ok
+INSERT INTO t VALUES (1, 10);
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t');
+SELECT id, val FROM t;
 ----
 1    10
 ```
 
+The canonical example test file is `test/sql/check_mode.test`.
+
 ### Key test functions
 
-- **`PRAGMA lpts_check('query')`** — the primary correctness test. Returns `true` if the LPTS-generated SQL, when executed, produces the exact same bag of results as the original query. **Every new test must include at least one `lpts_check`.**
-- **`PRAGMA lpts_exec('query')`** — executes the LPTS-generated SQL and returns results. Use to verify concrete output values.
-- **`lpts_query('query')`** — returns the generated SQL string. Use when you need to assert the exact SQL structure.
+- **`SET lpts_check = true`** — the primary correctness mechanism. Set once after `require lpts`, then run queries directly. Every top-level `SELECT` is transparently rewritten by LPTS and compared against the original; a wrong rewrite raises an error and fails the test. **Every new test must turn on `lpts_check` and exercise the feature with a bare query.**
+  - Use a bare `SELECT ...;` with a `query` block to also assert rows, or `statement ok` when no row assertion is needed.
+  - A query LPTS rewrites wrong is a `statement error` whose expected text contains `LPTS check failed`.
+- **`lpts_query('query')`** — returns the generated SQL string. Use when you need to assert the exact SQL structure, or for input-dialect tests (MySQL/Spark/etc.) that cannot run as bare DuckDB statements: assert through `SELECT sql FROM lpts_query('...')`.
 
 ### TPC-H coverage queries
 
 The file `tpch-umbra-flat-cte-list.txt` (in the repository root or provided separately) contains all 22 TPC-H queries paired with their expected flat-CTE SQL output as generated by Umbra. These are high-value regression tests for multi-table joins, aggregations, subqueries, and complex filters.
 
 When adding TPC-H tests:
-- Use `PRAGMA lpts_check(...)` to verify round-trip correctness on TPC-H tables
+- Set `SET lpts_check = true` once, then run each TPC-H query directly to verify round-trip correctness on TPC-H tables
 - TPC-H tables are: `lineitem`, `orders`, `customer`, `part`, `partsupp`, `supplier`, `nation`, `region`
 - Each test file should `LOAD tpch` and call `CALL dbgen(sf=0.01)` to generate data at a small scale factor
 - Focus on queries that exercise operators the current AST layer supports (start with Q1 for aggregates, Q3/Q5 for multi-way joins)
@@ -244,12 +251,13 @@ require lpts
 require tpch
 
 statement ok
+SET lpts_check = true;
+
+statement ok
 CALL dbgen(sf=0.01);
 
-query I
-PRAGMA lpts_check('SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, count(*) AS count_order FROM lineitem WHERE l_shipdate <= CAST(''1998-09-02'' AS date) GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus');
-----
-true
+statement ok
+SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, count(*) AS count_order FROM lineitem WHERE l_shipdate <= CAST('1998-09-02' AS date) GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
 ```
 
 ### SQL Storm coverage queries
@@ -259,7 +267,7 @@ The `SQL-Storm-queries/` directory contains 1000 SQL queries (files `100.sql` th
 When adding SQL Storm tests:
 - Select a representative sample (e.g., 10–20 queries that exercise different operator combinations)
 - Prioritize queries using only operators the AST layer currently supports (JOIN, GROUP BY, FILTER, PROJECTION)
-- Use `lpts_check` to verify correctness; queries that hit unsupported operators will throw `NotImplementedException` (expected during incremental development)
+- Turn on `lpts_check` and run each query directly to verify correctness; queries that hit unsupported operators will throw `NotImplementedException` (expected during incremental development)
 - Document which operators each test query exercises in a comment above the test
 
 ## Debugging
@@ -298,6 +306,10 @@ Run `make format-fix` to auto-format. The project uses DuckDB's `.clang-format` 
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `lpts_dialect` | VARCHAR | `"duckdb"` | SQL output dialect: `"duckdb"` or `"postgres"` |
+| `lpts_input_dialect` | VARCHAR | `"duckdb"` | Input dialect normalized before DuckDB parses the query |
+| `lpts_check` | BOOLEAN | `false` | Transparently verify round-trip correctness of every top-level `SELECT` |
+
+`lpts_check` strict mode raises `Invalid Input Error: LPTS check failed: ...` on a result mismatch and `Invalid Input Error: LPTS check: unsupported query (LPTS could not check it): ...` when LPTS cannot rewrite the query; nondeterministic queries are detected and pass. Setting the `LPTS_CHECK_LOG` environment variable to a file path switches to log mode: LPTS never raises and instead appends one line per intercepted `SELECT` — `<n> FAIL` (could not rewrite), `<n> OK` (bags matched), `<n> WRONG` (bags differed), or `<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, with the heuristic's explanation).
 
 ## DDL / usage examples
 
@@ -308,11 +320,9 @@ PRAGMA lpts('SELECT name FROM users WHERE age > 25');
 -- Convert via table function (for tests / scripting)
 SELECT sql FROM lpts_query('SELECT name FROM users WHERE age > 25');
 
--- Round-trip correctness check
-PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');  -- returns true
-
--- Execute the LPTS-generated SQL, return results
-PRAGMA lpts_exec('SELECT name FROM users WHERE age > 25');
+-- Turn on round-trip checking, then run the query directly
+SET lpts_check = true;
+SELECT name FROM users WHERE age > 25;   -- runs normally; raises if rewritten wrong
 
 -- Switch to Postgres dialect
 SET lpts_dialect = 'postgres';

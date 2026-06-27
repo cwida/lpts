@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Removed
+
+- `PRAGMA lpts_exec('query')`, the boolean-returning `PRAGMA lpts_check('query')`, and
+  the `lpts_check_log` setting. Round-trip verification is now driven by the `lpts_check`
+  session setting (see Added).
+
+### Added
+
+- `lpts_check` BOOLEAN session setting (default `false`). With `SET lpts_check = true`,
+  every top-level `SELECT` is intercepted: LPTS runs the original and the rewritten query
+  side by side and compares their result bags with an order-independent hash. The query
+  returns its normal rows unchanged. Strict mode raises `Invalid Input Error: LPTS check
+  failed: ...` on a mismatch and `Invalid Input Error: LPTS check: unsupported query
+  (LPTS could not check it): ...` when LPTS cannot rewrite the query; nondeterministic
+  queries are detected and pass. If the `LPTS_CHECK_LOG` environment variable points to a
+  file, LPTS never raises and instead appends `<n> OK`, `<n> OK WRONG`, or `<n> FAIL` per
+  intercepted `SELECT`. Queries reading LPTS's own table functions and queries under
+  statement verification are skipped.
+
 ### Changed
 
 - Bumped the DuckDB target from `v1.5.3` to `v1.5.4` (submodule and CI). The 1.5.4

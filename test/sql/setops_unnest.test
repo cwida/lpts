@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE left_t (id INTEGER, label VARCHAR);
 
 statement ok
@@ -16,60 +19,42 @@ INSERT INTO left_t VALUES (1, 'a'), (1, 'a'), (2, 'b'), (3, 'c'), (5, 'e');
 statement ok
 INSERT INTO right_t VALUES (1, 'a'), (3, 'c'), (3, 'c'), (4, 'd');
 
-query I
-PRAGMA lpts_check('SELECT id, label FROM left_t EXCEPT SELECT id, label FROM right_t');
-----
-true
+statement ok
+SELECT id, label FROM left_t EXCEPT SELECT id, label FROM right_t;
 
-query I
-PRAGMA lpts_check('SELECT rowid FROM left_t WHERE rowid IN (SELECT rowid FROM left_t WHERE id = 1 LIMIT 1)');
-----
-true
+statement ok
+SELECT rowid FROM left_t WHERE rowid IN (SELECT rowid FROM left_t WHERE id = 1 LIMIT 1);
 
-query I
-PRAGMA lpts_check('SELECT rowid, id, label FROM left_t WHERE rowid IN (SELECT rowid FROM left_t WHERE id = 1 LIMIT 1) ORDER BY rowid');
-----
-true
+statement ok
+SELECT rowid, id, label FROM left_t WHERE rowid IN (SELECT rowid FROM left_t WHERE id = 1 LIMIT 1) ORDER BY rowid;
 
-query I
-PRAGMA lpts_check('SELECT id, label FROM left_t EXCEPT ALL SELECT id, label FROM right_t');
-----
-true
+statement ok
+SELECT id, label FROM left_t EXCEPT ALL SELECT id, label FROM right_t;
 
-query I
-PRAGMA lpts_check('SELECT id, label FROM left_t INTERSECT SELECT id, label FROM right_t');
-----
-true
+statement ok
+SELECT id, label FROM left_t INTERSECT SELECT id, label FROM right_t;
 
-query I
-PRAGMA lpts_check('SELECT id, label FROM left_t INTERSECT ALL SELECT id, label FROM right_t');
-----
-true
+statement ok
+SELECT id, label FROM left_t INTERSECT ALL SELECT id, label FROM right_t;
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT id, label FROM left_t INTERSECT ALL SELECT DISTINCT id, label FROM right_t');
-----
-true
+statement ok
+SELECT DISTINCT id, label FROM left_t INTERSECT ALL SELECT DISTINCT id, label FROM right_t;
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT id, label FROM left_t EXCEPT ALL SELECT DISTINCT id, label FROM right_t');
-----
-true
+statement ok
+SELECT DISTINCT id, label FROM left_t EXCEPT ALL SELECT DISTINCT id, label FROM right_t;
 
 query I rowsort
-PRAGMA lpts_exec('SELECT id FROM left_t EXCEPT ALL SELECT id FROM right_t');
+SELECT id FROM left_t EXCEPT ALL SELECT id FROM right_t;
 ----
 1
 2
 5
 
-query I
-PRAGMA lpts_check('SELECT 42 AS answer');
-----
-true
+statement ok
+SELECT 42 AS answer;
 
 query II
-PRAGMA lpts_exec('SELECT 42 AS answer, ''ok'' AS label');
+SELECT 42 AS answer, 'ok' AS label;
 ----
 42	ok
 
@@ -80,35 +65,27 @@ statement ok
 INSERT INTO list_t VALUES (1, [10, 20]), (2, [30]), (3, []);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, unnest(vals) AS val FROM list_t');
+SELECT id, unnest(vals) AS val FROM list_t;
 ----
 1	10
 1	20
 2	30
 
-query I
-PRAGMA lpts_check('SELECT id, unnest(vals) AS val FROM list_t');
-----
-true
+statement ok
+SELECT id, unnest(vals) AS val FROM list_t;
 
-query I
-PRAGMA lpts_check('SELECT unnest([''BC'', ''GC'']) AS credit_type');
-----
-true
+statement ok
+SELECT unnest(['BC', 'GC']) AS credit_type;
 
-query I
-PRAGMA lpts_check('SELECT * FROM UNNEST([1, 2, 3]) AS u(val)');
-----
-true
+statement ok
+SELECT * FROM UNNEST([1, 2, 3]) AS u(val);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM list_t CROSS JOIN UNNEST(vals) AS u(val)');
+SELECT id, val FROM list_t CROSS JOIN UNNEST(vals) AS u(val);
 ----
 1	10
 1	20
 2	30
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM list_t CROSS JOIN UNNEST(vals) AS u(val)');
-----
-true
+statement ok
+SELECT id, val FROM list_t CROSS JOIN UNNEST(vals) AS u(val);

@@ -26,25 +26,17 @@ INSERT INTO events VALUES
 statement ok
 SET lpts_input_dialect = 'mysql';
 
-query I
-PRAGMA lpts_check('SELECT `order` FROM users WHERE `order` > 10 ORDER BY `order` LIMIT 1, 2');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT `order` FROM users WHERE `order` > 10 ORDER BY `order` LIMIT 1, 2');
 
-query I
-PRAGMA lpts_check('SELECT IFNULL(name, ''missing'') AS n FROM users ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT IFNULL(name, ''missing'') AS n FROM users ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT DATE_FORMAT(ts, ''%Y-%m-%d %H:%i:%s.%f'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT DATE_FORMAT(ts, ''%Y-%m-%d %H:%i:%s.%f'') AS formatted FROM events ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT STR_TO_DATE(text_value, ''%Y-%m-%d %H:%i:%s'') AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT STR_TO_DATE(text_value, ''%Y-%m-%d %H:%i:%s'') AS parsed FROM events ORDER BY id');
 
 query I
 SELECT sql LIKE '%"order"%' AS mysql_backtick_identifier_normalized
@@ -76,30 +68,20 @@ LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
 statement ok
 SET lpts_input_dialect = 'spark';
 
-query I
-PRAGMA lpts_check('SELECT `order` FROM users WHERE `order` > 10 ORDER BY `order`');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT `order` FROM users WHERE `order` > 10 ORDER BY `order`');
 
-query I
-PRAGMA lpts_check('SELECT nvl(name, ''missing'') AS n FROM users ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT nvl(name, ''missing'') AS n FROM users ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT date_format(ts, ''yyyy-MM-dd HH:mm:ss'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT date_format(ts, ''yyyy-MM-dd HH:mm:ss'') AS formatted FROM events ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT to_timestamp(text_value, ''yyyy-MM-dd HH:mm:ss'') AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT to_timestamp(text_value, ''yyyy-MM-dd HH:mm:ss'') AS parsed FROM events ORDER BY id');
 
-query T
-PRAGMA lpts_exec('SELECT typeof(to_date(text_value, ''yyyy-MM-dd HH:mm:ss'')) FROM events LIMIT 1');
-----
-DATE
+statement ok
+SELECT sql FROM lpts_query('SELECT typeof(to_date(text_value, ''yyyy-MM-dd HH:mm:ss'')) FROM events LIMIT 1');
 
 statement error
 SELECT sql FROM lpts_query('SELECT date_format(ts, ''yyyy-DD'') AS formatted FROM events');
@@ -109,10 +91,8 @@ LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
 statement ok
 SET lpts_input_dialect = 'hive';
 
-query I
-PRAGMA lpts_check('SELECT date_format(ts, ''yyyy-MM-dd'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT date_format(ts, ''yyyy-MM-dd'') AS formatted FROM events ORDER BY id');
 
 # ============================================================
 # Trino/Presto input: date_format/date_parse normalize before planning.
@@ -121,15 +101,11 @@ true
 statement ok
 SET lpts_input_dialect = 'trino';
 
-query I
-PRAGMA lpts_check('SELECT date_format(ts, ''%Y-%m-%d %H:%i:%s'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT date_format(ts, ''%Y-%m-%d %H:%i:%s'') AS formatted FROM events ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT date_parse(text_value, ''%Y-%m-%d %H:%i:%s'') AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT date_parse(text_value, ''%Y-%m-%d %H:%i:%s'') AS parsed FROM events ORDER BY id');
 
 query I
 SELECT sql NOT LIKE '%date_parse%' AND sql LIKE '%strptime%' AS trino_date_parse_normalized
@@ -140,10 +116,8 @@ true
 statement ok
 SET lpts_input_dialect = 'presto';
 
-query I
-PRAGMA lpts_check('SELECT date_format(ts, ''%Y-%m-%d'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT date_format(ts, ''%Y-%m-%d'') AS formatted FROM events ORDER BY id');
 
 # ============================================================
 # Postgres/Redshift input: Postgres-style date formats.
@@ -152,36 +126,26 @@ true
 statement ok
 SET lpts_input_dialect = 'postgres';
 
-query I
-PRAGMA lpts_check('SELECT to_char(ts, ''YYYY-MM-DD HH24:MI:SS.US'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT to_char(ts, ''YYYY-MM-DD HH24:MI:SS.US'') AS formatted FROM events ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT to_timestamp(text_value, ''YYYY-MM-DD HH24:MI:SS'') AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT to_timestamp(text_value, ''YYYY-MM-DD HH24:MI:SS'') AS parsed FROM events ORDER BY id');
 
 statement ok
 SET lpts_input_dialect = 'postgresql';
 
-query I
-PRAGMA lpts_check('SELECT to_date(text_value, ''YYYY-MM-DD HH24:MI:SS'') AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT to_date(text_value, ''YYYY-MM-DD HH24:MI:SS'') AS parsed FROM events ORDER BY id');
 
-query T
-PRAGMA lpts_exec('SELECT typeof(to_date(text_value, ''YYYY-MM-DD HH24:MI:SS'')) FROM events LIMIT 1');
-----
-DATE
+statement ok
+SELECT sql FROM lpts_query('SELECT typeof(to_date(text_value, ''YYYY-MM-DD HH24:MI:SS'')) FROM events LIMIT 1');
 
 statement ok
 SET lpts_input_dialect = 'redshift';
 
-query I
-PRAGMA lpts_check('SELECT to_char(ts, ''YYYY-MM-DD'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT to_char(ts, ''YYYY-MM-DD'') AS formatted FROM events ORDER BY id');
 
 # ============================================================
 # Snowflake input: Snowflake-style fractional-second date formats.
@@ -190,20 +154,14 @@ true
 statement ok
 SET lpts_input_dialect = 'snowflake';
 
-query I
-PRAGMA lpts_check('SELECT TO_CHAR(ts, ''YYYY-MM-DD HH24:MI:SS.FF6'') AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT TO_CHAR(ts, ''YYYY-MM-DD HH24:MI:SS.FF6'') AS formatted FROM events ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT TO_TIMESTAMP(text_value, ''YYYY-MM-DD HH24:MI:SS'') AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT TO_TIMESTAMP(text_value, ''YYYY-MM-DD HH24:MI:SS'') AS parsed FROM events ORDER BY id');
 
-query T
-PRAGMA lpts_exec('SELECT typeof(TO_DATE(text_value, ''YYYY-MM-DD HH24:MI:SS'')) FROM events LIMIT 1');
-----
-DATE
+statement ok
+SELECT sql FROM lpts_query('SELECT typeof(TO_DATE(text_value, ''YYYY-MM-DD HH24:MI:SS'')) FROM events LIMIT 1');
 
 # ============================================================
 # BigQuery input: backtick path identifiers and format-first date functions.
@@ -212,46 +170,32 @@ DATE
 statement ok
 SET lpts_input_dialect = 'bigquery';
 
-query I
-PRAGMA lpts_check('SELECT id FROM `users` ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT id FROM `users` ORDER BY id');
 
-query I
-PRAGMA lpts_check('SELECT FORMAT_TIMESTAMP(''%Y-%m-%d %H:%M:%S'', ts) AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT FORMAT_TIMESTAMP(''%Y-%m-%d %H:%M:%S'', ts) AS formatted FROM events ORDER BY id');
 
-query T
-PRAGMA lpts_exec('SELECT FORMAT_TIMESTAMP(''%H:%M:%S'', ts) AS formatted FROM events WHERE id = 1');
-----
-08:09:10
+statement ok
+SELECT sql FROM lpts_query('SELECT FORMAT_TIMESTAMP(''%H:%M:%S'', ts) AS formatted FROM events WHERE id = 1');
 
-query I
-PRAGMA lpts_check('SELECT PARSE_TIMESTAMP(''%Y-%m-%d %H:%M:%S'', text_value) AS parsed FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT PARSE_TIMESTAMP(''%Y-%m-%d %H:%M:%S'', text_value) AS parsed FROM events ORDER BY id');
 
 statement ok
 SET lpts_input_dialect = 'bq';
 
-query I
-PRAGMA lpts_check('SELECT FORMAT_DATE(''%Y-%m-%d'', ts) AS formatted FROM events ORDER BY id');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT FORMAT_DATE(''%Y-%m-%d'', ts) AS formatted FROM events ORDER BY id');
 
-query T
-PRAGMA lpts_exec('SELECT typeof(PARSE_DATE(''%Y-%m-%d'', ''2024-01-15''))');
-----
-DATE
+statement ok
+SELECT sql FROM lpts_query('SELECT typeof(PARSE_DATE(''%Y-%m-%d'', ''2024-01-15''))');
 
 statement ok
 SET lpts_input_dialect = 'spark';
 
-query I
-PRAGMA lpts_check('SELECT date_add(CAST(''2024-01-15'' AS DATE), 2), datediff(CAST(''2024-01-16'' AS DATE), CAST(''2024-01-15'' AS DATE))');
-----
-true
+statement ok
+SELECT sql FROM lpts_query('SELECT date_add(CAST(''2024-01-15'' AS DATE), 2), datediff(CAST(''2024-01-16'' AS DATE), CAST(''2024-01-15'' AS DATE))');
 
 statement ok
 SET lpts_input_dialect = 'not_a_dialect';

@@ -2,6 +2,8 @@
 
 #include "duckdb/parser/keyword_helper.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <regex>
 
 namespace duckdb {
@@ -289,6 +291,115 @@ string SubstituteColumnTokens(const string &sql, const std::unordered_map<string
 		i++;
 	}
 	return out;
+}
+
+//===--------------------------------------------------------------------===//
+// Nondeterminism heuristic (shared by the lpts_check mode and the SQLStorm benchmark).
+//===--------------------------------------------------------------------===//
+
+static string LowerASCII(string input) {
+	std::transform(input.begin(), input.end(), input.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return input;
+}
+
+static string NormalizeWhitespaceASCII(const string &input) {
+	string result;
+	bool last_was_space = true;
+	for (char c : input) {
+		if (std::isspace(static_cast<unsigned char>(c))) {
+			if (!last_was_space) {
+				result += ' ';
+				last_was_space = true;
+			}
+			continue;
+		}
+		result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		last_was_space = false;
+	}
+	if (!result.empty() && result.back() != ' ') {
+		result += ' ';
+	}
+	return " " + result;
+}
+
+static bool ContainsNormalizedPhrase(const string &sql, const string &phrase) {
+	return NormalizeWhitespaceASCII(sql).find(NormalizeWhitespaceASCII(phrase)) != string::npos;
+}
+
+static bool HasFunctionCall(const string &sql, const string &function_name) {
+	string lower_sql = LowerASCII(sql);
+	string needle = LowerASCII(function_name) + "(";
+	return lower_sql.find(needle) != string::npos;
+}
+
+static bool HasWindowFunctionCall(const string &sql, const string &function_name) {
+	return HasFunctionCall(sql, function_name) && ContainsNormalizedPhrase(sql, "over");
+}
+
+bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
+	// Order-sensitive aggregates (string_agg, group_concat, listagg, list, array_agg) concatenate/collect
+	// their inputs in an order that is only fully defined when an in-aggregate ORDER BY names a UNIQUE key.
+	// We cannot prove uniqueness from the SQL text, and a non-total ORDER BY (or none at all) leaves the
+	// result order input-dependent — so the original and LPTS-rewritten plans may legitimately disagree on
+	// the concatenation order. Treat any use as potentially nondeterministic, ordered or not.
+	if (HasFunctionCall(sql, "string_agg") || HasFunctionCall(sql, "group_concat")) {
+		reason = "order-sensitive aggregate (string_agg/group_concat) may have a non-total ordering";
+		return true;
+	}
+	if (HasFunctionCall(sql, "listagg")) {
+		reason = "order-sensitive aggregate (listagg) may have a non-total ordering";
+		return true;
+	}
+	if (HasFunctionCall(sql, "list") || HasFunctionCall(sql, "array_agg")) {
+		reason = "order-sensitive aggregate (list/array_agg) may have a non-total ordering";
+		return true;
+	}
+	if (HasFunctionCall(sql, "random")) {
+		reason = "volatile random() expression";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "row_number")) {
+		reason = "row_number over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "rank")) {
+		reason = "rank over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "dense_rank")) {
+		reason = "dense_rank over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "lag") || HasWindowFunctionCall(sql, "lead") ||
+	    HasWindowFunctionCall(sql, "first_value") || HasWindowFunctionCall(sql, "last_value") ||
+	    HasWindowFunctionCall(sql, "nth_value")) {
+		reason = "window function over potentially tied ordering keys";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "limit") && ContainsNormalizedPhrase(sql, "order by")) {
+		reason = "ORDER BY with LIMIT/OFFSET may have tied boundary rows";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "fetch first") && ContainsNormalizedPhrase(sql, "order by")) {
+		reason = "ORDER BY with FETCH FIRST may have tied boundary rows";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "fetch next") && ContainsNormalizedPhrase(sql, "order by")) {
+		reason = "ORDER BY with FETCH NEXT may have tied boundary rows";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "offset") && ContainsNormalizedPhrase(sql, "order by")) {
+		reason = "ORDER BY with OFFSET may have tied boundary rows";
+		return true;
+	}
+	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
+	    HasFunctionCall(sql, "stddev_samp") || HasFunctionCall(sql, "variance") || HasFunctionCall(sql, "var_pop") ||
+	    HasFunctionCall(sql, "var_samp")) {
+		reason = "strict floating aggregate equality may depend on evaluation order";
+		return true;
+	}
+	return false;
 }
 
 } // namespace duckdb

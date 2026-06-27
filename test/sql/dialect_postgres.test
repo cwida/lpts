@@ -10,6 +10,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
 
 statement ok
@@ -55,15 +58,11 @@ SELECT sql LIKE '%FROM%users%' AS bare_table_name FROM lpts_query('SELECT id FRO
 true
 
 # Round-trip still correct: unqualified names resolve fine inside DuckDB.
-query I
-PRAGMA lpts_check('SELECT id, name FROM users');
-----
-true
+statement ok
+SELECT id, name FROM users;
 
-query I
-PRAGMA lpts_check('SELECT id FROM users WHERE id > 1');
-----
-true
+statement ok
+SELECT id FROM users WHERE id > 1;
 
 # ============================================================
 # Identifier quoting — double quotes (same as DuckDB)

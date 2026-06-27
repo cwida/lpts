@@ -74,4 +74,13 @@ string SubstituteColumnTokens(const string &sql, const std::unordered_map<string
 /// Remove redundant whitespace from a query string.
 void RemoveRedundantWhitespaces(string &query);
 
+/// Heuristic: returns true when `sql` is likely to have a nondeterministic result *value or row order*
+/// — so a strict round-trip comparison can spuriously differ even when the rewrite is correct. On a
+/// match, `reason` is set to a short human-readable explanation. Covers unordered order-sensitive
+/// aggregates (string_agg/listagg/list/array_agg without ORDER BY), random(), window functions over
+/// potentially-tied keys (row_number/rank/dense_rank/lag/lead/first_value/last_value/nth_value),
+/// ORDER BY with LIMIT/OFFSET/FETCH (tied boundary rows), and floating aggregates whose strict equality
+/// can depend on evaluation order (avg/stddev*/variance/var_*).
+bool IsLikelyNondeterministicSQL(const string &sql, string &reason);
+
 } // namespace duckdb

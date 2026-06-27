@@ -25,6 +25,20 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/common/enums/set_scope.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <string>
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -368,25 +382,6 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	return result;
 }
 
-static string StripTrailingSemicolon(string sql) {
-	while (!sql.empty() &&
-	       (sql.back() == ';' || sql.back() == ' ' || sql.back() == '\n' || sql.back() == '\r' || sql.back() == '\t')) {
-		sql.pop_back();
-	}
-	return sql;
-}
-
-static string FirstStatementSqlForSubquery(ClientContext &context, const string &query) {
-	SqlDialect input_dialect = ReadInputDialect(context);
-	string normalized = NormalizeInputSqlToDuckDB(query, input_dialect);
-	Parser parser(context.GetParserOptions());
-	parser.ParseQuery(normalized);
-	if (parser.statements.empty()) {
-		throw ParserException("Failed to parse query: %s", normalized);
-	}
-	return StripTrailingSemicolon(parser.statements[0]->ToString());
-}
-
 //------------------------------------------------------------------------------
 // PRAGMA lpts('query') — converts a SQL query's logical plan to a SQL string.
 //
@@ -479,59 +474,6 @@ static void LptsTableFunc(ClientContext &context, TableFunctionInput &data_p, Da
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value(bind_data.result_sql));
 	state.done = true;
-}
-
-//------------------------------------------------------------------------------
-// PRAGMA lpts_exec('query') — converts a SQL query via LPTS then executes it.
-//
-// Runs the query through the full LPTS pipeline (plan → AST → SQL) and then
-// executes the generated SQL, returning its results directly.
-//------------------------------------------------------------------------------
-
-static string LptsExecPragmaFunction(ClientContext &context, const FunctionParameters &parameters) {
-	auto query = StringValue::Get(parameters.values[0]);
-	auto plan = PlanQuery(context, query);
-
-	SqlDialect dialect = ReadDialect(context);
-	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
-	return cte_list->ToQuery(true);
-}
-
-//------------------------------------------------------------------------------
-// PRAGMA lpts_check('query') — round-trip correctness check.
-//
-// Runs the original query and the LPTS-generated query, then compares results
-// using EXCEPT ALL in both directions. Returns a single boolean column "match".
-//
-// A false result means strict bag equality failed. This can be a real LPTS bug,
-// but it can also happen for SQL with nondeterministic result values, e.g.
-// unordered string_agg/list aggregates, row_number() over tied ORDER BY keys, or
-// ORDER BY ... LIMIT with tied boundary rows.
-//------------------------------------------------------------------------------
-
-static string LptsCheckPragmaFunction(ClientContext &context, const FunctionParameters &parameters) {
-	auto query = StringValue::Get(parameters.values[0]);
-	auto plan = PlanQuery(context, query);
-
-	SqlDialect dialect = ReadDialect(context);
-	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
-	string lpts_sql = cte_list->ToQuery(true);
-
-	// Normalize the original query to DuckDB's first parsed statement before embedding
-	// it as a subquery. Raw SQLStorm inputs often end with "LIMIT ...; -- comment",
-	// where simply trimming the last character leaves a semicolon inside the subquery.
-	string orig = FirstStatementSqlForSubquery(context, query);
-	lpts_sql = StripTrailingSemicolon(std::move(lpts_sql));
-
-	// Compare: no rows in (A EXCEPT ALL B) AND no rows in (B EXCEPT ALL A)
-	return "SELECT "
-	       "(SELECT count(*) FROM ((" +
-	       orig + ") EXCEPT ALL (" + lpts_sql +
-	       "))) = 0 AND "
-	       "(SELECT count(*) FROM ((" +
-	       lpts_sql + ") EXCEPT ALL (" + orig + "))) = 0 AS match;";
 }
 
 //------------------------------------------------------------------------------
@@ -811,6 +753,424 @@ static void LptsExplainSqlOptimize(OptimizerExtensionInput &input, unique_ptr<Lo
 }
 
 //------------------------------------------------------------------------------
+// lpts_check mode: transparent round-trip verification.
+//
+// When `SET lpts_check = true`, the optimizer hook below rewrites every top-level
+// SELECT into a UNION ALL of two sides:
+//   - LptsCheckHash(original):  passes all original tuples through (so the query
+//                               returns its normal result, in its normal order)
+//                               while hashing every tuple.
+//   - LptsCheckCmp(LPTS(query)): consumes the LPTS-rewritten result, emits ZERO
+//                               tuples, and hashes every tuple.
+// Each side hashes its tuples order-independently (additive combination of per-row
+// hashes) and publishes the final hash to a per-connection record on the
+// ClientContext at OperatorFinalize (a single, post-all-threads, global call). The
+// first side to finish stores its hash; the second compares and raises an error iff
+// the multisets differ. The original result is returned untouched, so a test's
+// expected output never changes — only a genuine LPTS round-trip divergence errors.
+//------------------------------------------------------------------------------
+
+// `SET lpts_check = true` turns on transparent round-trip verification of every top-level SELECT. The
+// behavior is chosen by the LPTS_CHECK_LOG environment variable (set by the suite driver):
+//   STRICT (env unset) — the query returns its normal result; a round-trip mismatch raises
+//       "LPTS check failed", and a query LPTS cannot rewrite raises a specific "unsupported" error. Both
+//       are deterministic messages that a sqllogictest `statement error` can match.
+//   LOG (env set to a path) — lenient: never raises. For each checked SELECT it appends one line to that
+//       path — "<query_number> FAIL" (LPTS could not rewrite it), "<query_number> OK" (rewrote, bags
+//       matched), "<query_number> WRONG" (rewrote, bags differed), or "<query_number> NONDETERMINISTIC:
+//       <reason>" (rewrote, but the query is nondeterministic so the comparison is not trusted; <reason>
+//       is the heuristic's explanation). The original rows are returned so the test run continues. The
+//       driver runs one .test file per process and writes a "# <filename>" header, so the combined log
+//       attributes each query to its file.
+enum class LptsCheckVerdict : uint8_t { STRICT, LOG };
+
+static const char *LptsCheckLogPath() {
+	return std::getenv("LPTS_CHECK_LOG");
+}
+
+static void LptsCheckAppendLog(const string &path, idx_t qnum, const string &status) {
+	std::ofstream f(path, std::ios::app);
+	if (f) {
+		f << qnum << " " << status << "\n";
+	}
+}
+
+class LptsCheckModeState : public ClientContextState {
+public:
+	bool enabled = false; // SET lpts_check = true
+	bool in_rewrite = false;
+	idx_t log_qnum = 0; // per-connection 1-based SELECT counter, for LOG-mode line numbers
+};
+
+// Per-connection, per-query coordination record. The hash (original) and cmp (rewritten) operators
+// fetch_add into the two accumulators during Execute — correct regardless of how many pipelines/threads
+// each side spans. The verdict is acted on once both sides are done ("last one out").
+class LptsCheckRunState : public ClientContextState {
+public:
+	std::atomic<uint64_t> hash_sum {0};
+	std::atomic<uint64_t> cmp_sum {0};
+	std::atomic<int> sides_remaining {0}; // "last one out" counter (init 2 per query)
+	bool suppress = false;                // query is likely nondeterministic → a diff is not a failure
+	string suppress_reason;               // why it was judged nondeterministic (logged with NONDETERMINISTIC)
+	LptsCheckVerdict behavior = LptsCheckVerdict::STRICT;
+	idx_t qnum = 0;  // this SELECT's 1-based number (LOG mode)
+	string log_path; // LOG mode: where to append the per-query result line
+
+	void ResetQuery(LptsCheckVerdict behavior_p, idx_t qnum_p, string log_path_p) {
+		hash_sum.store(0);
+		cmp_sum.store(0);
+		sides_remaining.store(0);
+		suppress = false;
+		suppress_reason.clear();
+		behavior = behavior_p;
+		qnum = qnum_p;
+		log_path = std::move(log_path_p);
+	}
+
+	void Add(bool hash_side, uint64_t v) {
+		(hash_side ? hash_sum : cmp_sum).fetch_add(v);
+	}
+
+	// Acted on once, by the last side out (both hashes complete). STRICT raises on a real mismatch
+	// (a nondeterministic divergence is suppressed — the check is lenient). LOG never raises; it records
+	// the outcome for a rewritten query: "OK" (bags matched), "WRONG" (bags differed), or
+	// "NONDETERMINISTIC: <reason>" (query is nondeterministic, so the comparison is not trusted; the reason
+	// is the heuristic's explanation, e.g. an order-sensitive aggregate or ORDER BY with LIMIT).
+	void ActOnVerdict() {
+		bool hashes_equal = (hash_sum.load() == cmp_sum.load());
+		bool match = hashes_equal || suppress;
+		if (behavior == LptsCheckVerdict::STRICT) {
+			if (!match) {
+				throw InvalidInputException(
+				    "LPTS check failed: the LPTS-rewritten query returned a different bag of rows than the "
+				    "original (hash %llu vs %llu)",
+				    static_cast<unsigned long long>(hash_sum.load()), static_cast<unsigned long long>(cmp_sum.load()));
+			}
+		} else if (suppress) {
+			string status = suppress_reason.empty() ? "NONDETERMINISTIC" : "NONDETERMINISTIC: " + suppress_reason;
+			LptsCheckAppendLog(log_path, qnum, status);
+		} else {
+			LptsCheckAppendLog(log_path, qnum, hashes_equal ? "OK" : "WRONG");
+		}
+	}
+
+	// "Last one out switches off the lights": each side calls this when fully done. The last caller
+	// (whichever finishes — order-independent) computes the verdict with both hashes complete.
+	void OnSideDone() {
+		if (sides_remaining.fetch_sub(1) == 1) {
+			ActOnVerdict();
+		}
+	}
+};
+
+static LptsCheckModeState &GetCheckMode(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<LptsCheckModeState>("lpts_check_mode");
+}
+
+static LptsCheckRunState &GetCheckRunState(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<LptsCheckRunState>("lpts_check_run_state");
+}
+
+static void LptsCheckSetCallback(ClientContext &context, SetScope scope, Value &parameter) {
+	GetCheckMode(context).enabled = !parameter.IsNull() && parameter.GetValue<bool>();
+}
+
+// Hash all rows of `chunk` order-independently into `running_sum`. DataChunk::Hash gives a
+// per-row hash that is NULL-aware and column-position-sensitive; summing the per-row hashes is
+// commutative (so tuple order is irrelevant) and duplicate-sensitive (so it is true bag equality).
+static void AccumulateChunkHash(DataChunk &chunk, uint64_t &running_sum) {
+	const idx_t n = chunk.size();
+	if (n == 0) {
+		return;
+	}
+	if (chunk.ColumnCount() == 0) {
+		running_sum += static_cast<uint64_t>(n);
+		return;
+	}
+	Vector hashes(LogicalType::HASH);
+	chunk.Hash(hashes);
+	hashes.Flatten(n);
+	auto hash_data = FlatVector::GetData<hash_t>(hashes);
+	uint64_t local = 0;
+	for (idx_t i = 0; i < n; i++) {
+		local += static_cast<uint64_t>(hash_data[i]);
+	}
+	running_sum += local;
+}
+
+// Hash side for the streaming SET/LOG path: a pass-through operator that streams the original rows up to
+// the UNION (no buffering) while accumulating their order-independent hash (atomic — correct across any
+// number of pipelines). It lives in the UNION's base pipeline, which gets a PipelineFinishEvent, so its
+// OperatorFinalize is the hash side's reliable "I'm done" signal for last-one-out.
+class PhysicalLptsCheck : public PhysicalOperator {
+public:
+	bool passthrough;
+	bool last_one_out; // streaming SET/LOG hash side: signal OnSideDone via OperatorFinalize
+
+	PhysicalLptsCheck(PhysicalPlan &physical_plan, vector<LogicalType> types_p, idx_t estimated_cardinality,
+	                  bool passthrough_p, bool last_one_out_p)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
+	      passthrough(passthrough_p), last_one_out(last_one_out_p) {
+	}
+
+	bool ParallelOperator() const override {
+		return true;
+	}
+
+	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
+	                           OperatorState &) const override {
+		uint64_t partial = 0;
+		AccumulateChunkHash(input, partial);
+		GetCheckRunState(context.client).Add(/*hash_side=*/passthrough, partial);
+		if (passthrough) {
+			chunk.Reference(input);
+		} else {
+			chunk.SetCardinality(0);
+		}
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	// The streaming hash side lives in the UNION's base pipeline, which gets a PipelineFinishEvent ⇒ this
+	// fires once after all of its input. It is the hash side's "I'm done" signal for last-one-out.
+	bool RequiresOperatorFinalize() const override {
+		return last_one_out;
+	}
+	OperatorFinalResultType OperatorFinalize(Pipeline &, Event &, ClientContext &context,
+	                                         OperatorFinalizeInput &) const override {
+		GetCheckRunState(context).OnSideDone();
+		return OperatorFinalResultType::FINISHED;
+	}
+
+	string GetName() const override {
+		return passthrough ? "LPTS_CHECK_HASH" : "LPTS_CHECK_CMP";
+	}
+};
+
+// Hash side: passes the original rows through unchanged while hashing them.
+class LogicalLptsCheckHash : public LogicalExtensionOperator {
+public:
+	bool last_one_out;
+
+	LogicalLptsCheckHash(unique_ptr<LogicalOperator> child, bool last_one_out_p) : last_one_out(last_one_out_p) {
+		children.push_back(std::move(child));
+	}
+
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+	string GetExtensionName() const override {
+		return "lpts_check_hash";
+	}
+
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		auto &child = planner.CreatePlan(*children[0]);
+		auto &op = planner.Make<PhysicalLptsCheck>(child.GetTypes(), children[0]->estimated_cardinality,
+		                                           /*passthrough=*/true, last_one_out);
+		op.children.push_back(child);
+		return op;
+	}
+};
+
+// Cmp side: a SINK that consumes the rewritten rows (hashing them into cmp_sum) and a SOURCE that emits
+// nothing. Its sink Finalize — reliable, fires after the whole rewritten subplan (inner UNIONs/joins
+// included) — is the cmp side's "I'm done" signal for last-one-out. It declares the original (left) types
+// so the hand-built UNION type-checks; it emits 0 rows, so those declared types never carry data.
+class LptsCheckSinkGlobalState : public GlobalSinkState {};
+class LptsCheckSinkSourceState : public GlobalSourceState {};
+
+class PhysicalLptsCheckSink : public PhysicalOperator {
+public:
+	PhysicalLptsCheckSink(PhysicalPlan &physical_plan, vector<LogicalType> types_p, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality) {
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
+		return make_uniq<LptsCheckSinkGlobalState>();
+	}
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &) const override {
+		uint64_t partial = 0;
+		AccumulateChunkHash(chunk, partial);
+		GetCheckRunState(context.client).Add(/*hash_side=*/false, partial);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context, OperatorSinkFinalizeInput &) const override {
+		GetCheckRunState(context).OnSideDone();
+		return SinkFinalizeType::READY;
+	}
+
+	bool IsSource() const override {
+		return true;
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+		return make_uniq<LptsCheckSinkSourceState>();
+	}
+	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &, OperatorSourceInput &) const override {
+		return SourceResultType::FINISHED; // emits no rows
+	}
+
+	string GetName() const override {
+		return "LPTS_CHECK_CMP";
+	}
+};
+
+class LogicalLptsCheckSink : public LogicalExtensionOperator {
+public:
+	vector<LogicalType> forced_types;
+
+	LogicalLptsCheckSink(unique_ptr<LogicalOperator> child, vector<LogicalType> forced_types_p)
+	    : forced_types(std::move(forced_types_p)) {
+		children.push_back(std::move(child));
+	}
+
+	void ResolveTypes() override {
+		types = forced_types;
+	}
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+	string GetExtensionName() const override {
+		return "lpts_check_cmp";
+	}
+
+	PhysicalOperator &CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) override {
+		auto &child = planner.CreatePlan(*children[0]);
+		auto &op = planner.Make<PhysicalLptsCheckSink>(forced_types, children[0]->estimated_cardinality);
+		op.children.push_back(child);
+		return op;
+	}
+};
+
+// Optimizer hook (post-optimize): when lpts_check mode is on, replace a top-level SELECT's plan
+// with UNION ALL(LptsCheckHash(original), LptsCheckCmp(LPTS(original))).
+static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	auto &mode = GetCheckMode(input.context);
+	if (mode.in_rewrite) {
+		return; // a nested PlanQuery from our own rewrite — leave it alone.
+	}
+	if (!mode.enabled) {
+		return;
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_EXPLAIN) {
+		return; // EXPLAIN (FORMAT SQL) is owned by the explain hook.
+	}
+	auto &client_config = ClientConfig::GetConfig(input.context);
+	if (client_config.AnyVerification()) {
+		// Statement verification (e.g. PRAGMA enable_verification, common in DuckDB's own test corpus)
+		// round-trips the plan through serialization, and our injected extension operators
+		// (lpts_check_hash / lpts_check_sink) have no deserialization method — so we cannot rewrite a
+		// query while verification is active.
+		//
+		// In LOG mode (the suite driver) more than half of DuckDB's .test files self-enable verification,
+		// which would otherwise leave them entirely unchecked. Since LOG mode never alters a query's
+		// result and we only read LPTS's own log, neutralize verification on this connection so that every
+		// *subsequent* query in the file is checkable. We still skip the current query (it may already be
+		// mid-verification), so a file loses at most its first post-PRAGMA query from coverage. Strict mode
+		// (interactive / SQLStorm) keeps the conservative skip and never touches the user's config.
+		if (LptsCheckLogPath()) {
+			client_config.query_verification_enabled = false;
+			client_config.verify_external = false;
+			client_config.verify_serializer = false;
+			client_config.verify_fetch_row = false;
+		}
+		return;
+	}
+
+	// Only intercept a single top-level SELECT. CREATE/INSERT/UPDATE/PRAGMA/... pass through untouched.
+	const string &query = input.context.GetCurrentQuery();
+	{
+		Parser parser(input.context.GetParserOptions());
+		try {
+			parser.ParseQuery(query);
+		} catch (...) {
+			return;
+		}
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			return;
+		}
+	}
+	// Don't check queries that read LPTS's own inspector table functions (lpts_query / print_ast_query /
+	// lpts_normalize_query): they wrap LPTS output and can't themselves be round-tripped — let them run as-is.
+	{
+		string lower_query = StringUtil::Lower(query);
+		if (lower_query.find("lpts_query") != string::npos || lower_query.find("print_ast_query") != string::npos ||
+		    lower_query.find("lpts_normalize_query") != string::npos) {
+			return;
+		}
+	}
+
+	struct RewriteGuard {
+		LptsCheckModeState &m;
+		explicit RewriteGuard(LptsCheckModeState &m_) : m(m_) {
+			m.in_rewrite = true;
+		}
+		~RewriteGuard() {
+			m.in_rewrite = false;
+		}
+	} guard(mode);
+
+	// LOG when the driver set LPTS_CHECK_LOG (lenient + per-query logging); STRICT otherwise (raise).
+	const char *log_path = LptsCheckLogPath();
+	LptsCheckVerdict behavior = log_path ? LptsCheckVerdict::LOG : LptsCheckVerdict::STRICT;
+	idx_t qnum = (behavior == LptsCheckVerdict::LOG) ? ++mode.log_qnum : 0;
+
+	auto &run = GetCheckRunState(input.context);
+	run.ResetQuery(behavior, qnum, log_path ? string(log_path) : string());
+	string reason;
+	run.suppress = IsLikelyNondeterministicSQL(query, reason); // a nondeterministic diff is not a failure
+	run.suppress_reason = run.suppress ? reason : string();
+	run.sides_remaining.store(2);
+
+	SqlDialect dialect = ReadDialect(input.context);
+	unique_ptr<LogicalOperator> original = std::move(plan);
+
+	// Build UNION(hash pass-through, cmp sink). The original rows stream through unbuffered; both sides
+	// signal done (hash via OperatorFinalize, cmp via sink Finalize) and the last one out takes the
+	// verdict. If LPTS cannot rewrite the query: LOG logs FAIL and runs it unchecked; STRICT raises a
+	// single, matchable "unsupported" error.
+	try {
+		original->ResolveOperatorTypes();
+		auto target_types = original->types;
+		idx_t col_count = target_types.size();
+
+		auto orig_for_lpts = PlanQuery(input.context, query);
+		auto ast = LogicalPlanToAst(input.context, orig_for_lpts, dialect);
+		auto cte_list = AstToCteList(*ast, dialect);
+		string sql = cte_list->ToQuery(true);
+		auto rewritten = PlanQuery(input.context, sql);
+		rewritten->ResolveOperatorTypes();
+		if (rewritten->types.size() != col_count) {
+			throw InvalidInputException("LPTS check: rewritten query has %llu columns but the original has %llu",
+			                            static_cast<unsigned long long>(rewritten->types.size()),
+			                            static_cast<unsigned long long>(col_count));
+		}
+
+		vector<unique_ptr<LogicalOperator>> children;
+		children.push_back(make_uniq<LogicalLptsCheckHash>(std::move(original), /*last_one_out=*/true));
+		children.push_back(make_uniq<LogicalLptsCheckSink>(std::move(rewritten), target_types));
+		idx_t union_index = input.optimizer.binder.GenerateTableIndex();
+		auto union_op = make_uniq<LogicalSetOperation>(union_index, col_count, std::move(children),
+		                                               LogicalOperatorType::LOGICAL_UNION,
+		                                               /*setop_all=*/true, /*allow_out_of_order=*/false);
+		union_op->ResolveOperatorTypes();
+		plan = std::move(union_op);
+	} catch (std::exception &e) {
+		if (behavior == LptsCheckVerdict::STRICT) {
+			throw InvalidInputException("LPTS check: unsupported query (LPTS could not check it): %s", e.what());
+		}
+		LptsCheckAppendLog(run.log_path, run.qnum, "FAIL"); // LOG: record + run the query unchecked
+		if (!plan) {
+			plan = std::move(original);
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
 // Extension loading
 //------------------------------------------------------------------------------
 
@@ -836,6 +1196,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Filter, and pushdown-free base-table scans) into one flat SELECT per query block "
 	                          "instead of one CTE per operator.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("lpts_check",
+	                          "When true, transparently verify every top-level SELECT: the query returns its "
+	                          "normal result, but LPTS rewrites it and, on a different result, raises 'LPTS check "
+	                          "failed' (an unsupported query raises a specific 'LPTS check: unsupported' error). If "
+	                          "the LPTS_CHECK_LOG environment variable points to a file, it instead logs one "
+	                          "'<query#> OK|FAIL [WRONG]' line per SELECT and never raises (suite-coverage mode).",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), LptsCheckSetCallback);
 
 	// Register PRAGMA lpts('query')
 	auto pragma = PragmaFunction::PragmaCall("lpts", LptsPragmaFunction, {LogicalType::VARCHAR});
@@ -858,22 +1225,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "Normalize SQL from lpts_input_dialect into DuckDB SQL without planning it.",
 	    {"SET lpts_input_dialect = 'mysql'; SELECT sql FROM lpts_normalize_query('SELECT `order` FROM users LIMIT 1, "
 	     "2')"});
-
-	// Register PRAGMA lpts_exec('query') — round-trip: plan → SQL → execute
-	auto lpts_exec_pragma = PragmaFunction::PragmaCall("lpts_exec", LptsExecPragmaFunction, {LogicalType::VARCHAR});
-	RegisterPragmaFunctionWithDescription(loader, std::move(lpts_exec_pragma),
-	                                      "Execute the SQL generated by LPTS and return its result rows.",
-	                                      {"PRAGMA lpts_exec('SELECT name FROM users WHERE age > 25')"});
-
-	// Register PRAGMA lpts_check('query') — strict bag round-trip check.
-	// It can return false for semantically equivalent SQL when the query result
-	// is nondeterministic, e.g. unordered aggregates, LIMIT ties, NULL ties, or
-	// window functions with non-unique ordering keys.
-	auto lpts_check_pragma = PragmaFunction::PragmaCall("lpts_check", LptsCheckPragmaFunction, {LogicalType::VARCHAR});
-	RegisterPragmaFunctionWithDescription(
-	    loader, std::move(lpts_check_pragma),
-	    "Compare the original query and the LPTS-generated query using EXCEPT ALL in both directions.",
-	    {"PRAGMA lpts_check('SELECT name FROM users WHERE age > 25')"});
 
 	// Register PRAGMA print_ast('query')
 	auto print_ast_pragma = PragmaFunction::PragmaCall("print_ast", PrintAstPragmaFunction, {LogicalType::VARCHAR});
@@ -903,6 +1254,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension explain_sql_opt;
 	explain_sql_opt.pre_optimize_function = LptsExplainSqlOptimize;
 	OptimizerExtension::Register(config, std::move(explain_sql_opt));
+
+	// lpts_check verification mode: rewrite each top-level SELECT (when enabled) into a UNION ALL of
+	// the original result and the LPTS-rewritten result, hashing both and raising on divergence. Runs
+	// as a post-optimize hook so the hand-built UNION + extension operators are not further rewritten.
+	OptimizerExtension check_opt;
+	check_opt.optimize_function = LptsCheckOptimize;
+	OptimizerExtension::Register(config, std::move(check_opt));
 }
 
 void LptsExtension::Load(ExtensionLoader &loader) {

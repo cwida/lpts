@@ -85,14 +85,15 @@ The dialect settings accept these values:
 | `EXPLAIN (FORMAT SQL) query` | Explain a query as equivalent CTE SQL, via a real `EXPLAIN` statement |
 | `PRAGMA lpts('query')` | Return generated CTE SQL |
 | `lpts_query('query')` | Table-function form of `PRAGMA lpts` |
-| `PRAGMA lpts_exec('query')` | Execute the generated SQL |
-| `PRAGMA lpts_check('query')` | Compare original and generated SQL with bag equality |
 | `PRAGMA print_ast('query')` | Print the AST to stdout |
 | `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
 | `lpts_normalize_query('query')` | Return input-dialect SQL normalized to DuckDB SQL |
 
-`lpts_check` can return `false` for nondeterministic queries, for example when
-row order or tie-breaking is not fully specified.
+To verify round-trip correctness, turn on the `lpts_check` session setting (see
+[Settings](#settings)). Once on, every top-level `SELECT` runs normally and is
+transparently compared against its LPTS rewrite. Nondeterministic queries — for
+example when row order or tie-breaking is not fully specified — are detected and
+pass without error.
 
 ## Use Cases
 
@@ -119,12 +120,43 @@ Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 |---|---|---|---|
 | `lpts_dialect` | VARCHAR | `duckdb` | Output dialect for generated SQL |
 | `lpts_input_dialect` | VARCHAR | `duckdb` | Input dialect to normalize before DuckDB parses and plans the query |
+| `lpts_check` | BOOLEAN | `false` | Transparently verify round-trip correctness of every top-level `SELECT` (see below) |
 | `lpts_enable_data_dependent_optimizers` | BOOLEAN | `false` | Allow LPTS planning to use optimizers that depend on current data, statistics, cardinality estimates, row groups, or runtime dynamic filters |
 
 By default, LPTS avoids data-dependent optimizers so generated SQL does not bake
 in snapshot-specific facts such as `WHERE false` from current table statistics.
 Enable `lpts_enable_data_dependent_optimizers` when you want DuckDB's full
 optimized plan shape and accept that the SQL may depend on planning-time data.
+
+### Round-trip checking with `lpts_check`
+
+Turn on `lpts_check` to verify LPTS transparently:
+
+```sql
+SET lpts_check = true;
+```
+
+Once on, every top-level `SELECT` you run is intercepted. LPTS runs the original
+query and its LPTS rewrite side by side and compares their result bags with an
+order-independent hash. The query returns its normal rows unchanged.
+
+By default the check is strict. If the rewrite's result bag differs, LPTS raises
+`Invalid Input Error: LPTS check failed: ...`. If LPTS cannot rewrite the query at
+all, it raises `Invalid Input Error: LPTS check: unsupported query (LPTS could not
+check it): ...`. Nondeterministic queries — no fully specified order, `random()`,
+unordered aggregates, and the like — are detected and pass without error.
+
+Queries that read LPTS's own table functions (`lpts_query`, `print_ast_query`,
+`lpts_normalize_query`) are skipped, as are queries running under statement
+verification (for example `PRAGMA enable_verification`).
+
+Set the environment variable `LPTS_CHECK_LOG` to a file path to switch to log
+mode. With `lpts_check` on and `LPTS_CHECK_LOG` set, LPTS never raises; instead it
+appends one line per intercepted `SELECT` tagging the outcome: `<n> FAIL` (could not
+rewrite), `<n> OK` (bags matched), `<n> WRONG` (bags differed), or
+`<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, so the comparison is
+not trusted, with the heuristic's explanation). `<n>` is the 1-based interception index.
+This is how DuckDB's own sqllogic corpus is run through LPTS.
 
 ## Examples
 
@@ -164,21 +196,17 @@ SELECT t1_day AS "day" FROM order_2;
 ```sql
 SET lpts_dialect = 'duckdb';
 
--- Execute the generated SQL and return the query result.
-PRAGMA lpts_exec('SELECT name FROM events WHERE id > 10 ORDER BY name');
+-- Turn on transparent round-trip checking once per session.
+SET lpts_check = true;
 
--- Compare original and generated SQL using bag equality.
-PRAGMA lpts_check('SELECT name FROM events WHERE id > 10 ORDER BY name');
+-- Runs normally and returns its rows; raises only if LPTS rewrites it wrong.
+SELECT name FROM events WHERE id > 10 ORDER BY name;
 ```
 
 ```text
 name
 ----
 beta
-
-match
------
-true
 ```
 
 ```sql

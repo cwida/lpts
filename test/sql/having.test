@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE sales (product VARCHAR, region VARCHAR, amount INTEGER);
 
 statement ok
@@ -18,130 +21,106 @@ INSERT INTO sales VALUES
 # --- HAVING count(*) > 5: only group with 6 rows passes ---
 
 query II
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 5');
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 5;
 ----
 A	6
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 5');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 5;
 
 # --- HAVING count(*) > 1: multiple groups pass ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 1');
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 1;
 ----
 A	6
 D	2
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 1');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 1;
 
 # --- HAVING sum(amount) > threshold ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT region, sum(amount) FROM sales GROUP BY region HAVING sum(amount) > 200');
+SELECT region, sum(amount) FROM sales GROUP BY region HAVING sum(amount) > 200;
 ----
 EU	3200
 US	1250
 
-query I
-PRAGMA lpts_check('SELECT region, sum(amount) FROM sales GROUP BY region HAVING sum(amount) > 200');
-----
-true
+statement ok
+SELECT region, sum(amount) FROM sales GROUP BY region HAVING sum(amount) > 200;
 
 # --- HAVING with equality: exactly equal to a value ---
 
 query II
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) = 2');
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) = 2;
 ----
 D	2
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) = 2');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) = 2;
 
 # --- HAVING that matches no group: empty result ---
 
 query II
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 100');
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 100;
 ----
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 100');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales GROUP BY product HAVING count(*) > 100;
 
 # --- WHERE before aggregation, HAVING after: independent filtering stages ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product HAVING count(*) > 2');
+SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product HAVING count(*) > 2;
 ----
 A	5
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product HAVING count(*) > 2');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product HAVING count(*) > 2;
 
 # --- WHERE on string column + HAVING on sum ---
 
 query II
-PRAGMA lpts_exec('SELECT region, sum(amount) FROM sales WHERE region = ''EU'' GROUP BY region HAVING sum(amount) > 500');
+SELECT region, sum(amount) FROM sales WHERE region = 'EU' GROUP BY region HAVING sum(amount) > 500;
 ----
 EU	3200
 
-query I
-PRAGMA lpts_check('SELECT region, sum(amount) FROM sales WHERE region = ''EU'' GROUP BY region HAVING sum(amount) > 500');
-----
-true
+statement ok
+SELECT region, sum(amount) FROM sales WHERE region = 'EU' GROUP BY region HAVING sum(amount) > 500;
 
 # --- WHERE eliminates all rows before grouping: no groups reach HAVING ---
 
 query II
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales WHERE amount > 99999 GROUP BY product HAVING count(*) > 0');
+SELECT product, count(*) FROM sales WHERE amount > 99999 GROUP BY product HAVING count(*) > 0;
 ----
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales WHERE amount > 99999 GROUP BY product HAVING count(*) > 0');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales WHERE amount > 99999 GROUP BY product HAVING count(*) > 0;
 
 # --- HAVING min/max: filter groups by their minimum value ---
 
-query I
-PRAGMA lpts_check('SELECT product, min(amount) FROM sales GROUP BY product HAVING min(amount) > 100');
-----
-true
+statement ok
+SELECT product, min(amount) FROM sales GROUP BY product HAVING min(amount) > 100;
 
-query I
-PRAGMA lpts_check('SELECT product, max(amount) FROM sales GROUP BY product HAVING max(amount) < 1000');
-----
-true
+statement ok
+SELECT product, max(amount) FROM sales GROUP BY product HAVING max(amount) < 1000;
 
 # --- HAVING avg: filter groups by average ---
 
-query I
-PRAGMA lpts_check('SELECT product, avg(amount) FROM sales GROUP BY product HAVING avg(amount) > 100');
-----
-true
+statement ok
+SELECT product, avg(amount) FROM sales GROUP BY product HAVING avg(amount) > 100;
 
 # --- Multi-column GROUP BY with HAVING ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT product, region, count(*) FROM sales GROUP BY product, region HAVING count(*) >= 2');
+SELECT product, region, count(*) FROM sales GROUP BY product, region HAVING count(*) >= 2;
 ----
 A	EU	6
 D	US	2
 
-query I
-PRAGMA lpts_check('SELECT product, region, count(*) FROM sales GROUP BY product, region HAVING count(*) >= 2');
-----
-true
+statement ok
+SELECT product, region, count(*) FROM sales GROUP BY product, region HAVING count(*) >= 2;
 
 # --- HAVING on empty table: no groups, no output ---
 
@@ -149,10 +128,8 @@ statement ok
 CREATE TABLE empty_sales (product VARCHAR, amount INTEGER);
 
 query II
-PRAGMA lpts_exec('SELECT product, count(*) FROM empty_sales GROUP BY product HAVING count(*) > 0');
+SELECT product, count(*) FROM empty_sales GROUP BY product HAVING count(*) > 0;
 ----
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM empty_sales GROUP BY product HAVING count(*) > 0');
-----
-true
+statement ok
+SELECT product, count(*) FROM empty_sales GROUP BY product HAVING count(*) > 0;

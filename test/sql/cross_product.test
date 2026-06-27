@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR);
 
 statement ok
@@ -23,43 +26,29 @@ statement ok
 INSERT INTO staff VALUES (1, 'eng', 50000), (2, 'sales', 60000);
 
 # Explicit CROSS JOIN
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u CROSS JOIN orders o');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u CROSS JOIN orders o;
 
 # Implicit cross product (comma notation)
-query I
-PRAGMA lpts_check('SELECT u.name, s.salary FROM users u, staff s');
-----
-true
+statement ok
+SELECT u.name, s.salary FROM users u, staff s;
 
 # 3-way cross product
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount, s.salary FROM users u, orders o, staff s');
-----
-true
+statement ok
+SELECT u.name, o.amount, s.salary FROM users u, orders o, staff s;
 
 # Cross product with filter (optimizer may convert to COMPARISON_JOIN or keep as CROSS + FILTER)
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u, orders o WHERE u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u, orders o WHERE u.id = o.user_id;
 
 # Cross product with aggregate
-query I
-PRAGMA lpts_check('SELECT u.name, SUM(o.amount) FROM users u CROSS JOIN orders o GROUP BY u.name');
-----
-true
+statement ok
+SELECT u.name, SUM(o.amount) FROM users u CROSS JOIN orders o GROUP BY u.name;
 
 # Cross product preserves all columns from both sides
-query I
-PRAGMA lpts_check('SELECT u.id, u.name, o.id, o.user_id, o.amount FROM users u CROSS JOIN orders o');
-----
-true
+statement ok
+SELECT u.id, u.name, o.id, o.user_id, o.amount FROM users u CROSS JOIN orders o;
 
 # Cross product with duplicate column names (both tables have "id")
-query I
-PRAGMA lpts_check('SELECT u.id, o.id FROM users u CROSS JOIN orders o');
-----
-true
+statement ok
+SELECT u.id, o.id FROM users u CROSS JOIN orders o;

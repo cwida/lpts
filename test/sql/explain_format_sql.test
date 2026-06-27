@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INT, name VARCHAR, age INT);
 
 statement ok
@@ -37,15 +40,11 @@ logical_opt	<REGEX>:(?s).*GROUP BY.*
 
 # --- round-trip correctness of the pipeline the feature reuses verbatim ---
 
-query I
-PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
-----
-true
+statement ok
+SELECT name FROM users WHERE age > 25;
 
-query I
-PRAGMA lpts_check('SELECT age, count(*) FROM users GROUP BY age');
-----
-true
+statement ok
+SELECT age, count(*) FROM users GROUP BY age;
 
 # --- NO REGRESSION: native EXPLAIN (FORMAT JSON) still works ---
 

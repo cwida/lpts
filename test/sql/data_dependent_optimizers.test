@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE dd_t(a INTEGER);
 
 statement ok
@@ -17,10 +20,8 @@ SELECT sql NOT LIKE '%WHERE false%' FROM lpts_query('SELECT * FROM dd_t WHERE a 
 ----
 true
 
-query I
-PRAGMA lpts_check('SELECT * FROM dd_t WHERE a > 10');
-----
-true
+statement ok
+SELECT * FROM dd_t WHERE a > 10;
 
 # Data-independent contradictions can still become empty results in
 # conservative mode. Only statistics-derived emptiness is disabled.
@@ -29,21 +30,17 @@ SELECT sql LIKE '%WHERE false%' FROM lpts_query('SELECT * FROM dd_t WHERE 1 = 0'
 ----
 true
 
-query I
-PRAGMA lpts_check('SELECT * FROM dd_t WHERE 1 = 0');
-----
-true
+statement ok
+SELECT * FROM dd_t WHERE 1 = 0;
 
 statement ok
 INSERT INTO dd_t VALUES (11);
 
-query I
-PRAGMA lpts_check('SELECT * FROM dd_t WHERE a > 10');
-----
-true
+statement ok
+SELECT * FROM dd_t WHERE a > 10;
 
 query I
-PRAGMA lpts_exec('SELECT * FROM dd_t WHERE a > 10');
+SELECT * FROM dd_t WHERE a > 10;
 ----
 11
 
@@ -181,10 +178,8 @@ true
 statement ok
 SET lpts_enable_data_dependent_optimizers = false;
 
-query I
-PRAGMA lpts_check('SELECT * FROM dd_a ORDER BY k LIMIT 10');
-----
-true
+statement ok
+SELECT * FROM dd_a ORDER BY k LIMIT 10;
 
 # Compressed materialization (active when data-dependent optimizers are on and group-key
 # stats allow compression) must round-trip: compress/decompress projections are skipped
@@ -204,10 +199,8 @@ SELECT sql NOT LIKE '%__internal%' FROM lpts_query('SELECT region, SUM(amount) A
 ----
 true
 
-query I
-PRAGMA lpts_check('SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dd_cm GROUP BY region');
-----
-true
+statement ok
+SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dd_cm GROUP BY region;
 
 statement ok
 SET lpts_enable_data_dependent_optimizers = false;

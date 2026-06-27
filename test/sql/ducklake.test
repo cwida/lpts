@@ -4,6 +4,9 @@
 
 require lpts
 
+statement ok
+SET lpts_check=true;
+
 require parquet
 
 statement ok
@@ -31,110 +34,76 @@ DELETE FROM dl.products WHERE product_id = 3;
 # Basic DuckLake scan
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT name FROM dl.products');
-----
-true
+statement ok
+SELECT name FROM dl.products;
 
-query I
-PRAGMA lpts_check('SELECT * FROM dl.products');
-----
-true
+statement ok
+SELECT * FROM dl.products;
 
-query I
-PRAGMA lpts_check('SELECT name, price FROM dl.products WHERE price > 10');
-----
-true
+statement ok
+SELECT name, price FROM dl.products WHERE price > 10;
 
-query I
-PRAGMA lpts_check('SELECT name FROM dl.products ORDER BY name');
-----
-true
+statement ok
+SELECT name FROM dl.products ORDER BY name;
 
 # ==========================================
 # DuckLake with aggregation
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT COUNT(*) FROM dl.products');
-----
-true
+statement ok
+SELECT COUNT(*) FROM dl.products;
 
-query I
-PRAGMA lpts_check('SELECT SUM(price), COUNT(*) FROM dl.products');
-----
-true
+statement ok
+SELECT SUM(price), COUNT(*) FROM dl.products;
 
 # ==========================================
 # DuckLake table_insertions
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT * FROM dl.table_insertions(''products'', 1, 2)');
-----
-true
+statement ok
+SELECT * FROM dl.table_insertions('products', 1, 2);
 
-query I
-PRAGMA lpts_check('SELECT name FROM dl.table_insertions(''products'', 1, 3)');
-----
-true
+statement ok
+SELECT name FROM dl.table_insertions('products', 1, 3);
 
-query I
-PRAGMA lpts_check('SELECT name, price FROM dl.table_insertions(''products'', 2, 3)');
-----
-true
+statement ok
+SELECT name, price FROM dl.table_insertions('products', 2, 3);
 
 # ==========================================
 # DuckLake table_deletions
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT * FROM dl.table_deletions(''products'', 1, 4)');
-----
-true
+statement ok
+SELECT * FROM dl.table_deletions('products', 1, 4);
 
-query I
-PRAGMA lpts_check('SELECT name FROM dl.table_deletions(''products'', 1, 4)');
-----
-true
+statement ok
+SELECT name FROM dl.table_deletions('products', 1, 4);
 
 # ==========================================
 # DuckLake table_changes (macro: UNION ALL of insertions + deletions with MARK JOINs)
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT change_type, name FROM dl.table_changes(''products'', 1, 4)');
-----
-true
+statement ok
+SELECT change_type, name FROM dl.table_changes('products', 1, 4);
 
-query I
-PRAGMA lpts_check('SELECT * FROM dl.table_changes(''products'', 1, 4)');
-----
-true
+statement ok
+SELECT * FROM dl.table_changes('products', 1, 4);
 
-query I
-PRAGMA lpts_check('SELECT change_type, price FROM dl.table_changes(''products'', 2, 3)');
-----
-true
+statement ok
+SELECT change_type, price FROM dl.table_changes('products', 2, 3);
 
 # ==========================================
 # DuckLake time travel: AT VERSION
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT * FROM dl.products AT (VERSION => 2)');
-----
-true
+statement ok
+SELECT * FROM dl.products AT (VERSION => 2);
 
-query I
-PRAGMA lpts_check('SELECT name FROM dl.products AT (VERSION => 2)');
-----
-true
+statement ok
+SELECT name FROM dl.products AT (VERSION => 2);
 
-query I
-PRAGMA lpts_check('SELECT name, price FROM dl.products AT (VERSION => 3) WHERE price > 10');
-----
-true
+statement ok
+SELECT name, price FROM dl.products AT (VERSION => 3) WHERE price > 10;
 
 # ==========================================
 # Multi-table DuckLake join
@@ -146,10 +115,8 @@ CREATE TABLE dl.categories(cat_id INTEGER, cat_name VARCHAR);
 statement ok
 INSERT INTO dl.categories VALUES (1, 'Electronics'), (2, 'Tools');
 
-query I
-PRAGMA lpts_check('SELECT p.name, c.cat_name FROM dl.products p JOIN dl.categories c ON p.product_id = c.cat_id');
-----
-true
+statement ok
+SELECT p.name, c.cat_name FROM dl.products p JOIN dl.categories c ON p.product_id = c.cat_id;
 
 # ==========================================
 # DuckLake + regular DuckDB table (hybrid)
@@ -161,39 +128,29 @@ CREATE TABLE local_tags(product_id INTEGER, tag VARCHAR);
 statement ok
 INSERT INTO local_tags VALUES (1, 'popular'), (2, 'new'), (4, 'sale');
 
-query I
-PRAGMA lpts_check('SELECT p.name, t.tag FROM dl.products p JOIN local_tags t ON p.product_id = t.product_id');
-----
-true
+statement ok
+SELECT p.name, t.tag FROM dl.products p JOIN local_tags t ON p.product_id = t.product_id;
 
 # ==========================================
 # DuckLake aggregation over table_insertions
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT COUNT(*), SUM(price) FROM dl.table_insertions(''products'', 1, 3)');
-----
-true
+statement ok
+SELECT COUNT(*), SUM(price) FROM dl.table_insertions('products', 1, 3);
 
-query I
-PRAGMA lpts_check('SELECT name, SUM(price) FROM dl.table_insertions(''products'', 1, 3) GROUP BY name');
-----
-true
+statement ok
+SELECT name, SUM(price) FROM dl.table_insertions('products', 1, 3) GROUP BY name;
 
 # ==========================================
 # DuckLake time travel with aggregation
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT COUNT(*) FROM dl.products AT (VERSION => 2)');
-----
-true
+statement ok
+SELECT COUNT(*) FROM dl.products AT (VERSION => 2);
 
 # ==========================================
 # DuckLake insertions + deletions UNION ALL (simulates IVM delta)
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT name, true AS mul FROM dl.table_insertions(''products'', 1, 4) UNION ALL SELECT name, false AS mul FROM dl.table_deletions(''products'', 1, 4)');
-----
-true
+statement ok
+SELECT name, true AS mul FROM dl.table_insertions('products', 1, 4) UNION ALL SELECT name, false AS mul FROM dl.table_deletions('products', 1, 4);
