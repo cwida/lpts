@@ -39,5 +39,7 @@ the number of successful queries needs investigation before the change is ready.
 
 A second, broader correctness sweep runs DuckDB's own sqllogic corpus
 (`duckdb/test/sql/**`) through LPTS in parallel and gates against a committed
-baseline. See [test.md](test.md#duckdb-suite-coverage-regression-gate) and
+baseline — this is part of `make test` (also available as `make coverage-check`
+/ `make coverage-baseline`). See
+[test.md](test.md#duckdb-suite-coverage-regression-gate) and
 `scripts/run_duckdb_lpts_coverage.sh`.

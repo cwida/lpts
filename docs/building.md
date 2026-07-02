@@ -56,6 +56,15 @@ build/release/duckdb -unsigned
 LOAD 'build/release/extension/lpts/lpts.duckdb_extension';
 ```
 
+## Run Tests
+
+```bash
+make unittest           # LPTS's own SQLLogicTests (fast)
+make test               # unittest + the DuckDB-corpus coverage gate (~4 min)
+```
+
+See [test.md](test.md) for conventions and the coverage gate.
+
 ## Format Code
 
 ```bash

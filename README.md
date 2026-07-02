@@ -26,9 +26,14 @@ PRAGMA lpts('SELECT name FROM users WHERE age > 25');
 ```
 
 ```text
-WITH scan_0 (t0_name) AS (SELECT name FROM memory.main.users WHERE age>25),
-projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
-SELECT t1_name AS "name" FROM projection_1;
+WITH
+t0_scan (t0_name) AS (
+    SELECT  "name"
+    FROM    memory.main.users
+    WHERE   (age>25)
+)
+SELECT  t0_name AS "name"
+FROM    t0_scan;
 ```
 
 LPTS plans the query through DuckDB, optimizes it, then serializes the optimized
@@ -51,9 +56,14 @@ EXPLAIN (FORMAT SQL) SELECT name FROM users WHERE age > 25;
 ││  Optimized Logical Plan   ││
 │└───────────────────────────┘│
 └─────────────────────────────┘
-WITH scan_0 (t0_name) AS (SELECT "name" FROM memory.main.users WHERE age>25),
-projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
-SELECT t1_name AS "name" FROM projection_1;
+WITH
+t0_scan (t0_name) AS (
+    SELECT  "name"
+    FROM    memory.main.users
+    WHERE   (age>25)
+)
+SELECT  t0_name AS "name"
+FROM    t0_scan;
 ```
 
 Because it is a genuine `EXPLAIN` statement, every client treats it like any other
@@ -108,11 +118,16 @@ pass without error.
 ## Supported Operators
 
 LPTS is intended to cover all logical operators produced by optimized DuckDB
-SELECT plans. The current regression suite round-trips all 22 TPC-H queries and
-exercises joins, aggregates, windows, set operations, CTEs, recursive CTEs,
-table functions, DuckLake scans, and inserts.
+SELECT plans. The regression suite round-trips all 22 TPC-H queries, the SQLStorm
+TPC-H corpus (17k queries, zero incorrect results), and DuckDB's own sqllogic test
+corpus (~3300 files run under `lpts_check`, gated in CI-style via `make test`:
+zero wrong translations and zero invalid-SQL failures). It exercises joins,
+aggregates, windows, set operations, CTEs, recursive CTEs, lateral joins, table
+functions, DuckLake scans, and inserts.
 
-Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
+Anything LPTS cannot faithfully reproduce fails explicitly with an
+`LPTS_<CODE>: ...` "not supported" error (a `NotImplementedException`) — it never
+silently emits wrong SQL.
 
 ## Settings
 
@@ -152,11 +167,14 @@ verification (for example `PRAGMA enable_verification`).
 
 Set the environment variable `LPTS_CHECK_LOG` to a file path to switch to log
 mode. With `lpts_check` on and `LPTS_CHECK_LOG` set, LPTS never raises; instead it
-appends one line per intercepted `SELECT` tagging the outcome: `<n> FAIL` (could not
-rewrite), `<n> OK` (bags matched), `<n> WRONG` (bags differed), or
+appends one line per intercepted `SELECT` tagging the outcome: `<n> OK` (bags
+matched), `<n> WRONG` (bags differed), `<n> UNSUPPORTED` (LPTS deliberately refused
+the query with an `LPTS_<CODE>: ...` "not supported" error), `<n> FAIL` (LPTS could
+not rewrite it and the error was *not* a deliberate refusal — a translation bug), or
 `<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, so the comparison is
 not trusted, with the heuristic's explanation). `<n>` is the 1-based interception index.
-This is how DuckDB's own sqllogic corpus is run through LPTS.
+This is how DuckDB's own sqllogic corpus is run through LPTS (see
+[docs/test.md](docs/test.md#duckdb-suite-coverage-regression-gate)).
 
 ## Examples
 
@@ -187,10 +205,15 @@ FROM lpts_query(
 ```
 
 ```text
-WITH scan_0 (t0_ts) AS (SELECT ts FROM events WHERE id>10),
-projection_1 (t1_day) AS (SELECT to_char(t0_ts, 'YYYY-MM-DD') FROM scan_0),
-order_2 (t1_day) AS (SELECT t1_day FROM projection_1 ORDER BY t1_day ASC NULLS LAST)
-SELECT t1_day AS "day" FROM order_2;
+WITH
+t0_scan (ts) AS (
+    SELECT  ts
+    FROM    events
+    WHERE   (id>10)
+)
+SELECT    to_char(ts, 'YYYY-MM-DD') AS "day"
+FROM      t0_scan
+ORDER BY  to_char(ts, 'YYYY-MM-DD') ASC NULLS LAST;
 ```
 
 ```sql
@@ -235,7 +258,7 @@ SELECT "order", strftime(ts, '%Y-%m-%d %H:%M:%S') AS formatted FROM events LIMIT
 ## Documentation
 
 - **[Building](docs/building.md)** - build, local loading, updating, and CLion setup
-- **[Tests](docs/test.md)** - SQLLogicTest conventions
+- **[Tests](docs/test.md)** - SQLLogicTest conventions and the DuckDB-corpus coverage gate (`make test`)
 - **[Benchmark](docs/benchmark.md)** - SQLStorm benchmark runner
 
 Maintainer: [ila](https://github.com/ila)

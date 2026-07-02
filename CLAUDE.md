@@ -19,6 +19,10 @@ When you're stuck — either unable to fix a bug after 2-3 attempts, or tempted 
 
 Always test your changes with real queries (e.g., create a table, run `PRAGMA lpts(...)` to check the SQL output, then `SET lpts_check = true` and run the query directly to verify round-trip correctness) before declaring success, not just unit tests.
 
+**Run the full validation (`make test`, i.e. unittest + the DuckDB-corpus coverage gate) when a feature
+is fully done or before pushing** — during iteration, use `make unittest` and targeted single-file runs
+instead (the gate takes a few minutes).
+
 **Only run the SQLStorm benchmark when a feature is fully done or before pushing.** Do not run it during iterative development — it takes several minutes even at the smallest scale factor. Run it like this:
 ```bash
 build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10
@@ -33,11 +37,12 @@ Never execute git commands that could lose code. Always ask the user for permiss
 - **Never remove a failing test to "fix" a failure.** If a test fails, fix the underlying bug. Tests exist for a reason.
 - **Only change `src/` and `test/` files** unless explicitly told otherwise. Do not touch CMakeLists.txt, Makefile, vcpkg.json, or any other project infrastructure files.
 - **Every test file MUST verify round-trip correctness**, not just that queries run without error. Set `SET lpts_check = true` once after `require lpts`, then run the query directly — LPTS transparently compares the original and the rewritten query and raises an error on a mismatch.
-- **Before implementing anything, search the existing codebase** for similar patterns or solutions. Check `src/logical_plan_to_sql.cpp` (`CreateCteNode`) as the canonical reference for operator-specific logic. Reuse before reinventing.
+- **Before implementing anything, search the existing codebase** for similar patterns or solutions. Check `BuildNode()` in `src/lpts_ast_builder.cpp` (logical operator → AST) and `FlattenNode()` in `src/lpts_ast_flattener.cpp` (AST → CTE list) as the canonical references for operator-specific logic. Reuse before reinventing.
 - **Use helper functions.** Factor shared logic into helpers. Check `src/lpts_helpers.cpp` and `src/include/lpts_helpers.hpp` for existing utilities (`VecToSeparatedList`, `EscapeSingleQuotes`, etc.).
 - **Never edit the `duckdb/` submodule.** The DuckDB source is read-only. All LPTS logic lives in `src/` and `test/`.
 - **Add `LPTS_DEBUG_PRINT` statements** at key processing points (entry into each operator case, before/after CTE node creation, at pipeline boundaries). Use the existing macro from `src/include/lpts_debug.hpp` — it is compiled out when `LPTS_DEBUG` is 0.
-- **The existing `logical_plan_to_sql.cpp` is your reference.** When implementing new AST or pipeline logic, use `CreateCteNode()` in `src/logical_plan_to_sql.cpp` as the ground truth for how each operator's data should be extracted and serialized.
+- **Follow the phase split.** Operator *extraction* (reading DuckDB's `LogicalOperator` internals) belongs in `src/lpts_ast_builder.cpp`; *serialization* (SQL text) belongs in `src/lpts_ast_flattener.cpp` and `src/cte_nodes.cpp`; expression rendering belongs in `src/lpts_expression_renderer.cpp`. Do not mix phases.
+- **Refuse cleanly, never emit wrong SQL.** When a query cannot be translated faithfully, raise an error whose message starts with `LPTS_<CODE>:` (use `ThrowLptsNotImplemented` from `src/lpts_helpers.cpp`). The coverage gate treats any non-`LPTS_`-formatted failure as a bug.
 
 ## What is LPTS?
 
@@ -45,11 +50,18 @@ LPTS (**L**ogical **P**lan **T**o **S**QL) is a DuckDB extension that takes a SQ
 
 ```
 D PRAGMA lpts('SELECT name FROM users WHERE age > 25');
--- WITH scan_0(t0_age, t0_name) AS (SELECT age, name FROM memory.main.users),
--- filter_1 AS (SELECT * FROM scan_0 WHERE (t0_age) > (CAST(25 AS INTEGER))),
--- projection_2(t1_name) AS (SELECT t0_name FROM filter_1)
--- SELECT t1_name AS name FROM projection_2;
+-- WITH
+-- t0_scan (t0_name) AS (
+--     SELECT  "name"
+--     FROM    memory.main.users
+--     WHERE   (age>25)
+-- )
+-- SELECT  t0_name AS "name"
+-- FROM    t0_scan;
 ```
+
+(CTE names are `t{N}_{operator}`; simple filter/projection chains are fused into the scan CTE by the
+pipeline-merging pass, and pushed-down filters render as scan-level `WHERE`.)
 
 ## Build & Test
 
@@ -58,10 +70,19 @@ GEN=ninja make          # build (release)
 make format-fix         # auto-format all source files (run before committing)
 
 make shell              # launch DuckDB shell with lpts extension loaded
-make unittest           # run all SQL logic tests
+make unittest           # run LPTS's own SQL logic tests (fast, use during iteration)
+
+make test               # unittest + the DuckDB-corpus coverage gate (~4 min; run before pushing)
+make coverage-check     # just the coverage gate
+make coverage-baseline  # regenerate test/duckdb_lpts_baseline.txt after intentional changes
 ```
 
 Build outputs go to `build/release/`. DuckDB is a git submodule in `duckdb/`.
+
+The coverage gate runs all ~3300 DuckDB sqllogic files through `lpts_check` (LOG mode) and fails on any
+NEW `WRONG` (wrong translation) or NEW `FAIL` (LPTS emitted SQL that did not parse/bind — the error was
+not a deliberate `LPTS_<CODE>` refusal). `UNSUPPORTED` (deliberate refusals) and `NONDETERMINISTIC` are
+acceptable. The committed baseline invariant is `wrong=0 fail=0`. See `docs/test.md` for details.
 
 ### Single test
 
@@ -88,17 +109,17 @@ The pipeline has three phases:
 Logical Plan  →  AST  →  CTE List  →  SQL String
 ```
 
-### Phase 1: `LogicalPlanToAst` (`src/lpts_pipeline.cpp`)
+### Phase 1: `LogicalPlanToAst` (`src/lpts_ast_builder.cpp`)
 
-Walks DuckDB's `LogicalOperator` tree and builds a dialect-agnostic AST. Each `LogicalOperator` node becomes a corresponding `AstNode` with parent-child relationships preserved via the `children` vector.
+Walks DuckDB's `LogicalOperator` tree and builds a dialect-agnostic AST. Each `LogicalOperator` node becomes a corresponding `AstNode` with parent-child relationships preserved via the `children` vector. The per-operator dispatch is `BuildNode()`; expression trees are rendered to SQL text via `src/lpts_expression_renderer.cpp`.
 
-### Phase 2: `AstToCteList` (`src/lpts_pipeline.cpp`)
+### Phase 2: `AstToCteList` (`src/lpts_ast_flattener.cpp`)
 
-Flattens the AST tree (post-order / bottom-up) into an ordered list of `CteNode` objects. Each `AstNode` becomes one CTE. The result is identical to what `LogicalPlanToSql::LogicalPlanToCteList()` produced before the AST layer was introduced.
+Flattens the AST tree (post-order / bottom-up) into an ordered list of `CteNode` objects via `FlattenNode()`. By default (`lpts_merge_pipeline = true`) chains of single-child pipeline operators (Filter/Project/Aggregate/Order/Limit over a scan) are fused into one `MergedSelectNode` — one CTE per *query block* instead of one per operator. Correlated subqueries are decorrelated here; some subtrees are rendered inline via `AstToInlineSQL()` instead of getting their own CTE.
 
-### Phase 3: CTE List → SQL String (already implemented)
+### Phase 3: CTE List → SQL String (`src/cte_nodes.cpp`)
 
-`CteList::ToQuery(true)` serializes the flat list into a WITH ... SELECT SQL string.
+`CteList::ToQuery(true)` serializes the flat list into a pretty-printed WITH ... SELECT SQL string. Each node class implements `ToQuery(SqlDialect)`; a final pass de-prefixes generated column names (`t0_name` → `name`) when globally unambiguous.
 
 ### Entry points: `src/lpts_extension.cpp`
 
@@ -113,9 +134,8 @@ Flattens the AST tree (post-order / bottom-up) into an ordered list of `CteNode`
 
 Both `lpts` and `lpts_query` call the same pipeline:
 ```cpp
-auto ast = LogicalPlanToAst(context, planner.plan);
-SqlDialect dialect = ReadDialect(context);
-auto cte_list = AstToCteList(*ast, dialect);
+auto ast = LogicalPlanToAst(context, plan, dialect);
+auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
 string result_sql = cte_list->ToQuery(true);
 ```
 
@@ -127,75 +147,116 @@ SET lpts_dialect = 'postgres';  -- or 'duckdb' (default)
 PRAGMA lpts('SELECT * FROM users');
 ```
 
-The `SqlDialect` enum is defined in `src/include/lpts_pipeline.hpp`.
+The `SqlDialect` enum and dialect predicates are defined in `src/include/sql_dialect.hpp` (implementation: `src/sql_dialect.cpp`). Supported output dialects: `duckdb`, `postgres`, `spark`, `hive`, `trino`/`presto`, `snowflake`, `bigquery`, `redshift`, `mysql`/`mariadb`. Dialect-specific function name/argument rewrites live in `src/dialect_function_map.cpp`; the input-dialect normalizer (`lpts_input_dialect`) lives in `src/lpts_parser.cpp` / `src/lpts_sql_scanner.cpp` / `src/lpts_date_format.cpp`.
 
 ### AST node hierarchy (`src/include/lpts_ast.hpp`)
 
 ```
 AstNode (abstract base, has vector<unique_ptr<AstNode>> children)
-├── AstGetNode        — table scan
-├── AstFilterNode     — WHERE clause
-├── AstProjectNode    — column selection
-├── AstAggregateNode  — GROUP BY + aggregates
-├── AstJoinNode       — JOIN
-├── AstUnionNode      — UNION / UNION ALL
-├── AstInsertNode     — INSERT INTO
-├── AstOrderNode      — ORDER BY
-├── AstLimitNode      — LIMIT / OFFSET
-└── AstDistinctNode   — SELECT DISTINCT
+├── AstGetNode             — table scan / table function
+├── AstFilterNode          — WHERE clause
+├── AstProjectNode         — column selection (also windows / unnest)
+├── AstAggregateNode       — GROUP BY + aggregates
+├── AstJoinNode            — JOIN (incl. MARK/SINGLE/SEMI/ANTI)
+├── AstDelimJoinNode       — correlated-subquery delim join
+├── AstDelimGetNode        — duplicate-eliminated correlation scan
+├── AstUnionNode           — UNION / UNION ALL
+├── AstSetOperationNode    — EXCEPT / INTERSECT [ALL]
+├── AstRecursiveCteNode    — WITH RECURSIVE
+├── AstMaterializedCteNode — WITH ... AS MATERIALIZED
+├── AstCteRefNode          — reference to a materialized CTE
+├── AstOrderNode           — ORDER BY
+├── AstLimitNode           — LIMIT / OFFSET
+├── AstTopNNode            — fused ORDER BY + LIMIT
+├── AstDistinctNode        — SELECT DISTINCT / DISTINCT ON
+├── AstSampleNode          — USING SAMPLE
+├── AstPositionalJoinNode  — POSITIONAL JOIN
+└── AstInsertNode          — INSERT INTO
 ```
 
-### CTE node hierarchy (`src/include/logical_plan_to_sql.hpp`)
+### CTE node hierarchy (`src/include/cte_nodes.hpp`)
 
 ```
-CteBaseNode (base)
-├── RootNode (virtual) — the final statement
+CteBaseNode (base, ToQuery(SqlDialect))
+├── RootNode (virtual) — the final statement, not wrapped in a CTE
 │   ├── FinalReadNode — closing SELECT that renames columns
-│   └── InsertNode — INSERT INTO ... SELECT * FROM <cte>
+│   ├── InsertNode    — INSERT INTO ... SELECT * FROM <cte>
+│   └── UpdateNode / DeleteNode — declared, not yet implemented
 └── CteNode (virtual) — one CTE in the WITH clause
-    ├── GetNode        — table scan
-    ├── FilterNode     — WHERE clause
-    ├── ProjectNode    — column selection
-    ├── AggregateNode  — GROUP BY
-    ├── JoinNode       — JOIN
-    └── UnionNode      — UNION / UNION ALL
+    ├── GetNode / FilterNode / ProjectNode / AggregateNode
+    ├── JoinNode / PositionalJoinNode / DelimGetNode
+    ├── UnionNode / ExceptNode / CteSetOperationNode
+    ├── OrderNode / LimitNode / TopNNode / DistinctNode / SampleNode
+    ├── RecursiveCteNode  — WITH RECURSIVE body
+    └── MergedSelectNode  — fused query block (pipeline fusion output)
 ```
 
 ## Key Source Files
 
 | File | Purpose |
 |---|---|
-| `src/lpts_extension.cpp` | Extension entry point. Registers all pragmas, table functions, and the `lpts_dialect` setting. |
-| `src/logical_plan_to_sql.cpp` | **Reference implementation.** The original converter (logical plan → CTE list). Use `CreateCteNode()` as the canonical reference for operator extraction logic. |
-| `src/include/logical_plan_to_sql.hpp` | CTE node class hierarchy + `LogicalPlanToSql` class declaration. |
+| `src/lpts_extension.cpp` | Extension entry point. Registers pragmas, table functions, all `lpts_*` settings, and the `lpts_check` optimizer hook (strict + `LPTS_CHECK_LOG` log mode, nondeterminism heuristics). |
+| `src/lpts_ast_builder.cpp` | **Phase 1.** `LogicalPlanToAst` / `BuildNode()` — walks the `LogicalOperator` tree, extracts per-operator data into AST nodes. The canonical reference for operator extraction logic. |
+| `src/lpts_ast_flattener.cpp` | **Phase 2.** `AstToCteList` / `FlattenNode()` — flattens the AST into a CTE list; pipeline fusion, decorrelation, inline-SQL rendering (`AstToInlineSQL`). |
+| `src/cte_nodes.cpp` | **Phase 3.** `ToQuery()` implementations for every CTE node + `CteList::ToQuery` (pretty printer, column de-prefixing). |
+| `src/include/cte_nodes.hpp` | CTE node class hierarchy + `CteList` declaration. |
+| `src/lpts_expression_renderer.cpp` | Renders bound `Expression` trees to SQL text (constants, casts, functions, windows, lambdas, subquery markers). Shared by phases 1–2. |
 | `src/include/lpts_ast.hpp` | AST node class hierarchy (`AstGetNode`, `AstFilterNode`, etc.). |
-| `src/lpts_ast.cpp` | AST `ToString()` implementations (and `PrintAst()`). `AstGetNode::ToString()` is the fully implemented reference. |
-| `src/lpts_ast_renderer.cpp` | Box-rendered ASCII tree printer for AST debugging. |
-| `src/include/lpts_pipeline.hpp` | Pipeline function declarations: `LogicalPlanToAst`, `AstToCteList`, `SqlDialect`, `ParseSqlDialect`. |
-| `src/lpts_pipeline.cpp` | Pipeline function implementations — main work area for the AST layer. |
+| `src/lpts_ast.cpp` | AST `ToString()` implementations (and `PrintAst()`). |
+| `src/lpts_ast_renderer.cpp` | Box-rendered ASCII tree printer for AST debugging (`PRAGMA print_ast`). |
+| `src/include/lpts_pipeline.hpp` | Pipeline entry-point declarations: `LogicalPlanToAst`, `AstToCteList`. |
+| `src/sql_dialect.cpp` / `src/include/sql_dialect.hpp` | `SqlDialect` enum, dialect predicates, identifier quoting (`DialectQuoteIdent`). |
+| `src/dialect_function_map.cpp` | Per-dialect function name/argument rewrites for output SQL. |
+| `src/lpts_parser.cpp`, `src/lpts_sql_scanner.cpp`, `src/lpts_date_format.cpp` | Input-dialect normalization (`lpts_input_dialect`, `lpts_normalize_query`). |
 | `src/include/lpts_debug.hpp` | Debug flag (`LPTS_DEBUG`) and `LPTS_DEBUG_PRINT` macro. |
-| `src/lpts_helpers.cpp` | Utility functions (`VecToSeparatedList`, `EscapeSingleQuotes`, etc.). |
-| `src/include/lpts_helpers.hpp` | Utility function declarations. |
+| `src/lpts_helpers.cpp` / `src/include/lpts_helpers.hpp` | Utility functions (`VecToSeparatedList`, `EscapeSingleQuotes`, `ThrowLptsNotImplemented`, etc.). |
+| `scripts/run_duckdb_lpts_coverage.sh` | DuckDB sqllogic suite coverage gate (`make coverage-check`); baseline in `test/duckdb_lpts_baseline.txt`. |
 | `test/sql/*.test` | SQL logic tests — must always pass. |
 
 ## Testing
 
 ### Existing test files
 
-| Test file | Operators covered |
+| Test file | Covers |
 |---|---|
 | `test/sql/select.test` | GET, FILTER, PROJECTION |
-| `test/sql/group_by.test` | GET, PROJECTION, AGGREGATE |
-| `test/sql/having.test` | AGGREGATE + FILTER (HAVING) |
-| `test/sql/join.test` | GET, PROJECTION, JOIN, UNION |
+| `test/sql/group_by.test` | GET, PROJECTION, AGGREGATE, GROUPING SETS, quantiles |
+| `test/sql/having.test` | AGGREGATE + FILTER (HAVING), incl. HAVING without GROUP BY |
+| `test/sql/join.test` | JOIN types, MARK/SINGLE joins, UNION |
 | `test/sql/union.test` | UNION / UNION ALL |
+| `test/sql/setops_unnest.test` | EXCEPT / INTERSECT, UNNEST |
 | `test/sql/order_limit.test` | ORDER BY, LIMIT, OFFSET |
-| `test/sql/distinct.test` | SELECT DISTINCT |
-| `test/sql/functions.test` | Scalar functions, casts |
-| `test/sql/lambda.test` | Lambda expressions |
+| `test/sql/distinct.test` | SELECT DISTINCT / DISTINCT ON |
+| `test/sql/functions.test` | Scalar functions, casts, `array_to_string` |
+| `test/sql/operators.test` | Operator rendering |
+| `test/sql/cast.test` | Constant type fidelity (ENUM, BIT, INT_MIN, typed NULL, ...) |
+| `test/sql/lambda.test` | Lambda expressions incl. captures |
+| `test/sql/lateral_join.test` | LATERAL joins |
+| `test/sql/single_join.test` | Scalar-subquery SINGLE joins |
+| `test/sql/correlated_subquery_null.test` | Correlated EXISTS / row-IN NULL (3-valued) semantics |
+| `test/sql/cte.test` | CTEs, recursive CTEs |
+| `test/sql/window.test` | Window functions |
+| `test/sql/cross_product.test` | Cross products |
+| `test/sql/between.test` | BETWEEN |
+| `test/sql/struct_pushdown.test` | Struct field-extraction pushdown |
+| `test/sql/virtual_columns.test` | Virtual/path-derived columns, hive partition filters |
+| `test/sql/identifiers.test` | Case-insensitive / unicode identifier handling |
+| `test/sql/dup_column_names.test` | Generated CTE column-name de-duplication |
+| `test/sql/fail_reduction.test` | Regression tests for once-invalid-SQL renderings (large grab bag) |
+| `test/sql/read_parquet_union_by_name.test` | read_parquet named-argument round-trip |
+| `test/sql/rendering_edges.test` | Miscellaneous rendering edge cases |
+| `test/sql/merge_pipeline.test` | Pipeline-fusion (merged SELECT) behavior |
+| `test/sql/pretty_print.test` | Exact generated-SQL layout |
+| `test/sql/optimizer.test` | Optimizer interaction |
+| `test/sql/data_dependent_optimizers.test` | `lpts_enable_data_dependent_optimizers` |
+| `test/sql/tpch.test` | All 22 TPC-H queries under `lpts_check` |
+| `test/sql/ducklake.test` | DuckLake scans |
+| `test/sql/explain_format_sql.test` | `EXPLAIN (FORMAT SQL)` |
 | `test/sql/print_ast.test` | AST `ToString()` output |
-| `test/sql/check_mode.test` | `lpts_check` round-trip correctness (canonical example) |
-| `test/sql/pragmas.test` | Public function metadata (5 functions) |
+| `test/sql/check_mode.test` | `lpts_check` round-trip semantics (canonical example) |
+| `test/sql/pragmas.test` | Public function metadata |
+| `test/sql/normalization.test`, `test/sql/input_dialect.test` | Input-dialect normalization |
+| `test/sql/dialect_*.test` | Output dialects (Postgres, Spark, Hive/Trino/Presto, Snowflake/Redshift, BigQuery, MySQL/MariaDB) + hardening |
 
 ### Test structure conventions
 
@@ -233,7 +294,7 @@ The canonical example test file is `test/sql/check_mode.test`.
 
 ### TPC-H coverage queries
 
-The file `tpch-umbra-flat-cte-list.txt` (in the repository root or provided separately) contains all 22 TPC-H queries paired with their expected flat-CTE SQL output as generated by Umbra. These are high-value regression tests for multi-table joins, aggregations, subqueries, and complex filters.
+`test/sql/tpch.test` runs TPC-H queries through `lpts_check`. These are high-value regression tests for multi-table joins, aggregations, subqueries, and complex filters.
 
 When adding TPC-H tests:
 - Set `SET lpts_check = true` once, then run each TPC-H query directly to verify round-trip correctness on TPC-H tables
@@ -262,12 +323,11 @@ SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, count(*) AS count
 
 ### SQL Storm coverage queries
 
-The `SQL-Storm-queries/` directory contains 1000 SQL queries (files `100.sql` through `10999.sql`) over TPC-H schema tables. These are LLM-generated complex queries including CTEs, multi-way joins, window functions, and FULL OUTER JOIN — useful for stress-testing LPTS operator coverage.
+The SQLStorm corpus lives in `benchmark/sqlstorm/SQLStorm` (17036 TPC-H queries, run in bulk via `lpts_sqlstorm_benchmark` — see `docs/benchmark.md`). These are LLM-generated complex queries including CTEs, multi-way joins, window functions, and FULL OUTER JOIN — useful for stress-testing LPTS operator coverage or as a source of individual regression cases.
 
 When adding SQL Storm tests:
 - Select a representative sample (e.g., 10–20 queries that exercise different operator combinations)
-- Prioritize queries using only operators the AST layer currently supports (JOIN, GROUP BY, FILTER, PROJECTION)
-- Turn on `lpts_check` and run each query directly to verify correctness; queries that hit unsupported operators will throw `NotImplementedException` (expected during incremental development)
+- Turn on `lpts_check` and run each query directly to verify correctness; queries LPTS deliberately does not support raise an `LPTS_<CODE>: ...` error
 - Document which operators each test query exercises in a comment above the test
 
 ## Debugging
@@ -305,9 +365,11 @@ Run `make format-fix` to auto-format. The project uses DuckDB's `.clang-format` 
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `lpts_dialect` | VARCHAR | `"duckdb"` | SQL output dialect: `"duckdb"` or `"postgres"` |
-| `lpts_input_dialect` | VARCHAR | `"duckdb"` | Input dialect normalized before DuckDB parses the query |
+| `lpts_dialect` | VARCHAR | `"duckdb"` | SQL output dialect: `duckdb`, `postgres`, `spark`, `hive`, `trino`/`presto`, `snowflake`, `bigquery`, `redshift`, `mysql`/`mariadb` |
+| `lpts_input_dialect` | VARCHAR | `"duckdb"` | Input dialect normalized before DuckDB parses the query (same valid values) |
 | `lpts_check` | BOOLEAN | `false` | Transparently verify round-trip correctness of every top-level `SELECT` |
+| `lpts_merge_pipeline` | BOOLEAN | `true` | Fuse chains of single-child pipeline operators into one flat SELECT per query block instead of one CTE per operator |
+| `lpts_enable_data_dependent_optimizers` | BOOLEAN | `false` | Allow planning optimizers that depend on current data/statistics (off so output SQL is data-independent) |
 
 `lpts_check` strict mode raises `Invalid Input Error: LPTS check failed: ...` on a result mismatch and `Invalid Input Error: LPTS check: unsupported query (LPTS could not check it): ...` when LPTS cannot rewrite the query; nondeterministic queries are detected and pass. Setting the `LPTS_CHECK_LOG` environment variable to a file path switches to log mode: LPTS never raises and instead appends one line per intercepted `SELECT` — `<n> OK` (bags matched), `<n> WRONG` (bags differed), `<n> UNSUPPORTED` (deliberate `LPTS_<CODE>`-formatted "not supported" refusal), `<n> FAIL` (could not rewrite with a non-LPTS error — a translation bug, gated like WRONG), or `<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, with the heuristic's explanation).
 

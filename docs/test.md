@@ -5,9 +5,11 @@ Tests are DuckDB SQLLogicTests under `test/sql/`.
 ## Run All Tests
 
 ```bash
-GEN=ninja make
-build/release/test/unittest
+GEN=ninja make unittest   # LPTS's own tests (test/sql/*, fast — use during iteration)
+GEN=ninja make test       # unittest + the DuckDB-corpus coverage gate (~4 min — run before pushing)
 ```
+
+(`build/release/test/unittest "test/sql/*"` is the underlying command for the unit tests.)
 
 ## Run One Test File
 
@@ -67,8 +69,8 @@ LPTS is also exercised against DuckDB's *own* sqllogic corpus (`duckdb/test/sql/
 file runs in its own release `unittest` process with `SET lpts_check=true` and the `LPTS_CHECK_LOG`
 environment variable set — LOG mode, which never raises (so the DuckDB test's own outcome is unchanged)
 and instead logs LPTS's verdict per intercepted SELECT (`OK` / `WRONG` / `UNSUPPORTED` / `FAIL` /
-`NONDETERMINISTIC`). In
-LOG mode LPTS also neutralizes `PRAGMA enable_verification` (which ~55% of files self-enable) so those
+`NONDETERMINISTIC`).
+In LOG mode LPTS also neutralizes `PRAGMA enable_verification` (which ~55% of files self-enable) so those
 files are still checked.
 
 LPTS is loaded as a **statically-linked** extension (`DUCKDB_TEST_STATICALLY_LOADED_EXTENSIONS='[core_functions, lpts]'`),
