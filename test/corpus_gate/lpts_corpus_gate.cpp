@@ -119,7 +119,8 @@ static void RunUnittestProcess(const std::string &unittest, const std::string &r
                                int64_t timeout_sec) {
 #ifdef _WIN32
 	// Build an environment block: current environment minus overridden keys, plus the extras.
-	std::string env_block;
+	// CreateProcessA requires the ANSI block to be sorted case-insensitively by name.
+	std::vector<std::string> entries;
 	LPCH cur = GetEnvironmentStringsA();
 	for (LPCH p = cur; *p;) {
 		std::string entry(p);
@@ -133,13 +134,18 @@ static void RunUnittestProcess(const std::string &unittest, const std::string &r
 			}
 		}
 		if (!overridden) {
-			env_block += entry;
-			env_block.push_back('\0');
+			entries.push_back(std::move(entry));
 		}
 	}
 	FreeEnvironmentStringsA(cur);
 	for (auto &kv : extra_env) {
-		env_block += kv.first + "=" + kv.second;
+		entries.push_back(kv.first + "=" + kv.second);
+	}
+	std::sort(entries.begin(), entries.end(),
+	          [](const std::string &a, const std::string &b) { return _stricmp(a.c_str(), b.c_str()) < 0; });
+	std::string env_block;
+	for (auto &entry : entries) {
+		env_block += entry;
 		env_block.push_back('\0');
 	}
 	env_block.push_back('\0');
