@@ -1,0 +1,73 @@
+# name: test/sql/correlated_subquery_null.test
+# description: Correlated boolean-subquery decorrelation with NULL / three-valued logic. A MARK join's
+# group: [sql]
+
+#   mark must say "did a row match" (via a non-null sentinel), not "is the correlation key non-null" — the
+#   correlation key can itself be NULL and legitimately match. Multi-column IN must build a 3-valued mark
+#   (TRUE / FALSE / NULL) across all its comparisons.
+
+require lpts
+
+statement ok
+SET lpts_check = true;
+
+statement ok
+CREATE TABLE integers(i INTEGER);
+
+statement ok
+INSERT INTO integers VALUES (1),(2),(3),(NULL);
+
+# Correlated EXISTS whose subquery is true for the NULL outer row via an uncorrelated `i IS NULL`
+# disjunct — the NULL outer row must be TRUE, not FALSE (a key-based `rhs IS NOT NULL` mark got this wrong).
+query IT
+SELECT i, EXISTS(SELECT i FROM integers WHERE i IS NULL OR i>i1.i*10) AS e FROM integers i1 ORDER BY i;
+----
+1	true
+2	true
+3	true
+NULL	true
+
+# Correlated EXISTS whose subquery is true for the NULL outer row via an `i1.i IS NULL` disjunct.
+query IT
+SELECT i, EXISTS(SELECT i FROM integers WHERE i1.i>i OR i1.i IS NULL) AS e FROM integers i1 ORDER BY i;
+----
+1	false
+2	true
+3	true
+NULL	true
+
+# Multi-column (row) IN with three-valued logic: no exact match, but a NULL operand makes the membership
+# comparison indeterminate → NULL (not FALSE).
+statement ok
+CREATE TABLE table1(x INTEGER, y INTEGER);
+
+statement ok
+INSERT INTO table1 VALUES (NULL, 2), (1, NULL);
+
+statement ok
+CREATE TABLE table2(i INTEGER);
+
+statement ok
+INSERT INTO table2 VALUES (1),(2),(3);
+
+query I
+SELECT (x, y) IN (SELECT i, i + 1 FROM table2) AS m FROM table1 ORDER BY x;
+----
+NULL
+NULL
+
+# Multi-column IN true/false paths (exact match → TRUE; definitely-no-match with no NULLs → FALSE).
+statement ok
+CREATE TABLE pairs(x INTEGER, y INTEGER);
+
+statement ok
+INSERT INTO pairs VALUES (1, 2), (5, 5);
+
+query IT
+SELECT x, (x, y) IN (SELECT i, i + 1 FROM table2) AS m FROM pairs ORDER BY x;
+----
+1	true
+5	false
+
+statement ok
+SET lpts_check = false;

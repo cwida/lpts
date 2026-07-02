@@ -1,0 +1,172 @@
+# name: test/sql/merge_pipeline.test
+# description: lpts_merge_pipeline — fuse single-child pipeline chains into one flat SELECT
+# group: [sql]
+
+require lpts
+
+statement ok
+SET lpts_check=true;
+
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER, d INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 2, 5), (3, 4, 5), (10, 20, 7), (8, 1, 7);
+
+statement ok
+CREATE TABLE u (d INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO u VALUES (5, 'x'), (7, 'y');
+
+# ==========================================================================
+# Merged path (default ON): chains collapse into a single block_N CTE.
+# ==========================================================================
+
+# --- absorbed pushdown-free base-table scan: scan folds into the block FROM ---
+statement ok
+SELECT a + b AS x FROM t;
+
+query I
+SELECT sql LIKE '%FROM%memory.main.t%' AND sql NOT LIKE '%scan_%' FROM lpts_query('SELECT a + b AS x FROM t');
+----
+true
+
+# --- project + filter over a base table fuse into one block ---
+statement ok
+SELECT a FROM t WHERE b > 1;
+
+# --- aggregate + bottom-project + order + limit fuse (folded sum expression) ---
+statement ok
+SELECT d, sum(a + b) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s LIMIT 5;
+
+# The chain fuses GROUP BY + ORDER BY + LIMIT into one SELECT (the terminal block is inlined,
+# so they all land in the final statement; there are no separate order_/limit_/aggregate CTEs).
+query I
+SELECT sql LIKE '%GROUP BY%ORDER BY%' AND sql LIKE '%LIMIT%5%' AND sql NOT LIKE '%_order %' AND sql NOT LIKE '%_limit %'
+FROM lpts_query('SELECT d, sum(a + b) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s LIMIT 5');
+----
+true
+
+query II
+SELECT d, sum(a + b) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s;
+----
+5	10
+7	39
+
+# --- scalar aggregate (no GROUP BY) ---
+statement ok
+SELECT count(*) AS c, sum(a) AS s FROM t WHERE b > 1;
+
+# --- GROUPING SETS aggregate folds into one block ---
+statement ok
+SELECT d, b, sum(a) FROM t GROUP BY GROUPING SETS ((d), (b));
+
+# --- ORDER BY over an aggregate expression ---
+statement ok
+SELECT d, sum(a) AS s FROM t GROUP BY d ORDER BY sum(a) DESC;
+
+# --- HAVING: a filter directly above the aggregate folds into a HAVING clause ---
+statement ok
+SELECT d, sum(a) AS s FROM t GROUP BY d HAVING sum(a) > 5;
+
+query I
+SELECT sql LIKE '%GROUP BY%HAVING%' FROM lpts_query('SELECT d, sum(a) AS s FROM t GROUP BY d HAVING sum(a) > 5');
+----
+true
+
+# HAVING combined with WHERE, a top projection, ORDER BY and LIMIT — all one SELECT.
+statement ok
+SELECT d, sum(a) * 2 AS s FROM t WHERE b > 0 GROUP BY d HAVING sum(a) > 5 ORDER BY d LIMIT 5;
+
+# A filter above a projection with NO group-by is NOT treated as HAVING (stays correct).
+statement ok
+SELECT x FROM (SELECT a + b AS x FROM t) WHERE x > 5;
+
+# ==========================================================================
+# Boundaries: the chain is cut; the boundary stays its own CTE.
+# ==========================================================================
+
+# --- scan WITH a pushed-down predicate stays a separate scan CTE; the fused block is inlined ---
+query I
+SELECT sql LIKE '%t0_scan%' AND sql LIKE '%WHERE%a>0%' AND sql LIKE '%GROUP BY%'
+FROM lpts_query('SELECT d, sum(a) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s');
+----
+true
+
+# --- a single operator is NOT fused into a block (and the terminal is inlined) ---
+query I
+SELECT sql NOT LIKE '%block%' AND sql LIKE '%t0_scan%'
+FROM lpts_query('SELECT a FROM t WHERE b > 1');
+----
+true
+
+# --- window functions are NOT folded (stay a separate projection_N CTE) ---
+statement ok
+SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t;
+
+query I
+SELECT sql LIKE '%OVER%' AND sql LIKE '%projection_%'
+FROM lpts_query('SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t');
+----
+true
+
+# --- joins cut the chain ---
+statement ok
+SELECT t.a, u.name FROM t JOIN u USING (d) WHERE t.a > 0;
+
+query I
+SELECT sql LIKE '%join_%' FROM lpts_query('SELECT t.a, u.name FROM t JOIN u USING (d) WHERE t.a > 0');
+----
+true
+
+# --- DISTINCT cuts the chain ---
+statement ok
+SELECT DISTINCT d FROM t WHERE a > 0 ORDER BY d;
+
+# --- UNION cuts the chain ---
+statement ok
+SELECT a FROM t WHERE b > 1 UNION ALL SELECT d FROM t WHERE a > 5;
+
+# ==========================================================================
+# Substitution correctness: shared identifier prefixes must not collide.
+# ==========================================================================
+
+statement ok
+CREATE TABLE wide (val INTEGER, value INTEGER);
+
+statement ok
+INSERT INTO wide VALUES (1, 100), (2, 200);
+
+statement ok
+SELECT val + value AS combo FROM wide WHERE value > val;
+
+# ==========================================================================
+# Unmerged path: SET lpts_merge_pipeline=false restores one CTE per operator.
+# ==========================================================================
+
+statement ok
+SET lpts_merge_pipeline=false;
+
+# One CTE per operator (no fusion): separate aggregate and order CTEs; the terminal limit is
+# still inlined into the final SELECT (inlining is independent of the merge setting).
+query I
+SELECT sql NOT LIKE '%block%' AND sql LIKE '%_aggregate%' AND sql LIKE '%_order%' AND sql LIKE '%LIMIT%5%'
+FROM lpts_query('SELECT d, sum(a + b) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s LIMIT 5');
+----
+true
+
+statement ok
+SELECT d, sum(a + b) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s LIMIT 5;
+
+# With fusion off, no block_N CTE is ever produced.
+query I
+SELECT sql NOT LIKE '%block_%' FROM lpts_query('SELECT a + b AS x FROM t');
+----
+true
+
+# A non-pushable filter (on a window output) keeps a separate filter_N CTE unmerged.
+query I
+SELECT sql LIKE '%filter_%' FROM lpts_query('SELECT a FROM (SELECT a, sum(b) OVER () AS sb FROM t) WHERE sb > 1');
+----
+true

@@ -1,0 +1,92 @@
+# name: test/sql/struct_pushdown.test
+# description: struct field-extraction projection pushdown (GET emits struct_extract(...))
+# group: [sql]
+
+require lpts
+
+statement ok
+SET lpts_check = true;
+
+statement ok
+CREATE TABLE ts (
+    id INTEGER,
+    info STRUCT(a INTEGER, b BOOLEAN),
+    deep STRUCT(x STRUCT(y INTEGER, z VARCHAR))
+);
+
+statement ok
+INSERT INTO ts VALUES
+    (1, {'a': 42, 'b': true}, {'x': {'y': 7, 'z': 'hi'}}),
+    (2, NULL, NULL),
+    (3, {'a': NULL, 'b': false}, {'x': {'y': NULL, 'z': 'q'}});
+
+# DuckDB pushes the field access into the scan, so LPTS must emit struct_extract(info, 'a')
+# rather than the whole struct. Each query below is round-trip-checked by lpts_check.
+
+# --- single field ---
+query I
+SELECT info.a FROM ts ORDER BY id;
+----
+42
+NULL
+NULL
+
+# --- the rewrite is a struct_extract expression, not a quoted identifier ---
+query I
+SELECT sql LIKE '%struct_extract(%' FROM lpts_query('SELECT info.a FROM ts');
+----
+true
+
+# --- multiple fields from the same struct ---
+query II
+SELECT info.a, info.b FROM ts ORDER BY id;
+----
+42	true
+NULL	NULL
+NULL	false
+
+# --- the same field projected twice (dedup of the leaf alias) plus a plain column ---
+query IIII
+SELECT info.a, info.a, info.b, id FROM ts ORDER BY id;
+----
+42	42	true	1
+NULL	NULL	NULL	2
+NULL	NULL	false	3
+
+# --- a field alongside the whole struct ---
+query II
+SELECT info, info.a FROM ts ORDER BY id;
+----
+{'a': 42, 'b': true}	42
+NULL	NULL
+{'a': NULL, 'b': false}	NULL
+
+# --- nested two-level extraction ---
+query II
+SELECT deep.x.y, deep.x.z FROM ts ORDER BY id;
+----
+7	hi
+NULL	NULL
+NULL	q
+
+# --- field used in a WHERE predicate (pushed into the scan filter) ---
+query I
+SELECT id FROM ts WHERE info.b ORDER BY id;
+----
+1
+
+# --- field with an explicit scalar cast on the extracted leaf ---
+query I
+SELECT info.a::BIGINT FROM ts ORDER BY id;
+----
+42
+NULL
+NULL
+
+# --- struct cast that reorders the fields (pushed into the scan as a typed extract) ---
+query I
+SELECT info::STRUCT(b BOOLEAN, a INTEGER) FROM ts ORDER BY id;
+----
+{'b': true, 'a': 42}
+NULL
+{'b': false, 'a': NULL}
