@@ -150,6 +150,14 @@ static string RenderConstantForDialect(const BoundConstantExpression &constant, 
 	}
 	const auto &value = constant.value;
 	if (value.IsNull()) {
+		// An untyped NULL literal (SQLNULL) has no target-dialect cast type; emit a
+		// bare NULL, which is valid in every non-DuckDB dialect. Casting it to its own
+		// "NULL" type would hit the RenderCastTargetType whitelist and fail (e.g. the
+		// to_date/to_timestamp shim's CASE ... THEN NULL branches). Typed NULLs keep
+		// their explicit CAST so downstream type inference is preserved.
+		if (value.type().id() == LogicalTypeId::SQLNULL) {
+			return "NULL";
+		}
 		return "CAST(NULL AS " + RenderCastTargetType(value.type(), dialect) + ")";
 	}
 	switch (value.type().id()) {
