@@ -210,7 +210,7 @@ CteBaseNode (base, ToQuery(SqlDialect))
 | `src/lpts_parser.cpp`, `src/lpts_sql_scanner.cpp`, `src/lpts_date_format.cpp` | Input-dialect normalization (`lpts_input_dialect`, `lpts_normalize_query`). |
 | `src/include/lpts_debug.hpp` | Debug flag (`LPTS_DEBUG`) and `LPTS_DEBUG_PRINT` macro. |
 | `src/lpts_helpers.cpp` / `src/include/lpts_helpers.hpp` | Utility functions (`VecToSeparatedList`, `EscapeSingleQuotes`, `ThrowLptsNotImplemented`, etc.). |
-| `scripts/run_duckdb_lpts_coverage.sh` | DuckDB sqllogic suite coverage gate (`make coverage-check`); baseline in `test/duckdb_lpts_baseline.txt`. |
+| `test/corpus_gate/lpts_corpus_gate.cpp` | Standalone C++ driver for the DuckDB sqllogic suite coverage gate (`make coverage-check`); baseline in `test/duckdb_lpts_baseline.txt`. |
 | `test/sql/*.test` | SQL logic tests — must always pass. |
 
 ## Testing

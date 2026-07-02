@@ -33,9 +33,11 @@
   Queries reading
   LPTS's own table functions are skipped; under statement verification the check is skipped
   in strict mode and verification is neutralized in log mode so those files are still checked.
-- DuckDB sqllogic suite coverage gate: `scripts/run_duckdb_lpts_coverage.sh` runs DuckDB's
-  own `test/sql/**` corpus through LPTS in parallel (log mode) and diffs the per-file result
-  against the committed `test/duckdb_lpts_baseline.txt`, failing on any new `WRONG`.
+- DuckDB sqllogic suite coverage gate: `lpts_corpus_gate` (a standalone C++ driver built with the
+  extension, source in `test/corpus_gate/lpts_corpus_gate.cpp` — no shell or Python dependency, so it
+  also works on Windows) runs DuckDB's own `test/sql/**` corpus through LPTS in parallel (log mode,
+  one `unittest` subprocess per file) and diffs the per-file result against the committed
+  `test/duckdb_lpts_baseline.txt`, failing on any new `WRONG` or `FAIL`.
 
 ### Changed
 
@@ -148,7 +150,7 @@
   queries in-process (`PlanQuery` → `Planner::CreatePlan`), decorrelation ran against that second DuckDB
   copy, and DuckDB's count-bug rewrite (`CASE WHEN count_star() IS NULL THEN 0 ELSE count_star() END`) is
   gated on an `AggregateFunction` function-*pointer* comparison that fails across two copies — silently
-  dropping the fix (NULL instead of 0). `scripts/run_duckdb_lpts_coverage.sh` now loads lpts as a
+  dropping the fix (NULL instead of 0). The coverage-gate driver now loads lpts as a
   statically-linked extension (host's single DuckDB copy) via `DUCKDB_TEST_STATICALLY_LOADED_EXTENSIONS`,
   matching how a real `duckdb` binary resolves the dylib. Committed baseline: `wrong=19 → 13`.
 - `array_to_string(list, sep)` dropped its separator. DuckDB compiles it to `list_aggr(list, 'string_agg')`,

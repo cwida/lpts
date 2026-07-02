@@ -81,9 +81,10 @@ copy. DuckDB compares `AggregateFunction`s by function *pointer* (e.g. the count
 THEN 0` rewrite), which silently fails across two copies and yields spurious `WRONG`s. The statically-linked
 extension shares the host's single DuckDB copy, matching how a real `duckdb` binary resolves the loaded dylib.
 
-The driver `scripts/run_duckdb_lpts_coverage.sh` parallelizes this across files (the `unittest` binary
-itself is single-threaded; parallelism is file-level sharding via `xargs -P`, the way DuckDB CI
-parallelizes) and collapses each file's log into one diff-friendly summary line:
+The driver `lpts_corpus_gate` (a standalone C++ tool built with the extension, source in
+`test/corpus_gate/lpts_corpus_gate.cpp`; no shell/Python dependency, works on Windows) parallelizes this
+across files — the `unittest` binary itself is single-threaded, so parallelism is file-level sharding
+across `unittest` subprocesses — and collapses each file's log into one diff-friendly summary line:
 
 ```
 duckdb/test/sql/... ok=<n> wrong=<n> fail=<n> unsupported=<n> ndet=<n> [WRONG[i,...]] [FAIL[i,...]]
@@ -103,7 +104,7 @@ the check classifies anything else as `FAIL`. `NONDETERMINISTIC` is suppressed.
 GEN=ninja make test          # unit tests + the corpus coverage gate (the standard way to run it)
 make coverage-check          # just the gate (exit non-zero on any new WRONG / FAIL)
 make coverage-baseline       # (re)write test/duckdb_lpts_baseline.txt after intentional changes
-JOBS=12 scripts/run_duckdb_lpts_coverage.sh   # print the full per-file report to stdout
+JOBS=12 build/release/extension/lpts/lpts_corpus_gate   # print the full per-file report to stdout
 ```
 
 `test/duckdb_lpts_baseline.txt` is the committed regression floor (currently

@@ -23,10 +23,10 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # ------------------------------------------------------------------------------------------------
 .PHONY: coverage-check coverage-baseline
 coverage-check: release
-	bash scripts/run_duckdb_lpts_coverage.sh --check
+	build/release/extension/lpts/lpts_corpus_gate --check
 
 coverage-baseline: release
-	bash scripts/run_duckdb_lpts_coverage.sh --update-baseline
+	build/release/extension/lpts/lpts_corpus_gate --update-baseline
 
 # `make test` = the extension's own unit tests, then the corpus coverage gate.
 test: coverage-check
