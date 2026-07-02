@@ -302,12 +302,7 @@
   `read_*` calls with path-derived columns (`hive_partitioning`/`filename`), and `alias(expr)` (it
   reflects a column name that LPTS rewrites, so its string result cannot match the original).
 
-### Changed
-
-- Bumped the DuckDB target from `v1.5.3` to `v1.5.4` (submodule and CI). The 1.5.4
-  optimizer pushes trivial projections/filters into the scan, so single-table
-  `EXPLAIN (FORMAT SQL)` plans may collapse to a plain `SELECT` with no CTE; round-trip
-  correctness is unchanged.
+## 1.0.0 - 2026-06-23
 
 ### Added
 
@@ -316,6 +311,18 @@
   prints it as plain multi-line text and other clients (JDBC, Python, ...) receive the
   standard two-column `explain_key`/`explain_value` EXPLAIN result, similar to Umbra's
   plan-as-SQL output. Honors `lpts_dialect`. Implemented without changes to DuckDB core.
+
+### Changed
+
+- Generated SQL is now pretty-printed across multiple lines instead of a single line,
+  with HAVING fused into its aggregate and join build-side CTEs marked, for more
+  readable output.
+- Fewer CTEs are emitted while keeping execution order unambiguous, and column names
+  are now human-readable (e.g. `t0_scan (t0_name)`) rather than purely positional.
+- Bumped the DuckDB target from `v1.5.3` to `v1.5.4` (submodule and CI). The 1.5.4
+  optimizer pushes trivial projections/filters into the scan, so single-table plans may
+  collapse to a plain `SELECT` with no separate projection CTE; round-trip correctness
+  is unchanged.
 
 ## 0.9.0 - 2026-05-29
 
