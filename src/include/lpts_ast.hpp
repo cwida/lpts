@@ -74,6 +74,14 @@ public:
 	vector<string> cte_column_names; ///< CTE-scoped names (e.g. "t0_age", "t0_name").
 	vector<string> table_filters;    ///< Pushdown filters (as SQL strings).
 	idx_t table_function_output_count;
+	/// For a table function, the `_tf(...)` column-alias list in the function's *output* order (so the
+	/// positional alias maps correctly even when projection pushdown reorders/subsets the columns). Empty
+	/// means "use the projected column order" (the legacy behavior, kept for non-native cases).
+	vector<string> table_function_alias;
+	/// Parallel to `column_names`: true where the entry is a raw SQL expression (a struct field-extraction
+	/// pushdown, e.g. `struct_extract(c, 'a')`) that must be emitted verbatim rather than quoted as an
+	/// identifier. Empty means "all plain identifiers".
+	vector<bool> column_is_expression;
 
 	AstGetNode(string catalog, string schema, string table_name, size_t table_index, vector<string> column_names,
 	           vector<string> cte_column_names, vector<string> table_filters,
@@ -181,7 +189,26 @@ public:
 	vector<string> conditions;       ///< Join conditions as strings (e.g. "(t0_id = t1_user_id)").
 	vector<string> cte_column_names; ///< All output column names (left ++ right + mark if MARK join).
 	string mark_expression;          ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" expression.
-	bool is_asof;                    ///< True for DuckDB ASOF JOIN.
+	/// For a MARK join with exactly one NULL-propagating comparison, the left/right key SQL of that
+	/// comparison, plus the null-safe correlation conditions. Used to build the 3-valued mark
+	/// (TRUE/FALSE/NULL) the SQL semantics of IN/ANY/ALL require. Empty otherwise.
+	string mark_lhs_key;
+	string mark_rhs_key;
+	vector<string> mark_correlation_conditions;
+	/// One clause per NULL-propagating membership comparison, `((lhs op rhs) OR lhs IS NULL OR rhs IS NULL)`,
+	/// AND-ed to form the 3-valued mark's "indeterminate" test. Non-empty for IN/ANY/ALL (single or
+	/// multi-column); empty for EXISTS (2-valued).
+	vector<string> mark_membership_conditions;
+	/// Parallel per-membership pieces (rendered comparison, lhs SQL, rhs SQL) plus whether any join
+	/// condition is `=`/`IS NOT DISTINCT FROM`. A multi-condition mark join WITHOUT any equality executes
+	/// as a nested-loop join whose conditions match INDEPENDENTLY (per-condition OR, e.g. a decomposed
+	/// row `!=` from `x != ANY(...)`/`= ALL(...)`), needing a different rendering than the hash join's
+	/// per-row AND.
+	vector<string> mark_membership_comparisons;
+	vector<string> mark_membership_lhs;
+	vector<string> mark_membership_rhs;
+	bool mark_join_has_equality = false;
+	bool is_asof; ///< True for DuckDB ASOF JOIN.
 
 	AstJoinNode(JoinType join_type, vector<string> conditions, vector<string> cte_column_names,
 	            string mark_expression = "", bool is_asof = false)
@@ -368,6 +395,11 @@ public:
 class AstDistinctNode : public AstNode {
 public:
 	vector<string> cte_column_names; ///< passthrough from child.
+	/// DISTINCT ON: keep one row per `distinct_on_targets` group, choosing by `distinct_on_orders`.
+	/// When false this is a plain SELECT DISTINCT (targets/orders empty).
+	bool is_distinct_on = false;
+	vector<string> distinct_on_targets; ///< rendered ON expressions (PARTITION BY keys).
+	vector<string> distinct_on_orders;  ///< rendered "expr ASC/DESC NULLS ..." items (may be empty).
 
 	explicit AstDistinctNode(vector<string> cte_column_names) : cte_column_names(std::move(cte_column_names)) {
 	}
@@ -480,6 +512,20 @@ public:
 	vector<idx_t> delim_table_indices; ///< table_indices of ALL AstDelimGetNodes in the right subtree.
 
 	string mark_expression; ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" or empty.
+
+	// For a 3-valued IN/ANY/ALL mark (NULL when the membership comparison is indeterminate): the
+	// membership comparison's operand expressions and the null-safe correlation conditions. Empty for
+	// 2-valued (EXISTS) marks. See AstBuilder::ExtractMarkComparison and JoinNode::ToQuery.
+	string mark_lhs_key;
+	string mark_rhs_key;
+	vector<string> mark_correlation_conditions;
+	/// See AstJoinNode::mark_membership_conditions — one indeterminate clause per membership comparison.
+	vector<string> mark_membership_conditions;
+	/// See AstJoinNode — per-membership pieces + equality flag for the AND-vs-OR mark rendering choice.
+	vector<string> mark_membership_comparisons;
+	vector<string> mark_membership_lhs;
+	vector<string> mark_membership_rhs;
+	bool mark_join_has_equality = false;
 
 	AstDelimJoinNode(JoinType join_type_p, vector<string> conditions_p, vector<string> cte_column_names_p,
 	                 vector<idx_t> delim_table_indices_p, string mark_expression_p = "")

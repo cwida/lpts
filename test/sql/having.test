@@ -133,3 +133,22 @@ SELECT product, count(*) FROM empty_sales GROUP BY product HAVING count(*) > 0;
 
 statement ok
 SELECT product, count(*) FROM empty_sales GROUP BY product HAVING count(*) > 0;
+
+# --- HAVING without GROUP BY: an implicit single-group (ungrouped) aggregate collapses the input to
+# one row purely by being an aggregate, even when no aggregate value is projected. LPTS must not fuse a
+# constant projection over it (which would drop the aggregation and emit one row per input row). ---
+
+query I
+SELECT 1 AS one FROM (VALUES (1,2),(3,2)) t(a, b) HAVING 1 < 2;
+----
+1
+
+query I
+SELECT 1 AS one FROM (VALUES (1,2),(3,2)) t(a, b) HAVING false;
+----
+
+# Ungrouped aggregate whose value IS used still fuses/round-trips correctly.
+query I
+SELECT count(*) + 1 AS c FROM (VALUES (1,2),(3,2)) t(a, b) HAVING count(*) > 1;
+----
+3

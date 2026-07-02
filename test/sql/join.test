@@ -277,6 +277,96 @@ statement ok
 SELECT id, val FROM t1 WHERE id IN (SELECT id FROM t2_dups);
 
 # ============================================================
+# 3-valued MARK join: correlated ANY/ALL with NULLs
+# ============================================================
+# IN/ANY/ALL marks are 3-valued (NULL when the membership comparison
+# is indeterminate). A decorrelated mark join's conditions split into
+# null-safe correlation keys (IS NOT DISTINCT FROM) and a single
+# NULL-propagating membership comparison; the comparison's operands
+# drive the NULL (indeterminate) case. The membership comparison can
+# live in a LOGICAL_COMPARISON_JOIN or in the DELIM/DEPENDENT join path
+# (e.g. when the subquery returns a projected expression).
+
+statement ok
+CREATE TABLE integers (i INTEGER);
+
+statement ok
+INSERT INTO integers VALUES (1), (2), (3), (NULL);
+
+# Correlated ALL over a projected expression (DELIM mark join; the
+# comparison CAST(i AS DOUBLE) <= scalar_0 sits among the join
+# conditions). i=NULL yields NULL (indeterminate), excluded by ALL.
+query I
+SELECT i FROM integers i1 WHERE i > ALL(SELECT (i + i1.i - 1) / 2 FROM integers WHERE i IS NOT NULL) ORDER BY i;
+----
+3
+
+statement ok
+SELECT i FROM integers i1 WHERE i > ALL(SELECT (i + i1.i - 1) / 2 FROM integers WHERE i IS NOT NULL) ORDER BY i;
+
+# Uncorrelated ALL with a NULL in the subquery: every comparison is
+# indeterminate, so the ALL is never TRUE.
+query I
+SELECT i FROM integers WHERE i < ALL(SELECT i FROM integers) ORDER BY i;
+----
+
+statement ok
+SELECT i FROM integers WHERE i < ALL(SELECT i FROM integers) ORDER BY i;
+
+# Uncorrelated ANY with a NULL in the subquery.
+query I
+SELECT i FROM integers WHERE i = ANY(SELECT i FROM integers) ORDER BY i;
+----
+1
+2
+3
+
+statement ok
+SELECT i FROM integers WHERE i = ANY(SELECT i FROM integers) ORDER BY i;
+
+# Correlated ANY: each outer row checks membership against its own group.
+query I
+SELECT i FROM integers i1 WHERE i >= ANY(SELECT i FROM integers WHERE i <= i1.i) ORDER BY i;
+----
+1
+2
+3
+
+statement ok
+SELECT i FROM integers i1 WHERE i >= ANY(SELECT i FROM integers WHERE i <= i1.i) ORDER BY i;
+
+# ============================================================
+# SINGLE join (scalar subquery) must not multiply the outer row
+# ============================================================
+# A scalar subquery is a SINGLE join: at most one row per outer row. When the (decorrelated) subquery
+# carries duplicate rows per correlation key — e.g. a non-aggregated subquery over a multi-row table —
+# LPTS must deduplicate the right side, else the outer row is multiplied. Allow the multi-row form to
+# return one (arbitrary but here constant) row rather than raising.
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows = false;
+
+# The inner value (42 + i1.i) is constant w.r.t. the subquery's own rows, so the single value is
+# well-defined; the rewrite must still yield exactly one row per outer row.
+query II
+SELECT i, (SELECT 42 + i1.i FROM integers) AS j FROM integers i1 ORDER BY i;
+----
+1	43
+2	44
+3	45
+NULL	NULL
+
+statement ok
+SELECT i, (SELECT 42 + i1.i FROM integers) AS j FROM integers i1 ORDER BY i;
+
+# scalar subquery through a CTE
+statement ok
+SELECT i, (WITH t AS (SELECT 42 + i1.i AS j FROM integers) SELECT j FROM t) AS j FROM integers i1 ORDER BY i;
+
+statement ok
+RESET scalar_subquery_error_on_multiple_rows;
+
+# ============================================================
 # LOGICAL_EMPTY_RESULT: optimizer collapses to empty
 # ============================================================
 

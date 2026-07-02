@@ -309,7 +309,7 @@ Run `make format-fix` to auto-format. The project uses DuckDB's `.clang-format` 
 | `lpts_input_dialect` | VARCHAR | `"duckdb"` | Input dialect normalized before DuckDB parses the query |
 | `lpts_check` | BOOLEAN | `false` | Transparently verify round-trip correctness of every top-level `SELECT` |
 
-`lpts_check` strict mode raises `Invalid Input Error: LPTS check failed: ...` on a result mismatch and `Invalid Input Error: LPTS check: unsupported query (LPTS could not check it): ...` when LPTS cannot rewrite the query; nondeterministic queries are detected and pass. Setting the `LPTS_CHECK_LOG` environment variable to a file path switches to log mode: LPTS never raises and instead appends one line per intercepted `SELECT` — `<n> FAIL` (could not rewrite), `<n> OK` (bags matched), `<n> WRONG` (bags differed), or `<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, with the heuristic's explanation).
+`lpts_check` strict mode raises `Invalid Input Error: LPTS check failed: ...` on a result mismatch and `Invalid Input Error: LPTS check: unsupported query (LPTS could not check it): ...` when LPTS cannot rewrite the query; nondeterministic queries are detected and pass. Setting the `LPTS_CHECK_LOG` environment variable to a file path switches to log mode: LPTS never raises and instead appends one line per intercepted `SELECT` — `<n> OK` (bags matched), `<n> WRONG` (bags differed), `<n> UNSUPPORTED` (deliberate `LPTS_<CODE>`-formatted "not supported" refusal), `<n> FAIL` (could not rewrite with a non-LPTS error — a translation bug, gated like WRONG), or `<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, with the heuristic's explanation).
 
 ## DDL / usage examples
 

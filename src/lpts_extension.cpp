@@ -24,6 +24,9 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -776,7 +779,8 @@ static void LptsExplainSqlOptimize(OptimizerExtensionInput &input, unique_ptr<Lo
 //       "LPTS check failed", and a query LPTS cannot rewrite raises a specific "unsupported" error. Both
 //       are deterministic messages that a sqllogictest `statement error` can match.
 //   LOG (env set to a path) — lenient: never raises. For each checked SELECT it appends one line to that
-//       path — "<query_number> FAIL" (LPTS could not rewrite it), "<query_number> OK" (rewrote, bags
+//       path — "<query_number> UNSUPPORTED" (deliberate LPTS_<CODE> refusal), "<query_number> FAIL"
+//       (could not rewrite, non-LPTS error — a bug), "<query_number> OK" (rewrote, bags
 //       matched), "<query_number> WRONG" (rewrote, bags differed), or "<query_number> NONDETERMINISTIC:
 //       <reason>" (rewrote, but the query is nondeterministic so the comparison is not trusted; <reason>
 //       is the heuristic's explanation). The original rows are returned so the test run continues. The
@@ -812,6 +816,11 @@ public:
 	std::atomic<int> sides_remaining {0}; // "last one out" counter (init 2 per query)
 	bool suppress = false;                // query is likely nondeterministic → a diff is not a failure
 	string suppress_reason;               // why it was judged nondeterministic (logged with NONDETERMINISTIC)
+	// Like `suppress`, but only applied when the two sides actually DIFFER: the query is nondeterministic
+	// *conditionally* (e.g. a scalar subquery that returns an arbitrary row only when it matches >1 row). A
+	// deterministic run of such a query still matches and logs OK; only a genuine divergence is excused.
+	bool suppress_on_mismatch = false;
+	string suppress_on_mismatch_reason;
 	LptsCheckVerdict behavior = LptsCheckVerdict::STRICT;
 	idx_t qnum = 0;  // this SELECT's 1-based number (LOG mode)
 	string log_path; // LOG mode: where to append the per-query result line
@@ -822,6 +831,8 @@ public:
 		sides_remaining.store(0);
 		suppress = false;
 		suppress_reason.clear();
+		suppress_on_mismatch = false;
+		suppress_on_mismatch_reason.clear();
 		behavior = behavior_p;
 		qnum = qnum_p;
 		log_path = std::move(log_path_p);
@@ -838,7 +849,9 @@ public:
 	// is the heuristic's explanation, e.g. an order-sensitive aggregate or ORDER BY with LIMIT).
 	void ActOnVerdict() {
 		bool hashes_equal = (hash_sum.load() == cmp_sum.load());
-		bool match = hashes_equal || suppress;
+		// A conditional-nondeterminism excuse only applies when the sides actually diverged.
+		bool mismatch_excused = !hashes_equal && suppress_on_mismatch;
+		bool match = hashes_equal || suppress || mismatch_excused;
 		if (behavior == LptsCheckVerdict::STRICT) {
 			if (!match) {
 				throw InvalidInputException(
@@ -849,8 +862,14 @@ public:
 		} else if (suppress) {
 			string status = suppress_reason.empty() ? "NONDETERMINISTIC" : "NONDETERMINISTIC: " + suppress_reason;
 			LptsCheckAppendLog(log_path, qnum, status);
+		} else if (hashes_equal) {
+			LptsCheckAppendLog(log_path, qnum, "OK");
+		} else if (mismatch_excused) {
+			string status = suppress_on_mismatch_reason.empty() ? "NONDETERMINISTIC"
+			                                                    : "NONDETERMINISTIC: " + suppress_on_mismatch_reason;
+			LptsCheckAppendLog(log_path, qnum, status);
 		} else {
-			LptsCheckAppendLog(log_path, qnum, hashes_equal ? "OK" : "WRONG");
+			LptsCheckAppendLog(log_path, qnum, "WRONG");
 		}
 	}
 
@@ -1046,6 +1065,96 @@ public:
 	}
 };
 
+// Sequence functions read/advance sequence state, so running the original and the rewritten query in
+// succession sees different values — the round-trip cannot be verified even though the translation is
+// correct. The text-based nondeterminism heuristic misses these when they are hidden inside a macro
+// (the query text shows `my_macro(...)`, not `nextval(...)`), so also scan the bound plan, where macros
+// are already expanded.
+static bool ExpressionUsesSequenceFunction(const Expression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		const auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+		if (name == "nextval" || name == "currval" || name == "lastval") {
+			return true;
+		}
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (!found && ExpressionUsesSequenceFunction(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+static bool PlanUsesSequenceFunction(const LogicalOperator &op) {
+	for (const auto &expr : op.expressions) {
+		if (ExpressionUsesSequenceFunction(*expr)) {
+			return true;
+		}
+	}
+	for (const auto &child : op.children) {
+		if (PlanUsesSequenceFunction(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Does this subtree guarantee at most one row (so a scalar-subquery SINGLE join over it is well-defined)?
+// An aggregate collapses to ≤1 row per group; a LIMIT/TOP_N caps the count. Row-preserving single-child
+// operators (projection/filter/order) are transparent; anything else (scan, join, set-op, ...) can be
+// multi-row.
+static bool SubtreeGuaranteesSingleRow(const LogicalOperator &op) {
+	const LogicalOperator *cur = &op;
+	while (cur) {
+		switch (cur->type) {
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+			// Only an UNGROUPED aggregate yields exactly one row. A grouped aggregate yields ≤1 row per
+			// group, but a SINGLE join's correlation can match several groups per outer row (e.g. an
+			// `(ba = ra OR ra IS NULL)` link), so it is still multi-row-capable.
+			return cur->Cast<LogicalAggregate>().groups.empty();
+		case LogicalOperatorType::LOGICAL_LIMIT:
+		case LogicalOperatorType::LOGICAL_TOP_N:
+			return true;
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+			if (cur->children.size() != 1) {
+				return false;
+			}
+			cur = cur->children[0].get();
+			continue;
+		default:
+			return false;
+		}
+	}
+	return false;
+}
+
+// A SINGLE join implements a scalar subquery (≤1 row per outer). DuckDB enforces that at runtime: with the
+// default it raises on >1 row; with scalar_subquery_error_on_multiple_rows=false it returns an ARBITRARY
+// row (nondeterministic). LPTS decorrelates it to `LEFT JOIN (SELECT DISTINCT *)`, which is only faithful
+// when the RHS yields ≤1 row per key — otherwise it fans out / picks a different arbitrary row. Detecting a
+// SINGLE join whose subquery side is not row-count-bounded lets the check treat a *divergence* as
+// nondeterminism rather than a translation bug. Returns true if such a join exists.
+static bool PlanHasMultiRowSingleJoin(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		const auto &join = op.Cast<LogicalComparisonJoin>();
+		if (join.join_type == JoinType::SINGLE && op.children.size() == 2) {
+			const idx_t subquery_child = join.delim_flipped ? 0 : 1;
+			if (!SubtreeGuaranteesSingleRow(*op.children[subquery_child])) {
+				return true;
+			}
+		}
+	}
+	for (const auto &child : op.children) {
+		if (PlanHasMultiRowSingleJoin(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Optimizer hook (post-optimize): when lpts_check mode is on, replace a top-level SELECT's plan
 // with UNION ALL(LptsCheckHash(original), LptsCheckCmp(LPTS(original))).
 static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
@@ -1060,11 +1169,12 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		return; // EXPLAIN (FORMAT SQL) is owned by the explain hook.
 	}
 	auto &client_config = ClientConfig::GetConfig(input.context);
-	if (client_config.AnyVerification()) {
-		// Statement verification (e.g. PRAGMA enable_verification, common in DuckDB's own test corpus)
-		// round-trips the plan through serialization, and our injected extension operators
-		// (lpts_check_hash / lpts_check_sink) have no deserialization method — so we cannot rewrite a
-		// query while verification is active.
+	if (client_config.AnyVerification() || client_config.verify_parallelism) {
+		// Statement verification (e.g. PRAGMA enable_verification / verify_parallelism, common in DuckDB's
+		// own test corpus) re-runs the plan multiple times (serialization round-trip, parallel re-execution).
+		// Our injected extension operators (lpts_check_hash / lpts_check_sink) have no deserialization method,
+		// and repeated execution would double-count into the hash accumulators — so we cannot check a query
+		// while any verification is active.
 		//
 		// In LOG mode (the suite driver) more than half of DuckDB's .test files self-enable verification,
 		// which would otherwise leave them entirely unchecked. Since LOG mode never alters a query's
@@ -1077,6 +1187,7 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 			client_config.verify_external = false;
 			client_config.verify_serializer = false;
 			client_config.verify_fetch_row = false;
+			client_config.verify_parallelism = false;
 		}
 		return;
 	}
@@ -1129,9 +1240,27 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 	SqlDialect dialect = ReadDialect(input.context);
 	unique_ptr<LogicalOperator> original = std::move(plan);
 
+	// Plan-level nondeterminism: a sequence function (nextval/currval/lastval) may be hidden inside a macro
+	// that the text heuristic can't see. Macros are expanded in the bound plan, so scan it here.
+	if (!run.suppress && PlanUsesSequenceFunction(*original)) {
+		run.suppress = true;
+		run.suppress_reason = "sequence function (nextval/currval/lastval) advances/reads sequence state";
+	}
+
+	// A scalar-subquery SINGLE join over a subquery that can return >1 row is nondeterministic when
+	// scalar_subquery_error_on_multiple_rows=false (DuckDB returns an arbitrary row; by default it errors).
+	// LPTS's decorrelation can't reproduce that arbitrary choice, so a divergence here is nondeterminism,
+	// not a translation bug — excuse it, but only if the sides actually differ (a genuinely single-row run
+	// still matches and logs OK).
+	if (!run.suppress && PlanHasMultiRowSingleJoin(*original)) {
+		run.suppress_on_mismatch = true;
+		run.suppress_on_mismatch_reason = "scalar subquery may return >1 row (arbitrary row / error semantics)";
+	}
+
 	// Build UNION(hash pass-through, cmp sink). The original rows stream through unbuffered; both sides
 	// signal done (hash via OperatorFinalize, cmp via sink Finalize) and the last one out takes the
-	// verdict. If LPTS cannot rewrite the query: LOG logs FAIL and runs it unchecked; STRICT raises a
+	// verdict. If LPTS cannot rewrite the query: LOG logs UNSUPPORTED (a deliberate LPTS_<CODE> refusal)
+	// or FAIL (any other error — a translation bug) and runs it unchecked; STRICT raises a
 	// single, matchable "unsupported" error.
 	try {
 		original->ResolveOperatorTypes();
@@ -1163,7 +1292,13 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		if (behavior == LptsCheckVerdict::STRICT) {
 			throw InvalidInputException("LPTS check: unsupported query (LPTS could not check it): %s", e.what());
 		}
-		LptsCheckAppendLog(run.log_path, run.qnum, "FAIL"); // LOG: record + run the query unchecked
+		// LOG: record + run the query unchecked. A non-rewritable query is only ACCEPTABLE when the error
+		// is a deliberate, LPTS-formatted "not supported" refusal (ThrowLptsNotImplemented codes
+		// "LPTS_<CODE>: ...") — logged as UNSUPPORTED. Any other error means LPTS emitted SQL that did not
+		// parse/bind — a translation BUG — logged as FAIL so the coverage gate treats it like WRONG.
+		const string error_text = e.what();
+		const bool intentional_lpts_refusal = error_text.find("\"exception_message\":\"LPTS_") != string::npos;
+		LptsCheckAppendLog(run.log_path, run.qnum, intentional_lpts_refusal ? "UNSUPPORTED" : "FAIL");
 		if (!plan) {
 			plan = std::move(original);
 		}
@@ -1196,13 +1331,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Filter, and pushdown-free base-table scans) into one flat SELECT per query block "
 	                          "instead of one CTE per operator.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("lpts_check",
-	                          "When true, transparently verify every top-level SELECT: the query returns its "
-	                          "normal result, but LPTS rewrites it and, on a different result, raises 'LPTS check "
-	                          "failed' (an unsupported query raises a specific 'LPTS check: unsupported' error). If "
-	                          "the LPTS_CHECK_LOG environment variable points to a file, it instead logs one "
-	                          "'<query#> OK|FAIL [WRONG]' line per SELECT and never raises (suite-coverage mode).",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), LptsCheckSetCallback);
+	config.AddExtensionOption(
+	    "lpts_check",
+	    "When true, transparently verify every top-level SELECT: the query returns its "
+	    "normal result, but LPTS rewrites it and, on a different result, raises 'LPTS check "
+	    "failed' (an unsupported query raises a specific 'LPTS check: unsupported' error). If "
+	    "the LPTS_CHECK_LOG environment variable points to a file, it instead logs one "
+	    "'<query#> OK|WRONG|UNSUPPORTED|FAIL' line per SELECT and never raises (suite-coverage mode).",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false), LptsCheckSetCallback);
 
 	// Register PRAGMA lpts('query')
 	auto pragma = PragmaFunction::PragmaCall("lpts", LptsPragmaFunction, {LogicalType::VARCHAR});

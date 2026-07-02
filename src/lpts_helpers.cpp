@@ -19,6 +19,21 @@ string VecToSeparatedList(const vector<string> &input_list, const string &separa
 	return ret_str.str();
 }
 
+string BuildDistinctOnQuery(const vector<string> &cols, const vector<string> &targets, const vector<string> &orders,
+                            const string &from_clause) {
+	std::ostringstream window;
+	window << "row_number() OVER (PARTITION BY " << VecToSeparatedList(targets);
+	if (!orders.empty()) {
+		window << " ORDER BY " << VecToSeparatedList(orders);
+	}
+	window << ")";
+	const string col_list = VecToSeparatedList(cols);
+	std::ostringstream s;
+	s << "SELECT " << col_list << " FROM (SELECT " << col_list << ", " << window.str()
+	  << " AS _lpts_distinct_on_rn FROM " << from_clause << ") AS _lpts_distinct_on WHERE _lpts_distinct_on_rn = 1";
+	return s.str();
+}
+
 string JoinConditionsToSQL(const vector<string> &conditions) {
 	if (conditions.empty()) {
 		return "TRUE";
@@ -359,6 +374,31 @@ bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 		reason = "volatile random() expression";
 		return true;
 	}
+	// Volatile/non-reproducible scalar functions: random UUIDs and the debug stats() summary (depends on
+	// storage layout / cardinality estimates), which differ between the original and rewritten plans.
+	if (HasFunctionCall(sql, "uuid") || HasFunctionCall(sql, "uuidv4") || HasFunctionCall(sql, "uuidv7") ||
+	    HasFunctionCall(sql, "gen_random_uuid")) {
+		reason = "volatile UUID generator";
+		return true;
+	}
+	if (HasFunctionCall(sql, "stats")) {
+		reason = "stats() depends on storage layout / statistics";
+		return true;
+	}
+	// Stateful sequence access: nextval advances the sequence, so the original and the rewritten plan
+	// (which may reference it a different number of times) observe different values.
+	if (HasFunctionCall(sql, "nextval") || HasFunctionCall(sql, "currval")) {
+		reason = "sequence access (nextval/currval) is stateful";
+		return true;
+	}
+	// Wall-clock / transaction-time functions return a value that depends on when they run.
+	if (HasFunctionCall(sql, "now") || ContainsNormalizedPhrase(sql, "current_timestamp") ||
+	    ContainsNormalizedPhrase(sql, "current_date") || ContainsNormalizedPhrase(sql, "current_time") ||
+	    HasFunctionCall(sql, "get_current_timestamp") || HasFunctionCall(sql, "transaction_timestamp") ||
+	    HasFunctionCall(sql, "current_localtimestamp") || HasFunctionCall(sql, "current_localtime")) {
+		reason = "wall-clock/transaction time function";
+		return true;
+	}
 	if (HasWindowFunctionCall(sql, "row_number")) {
 		reason = "row_number over potentially tied ordering keys";
 		return true;
@@ -377,26 +417,40 @@ bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 		reason = "window function over potentially tied ordering keys";
 		return true;
 	}
-	if (ContainsNormalizedPhrase(sql, "limit") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with LIMIT/OFFSET may have tied boundary rows";
+	if (ContainsNormalizedPhrase(sql, "using sample") || ContainsNormalizedPhrase(sql, "tablesample")) {
+		reason = "row sampling (USING SAMPLE/TABLESAMPLE) returns a nondeterministic subset";
 		return true;
 	}
-	if (ContainsNormalizedPhrase(sql, "fetch first") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with FETCH FIRST may have tied boundary rows";
-		return true;
-	}
-	if (ContainsNormalizedPhrase(sql, "fetch next") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with FETCH NEXT may have tied boundary rows";
-		return true;
-	}
-	if (ContainsNormalizedPhrase(sql, "offset") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with OFFSET may have tied boundary rows";
+	// Row-count limiting (LIMIT/OFFSET/FETCH) selects an unspecified subset unless the input has a total
+	// order: with no ORDER BY the chosen rows are arbitrary, and with a non-total ORDER BY the boundary
+	// rows can tie. Either way the result bag is not guaranteed, so treat any such query as nondeterministic.
+	if (ContainsNormalizedPhrase(sql, "limit") || ContainsNormalizedPhrase(sql, "offset") ||
+	    ContainsNormalizedPhrase(sql, "fetch first") || ContainsNormalizedPhrase(sql, "fetch next")) {
+		reason = "LIMIT/OFFSET/FETCH selects an unspecified subset of rows";
 		return true;
 	}
 	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
 	    HasFunctionCall(sql, "stddev_samp") || HasFunctionCall(sql, "variance") || HasFunctionCall(sql, "var_pop") ||
 	    HasFunctionCall(sql, "var_samp")) {
 		reason = "strict floating aggregate equality may depend on evaluation order";
+		return true;
+	}
+	// An aggregate with an in-argument ORDER BY (e.g. `sum(x ORDER BY y)`) sorts its inputs before
+	// combining; for floating-point sums/products that makes the exact result depend on the ordering,
+	// which the original and rewritten plans need not share.
+	{
+		static const std::regex ordered_float_agg(R"(\b(sum|product|geomean|fsum|kahan_sum)\s*\([^()]*\border\s+by\b)",
+		                                          std::regex::icase);
+		if (std::regex_search(sql, ordered_float_agg)) {
+			reason = "ordered floating aggregate result may depend on summation order";
+			return true;
+		}
+	}
+	// Approximate aggregates (sketch/sample based) are not guaranteed to return the same value twice, so the
+	// original and LPTS-rewritten plans may legitimately disagree.
+	if (HasFunctionCall(sql, "approx_quantile") || HasFunctionCall(sql, "approx_count_distinct") ||
+	    HasFunctionCall(sql, "reservoir_quantile") || HasFunctionCall(sql, "approx_top_k")) {
+		reason = "approximate aggregate result is not exactly reproducible";
 		return true;
 	}
 	return false;

@@ -83,4 +83,13 @@ void RemoveRedundantWhitespaces(string &query);
 /// can depend on evaluation order (avg/stddev*/variance/var_*).
 bool IsLikelyNondeterministicSQL(const string &sql, string &reason);
 
+// Build the SQL for `DISTINCT ON (targets) ... [ORDER BY orders]` as a portable row_number() filter:
+//   SELECT <cols> FROM (SELECT <cols>, row_number() OVER (PARTITION BY <targets> [ORDER BY <orders>])
+//                       AS _lpts_distinct_on_rn FROM <from_clause>) AS _lpts_distinct_on
+//   WHERE _lpts_distinct_on_rn = 1
+// `from_clause` is a CTE name or a parenthesized subquery. `orders` may be empty (arbitrary row per group).
+// The rn column is consumed by the WHERE and never selected outward, so the fixed alias is safe when nested.
+string BuildDistinctOnQuery(const vector<string> &cols, const vector<string> &targets, const vector<string> &orders,
+                            const string &from_clause);
+
 } // namespace duckdb

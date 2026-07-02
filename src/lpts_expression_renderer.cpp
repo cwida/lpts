@@ -21,12 +21,211 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+
+#include <limits>
 
 namespace duckdb {
 
 LptsExpressionRenderer::LptsExpressionRenderer(SqlDialect _dialect, BindingResolver _binding_resolver)
     : dialect(_dialect), binding_resolver(std::move(_binding_resolver)) {
+}
+
+// A folded constant rendered bare (or via Value::ToSQLString's default) re-parses to a *different* type
+// than the original: a small TINYINT/HUGEINT shows as INTEGER, a FLOAT as DOUBLE, a BIT `00000001` as the
+// integer 1. Since the round-trip bag-hash is type-sensitive, these need an explicit CAST to pin the type.
+// Types whose literal already self-describes (INTEGER, DOUBLE, VARCHAR, BOOLEAN, DATE/TIME/TS, BLOB, ...)
+// do not, so we leave them bare to keep the generated SQL readable.
+// VARIANT (anywhere in the type, including inside LIST/ARRAY/STRUCT/MAP) has no faithful re-parseable SQL
+// literal, so a value of such a type is untranslatable.
+static bool TypeContainsVariant(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::VARIANT:
+		return true;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsVariant(ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT: {
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsVariant(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeContainsVariant(MapType::KeyType(type)) || TypeContainsVariant(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+// An UNNAMED struct type (a ROW value, e.g. produced by `(0, 0)` or list_zip's entries) cannot be written
+// in SQL — `STRUCT(INTEGER, INTEGER)` has no field names and does not parse — so neither a bare literal
+// nor a CAST('<text>' AS <type>) can express a constant containing one. Such values are rebuilt
+// structurally instead (see RenderConstantContainingUnnamedStruct).
+static bool TypeContainsUnnamedStruct(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsUnnamedStruct(ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT: {
+		if (StructType::IsUnnamed(type)) {
+			return true;
+		}
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsUnnamedStruct(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeContainsUnnamedStruct(MapType::KeyType(type)) || TypeContainsUnnamedStruct(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+// Structural type equality that ignores struct field names (`STRUCT(k INT, v INT)` vs
+// `STRUCT(INTEGER, INTEGER)`) and treats an untyped-NULL slot as compatible with anything: used to
+// recognize casts that are no-ops for re-binding (name-stripping / NULL-slot-typing only).
+static bool TypesEqualIgnoringStructNames(const LogicalType &a, const LogicalType &b) {
+	if (a.id() == LogicalTypeId::SQLNULL || b.id() == LogicalTypeId::SQLNULL) {
+		return true;
+	}
+	if (a.id() != b.id()) {
+		return false;
+	}
+	switch (a.id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypesEqualIgnoringStructNames(ListType::GetChildType(a), ListType::GetChildType(b));
+	case LogicalTypeId::STRUCT: {
+		const auto &ac = StructType::GetChildTypes(a);
+		const auto &bc = StructType::GetChildTypes(b);
+		if (ac.size() != bc.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < ac.size(); i++) {
+			if (!TypesEqualIgnoringStructNames(ac[i].second, bc[i].second)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::MAP:
+		return TypesEqualIgnoringStructNames(MapType::KeyType(a), MapType::KeyType(b)) &&
+		       TypesEqualIgnoringStructNames(MapType::ValueType(a), MapType::ValueType(b));
+	default:
+		return a == b;
+	}
+}
+
+// True when the type is (or nests) the untyped-NULL type, whose rendering `"NULL"` does not parse.
+static bool TypeContainsNullType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::SQLNULL:
+		return true;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsNullType(ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT: {
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsNullType(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeContainsNullType(MapType::KeyType(type)) || TypeContainsNullType(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+// Constants of these types cannot be expressed as a literal OR as a CAST from their text form: unnamed
+// structs have no writable type, and a UNION's text form does not cast back (VARCHAR is not implicitly
+// castable to the members). They are rebuilt structurally (RenderConstantContainingUnnamedStruct).
+static bool TypeNeedsStructuralRender(const LogicalType &type) {
+	if (TypeContainsUnnamedStruct(type)) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::UNION:
+	// An untyped-NULL element type renders as `"NULL"` inside the CAST target (e.g. `CAST('[]' AS
+	// "NULL"[])` for an empty list literal), which does not parse; the structural form (`[]`) does.
+	case LogicalTypeId::SQLNULL:
+		return true;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeNeedsStructuralRender(ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT: {
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeNeedsStructuralRender(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeNeedsStructuralRender(MapType::KeyType(type)) || TypeNeedsStructuralRender(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+static bool ConstantNeedsExplicitCast(const LogicalType &type) {
+	// Extension / user types (GEOMETRY, INET, ...): their text form has no literal syntax of its own
+	// (bare WKT does not even parse); CAST('<text>' AS <alias>) re-enters through the type's VARCHAR cast.
+	if (type.HasAlias()) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE: // a bare `2.0` re-parses as DECIMAL, not DOUBLE
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::BIT:
+	case LogicalTypeId::BIGNUM:
+	// ENUM: a folded enum value (e.g. `'happy'::mood`, or the ENUM('num','str') that union_tag(...) returns)
+	// renders bare as a plain VARCHAR string, losing the ENUM type. CAST('happy' AS ENUM('sad','ok','happy'))
+	// (type.ToString() inlines the full member list) restores the type so the type-sensitive bag-hash matches.
+	case LogicalTypeId::ENUM:
+	// GEOMETRY: ToSQLString has no case for it, so the value prints as bare WKT (not even a string
+	// literal); CAST('<wkt>' AS GEOMETRY) re-enters through the text cast.
+	case LogicalTypeId::GEOMETRY:
+	// Nested types whose element/field types are not preserved by the bare `[...]`/`{...}` literal
+	// (e.g. a DOUBLE[] prints as `[2.0, ...]` and re-parses as DECIMAL[]). CAST('<text>' AS <type>) casts
+	// the string form to the exact nested type. MAP values have NO bare literal at all — ToSQLString()
+	// yields the display form `{k=v}`, which only parses as a VARCHAR→MAP cast.
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::MAP:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// A bare INTEGER literal round-trips except its minimum value: `-2147483648` re-parses as BIGINT, because
+// `2147483648` overflows INT32 and is a BIGINT, then negated. (TINYINT/SMALLINT/BIGINT/HUGEINT are always
+// cast by ConstantNeedsExplicitCast, so INTEGER is the only signed width with this gap.) Value-conditional,
+// so ordinary INTEGER constants stay bare and readable.
+static bool IntegerConstantNeedsExplicitCast(const Value &value) {
+	return !value.IsNull() && value.type().id() == LogicalTypeId::INTEGER &&
+	       value.GetValue<int32_t>() == std::numeric_limits<int32_t>::min();
 }
 
 static bool IsDateFormatFunction(const string &function_name) {
@@ -101,6 +300,13 @@ static bool UsesArrowLambdaSyntax(SqlDialect dialect) {
 }
 
 static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) {
+	// Types with no SQL syntax cannot be a cast target in ANY dialect: an unnamed struct
+	// (`STRUCT(INTEGER, INTEGER)`, from row(...) values — only reachable here when the cast is NOT a
+	// names-only no-op, see BOUND_CAST) and internal aggregate-state types (`AGGREGATE_STATE<sum(...)>`).
+	if (TypeContainsUnnamedStruct(type) || type.id() == LogicalTypeId::AGGREGATE_STATE) {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
+		                        "the cast target type cannot be written in SQL");
+	}
 	if (IsDuckDBDialect(dialect)) {
 		return type.ToString();
 	}
@@ -211,7 +417,9 @@ bool LptsExpressionRenderer::TableFilterToSql(const TableFilter &filter, const s
 		for (auto &child_filter : and_filter.child_filters) {
 			string child_sql;
 			if (TableFilterToSql(*child_filter, column_name, child_sql)) {
-				children.push_back(std::move(child_sql));
+				// Parenthesize each child: a nested OR child must not lose grouping when joined with AND
+				// (AND binds tighter than OR, so `a AND b OR c` would mean `(a AND b) OR c`).
+				children.push_back("(" + std::move(child_sql) + ")");
 			}
 		}
 		if (children.empty()) {
@@ -228,12 +436,34 @@ bool LptsExpressionRenderer::TableFilterToSql(const TableFilter &filter, const s
 			if (!TableFilterToSql(*child_filter, column_name, child_sql)) {
 				return false;
 			}
-			children.push_back(std::move(child_sql));
+			children.push_back("(" + std::move(child_sql) + ")");
 		}
 		if (children.empty()) {
 			return false;
 		}
 		result = VecToSeparatedList(children, " OR ");
+		return true;
+	}
+	case TableFilterType::CONSTANT_COMPARISON: {
+		// Only reroute through the expression renderer when the compared constant needs a type-preserving
+		// cast (BIT/ENUM/HUGEINT/INT_MIN/...); e.g. a BIT filter `b = '111'` must emit `CAST('111' AS BIT)`,
+		// not the bare `111` that DuckDB's TableFilter::ToString produces (which re-parses as the integer
+		// 111). For ordinary constants, keep the compact `col op const` rendering (readability + exact-SQL
+		// tests).
+		auto &constant_filter = filter.Cast<ConstantFilter>();
+		// A VARCHAR constant containing a NUL byte also reroutes: the expression renderer rebuilds it as
+		// `'part' || chr(0) || 'part'` (a NUL cannot appear in a SQL literal).
+		const bool varchar_with_nul = constant_filter.constant.type().id() == LogicalTypeId::VARCHAR &&
+		                              !constant_filter.constant.IsNull() &&
+		                              StringValue::Get(constant_filter.constant).find('\0') != string::npos;
+		if (ConstantNeedsExplicitCast(constant_filter.constant.type()) ||
+		    IntegerConstantNeedsExplicitCast(constant_filter.constant) || varchar_with_nul) {
+			auto column_expr = make_uniq<BoundReferenceExpression>(column_name, LogicalType::INVALID, 0);
+			auto filter_expr = filter.ToExpression(*column_expr);
+			result = ExpressionToAliasedString(filter_expr);
+			return true;
+		}
+		result = filter.ToString(column_name);
 		return true;
 	}
 	case TableFilterType::EXPRESSION_FILTER: {
@@ -248,23 +478,27 @@ bool LptsExpressionRenderer::TableFilterToSql(const TableFilter &filter, const s
 	}
 }
 
-string LptsExpressionRenderer::QuantileArgument(const BoundAggregateExpression &aggregate) {
-	// DuckDB does not expose quantile arguments through the aggregate children after binding.
-	// Keep this layout-dependent access isolated so a future DuckDB upgrade has one place
-	// to update if QuantileBindData changes.
-	struct QuantileValueLayout {
-		Value val;
-		double dbl;
-		hugeint_t integral;
-		hugeint_t scaling;
-	};
-	struct QuantileBindDataLayout {
-		void *vtable;
-		vector<QuantileValueLayout> quantiles;
-		vector<idx_t> order;
-		bool desc;
-	};
-	const auto &bind_data = *reinterpret_cast<const QuantileBindDataLayout *>(aggregate.bind_info.get());
+// DuckDB does not expose quantile arguments through the function children after binding — they live in
+// the bind data, both for aggregate calls and for the same aggregate used as a window function. Keep the
+// layout-dependent access isolated here so a future DuckDB upgrade has one place to update if
+// QuantileBindData (defined in a .cpp) changes.
+namespace {
+struct QuantileValueLayout {
+	Value val;
+	double dbl;
+	hugeint_t integral;
+	hugeint_t scaling;
+};
+struct QuantileBindDataLayout {
+	void *vtable;
+	vector<QuantileValueLayout> quantiles;
+	vector<idx_t> order;
+	bool desc;
+};
+} // namespace
+
+static string QuantileArgumentFromBindInfo(const FunctionData &bind_info) {
+	const auto &bind_data = reinterpret_cast<const QuantileBindDataLayout &>(bind_info);
 	if (bind_data.quantiles.size() == 1) {
 		return bind_data.quantiles[0].val.ToSQLString();
 	}
@@ -275,12 +509,12 @@ string LptsExpressionRenderer::QuantileArgument(const BoundAggregateExpression &
 	return "[" + VecToSeparatedList(values) + "]";
 }
 
-string LptsExpressionRenderer::ApproxQuantileArgument(const BoundAggregateExpression &aggregate) {
+static string ApproxQuantileArgumentFromBindInfo(const FunctionData &bind_info) {
 	struct ApproxQuantileBindDataLayout {
 		void *vtable;
 		vector<float> quantiles;
 	};
-	const auto &bind_data = *reinterpret_cast<const ApproxQuantileBindDataLayout *>(aggregate.bind_info.get());
+	const auto &bind_data = reinterpret_cast<const ApproxQuantileBindDataLayout &>(bind_info);
 	if (bind_data.quantiles.size() == 1) {
 		return Value::FLOAT(bind_data.quantiles[0]).ToSQLString();
 	}
@@ -291,13 +525,13 @@ string LptsExpressionRenderer::ApproxQuantileArgument(const BoundAggregateExpres
 	return "[" + VecToSeparatedList(values) + "]";
 }
 
-string LptsExpressionRenderer::ReservoirQuantileArguments(const BoundAggregateExpression &aggregate) {
+static string ReservoirQuantileArgumentsFromBindInfo(const FunctionData &bind_info) {
 	struct ReservoirQuantileBindDataLayout {
 		void *vtable;
 		vector<double> quantiles;
 		idx_t sample_size;
 	};
-	const auto &bind_data = *reinterpret_cast<const ReservoirQuantileBindDataLayout *>(aggregate.bind_info.get());
+	const auto &bind_data = reinterpret_cast<const ReservoirQuantileBindDataLayout &>(bind_info);
 	vector<string> values;
 	for (const auto quantile : bind_data.quantiles) {
 		values.push_back(Value::DOUBLE(quantile).ToSQLString());
@@ -307,6 +541,27 @@ string LptsExpressionRenderer::ReservoirQuantileArguments(const BoundAggregateEx
 		return quantile_arg;
 	}
 	return quantile_arg + ", " + to_string(bind_data.sample_size);
+}
+
+string LptsExpressionRenderer::QuantileArgument(const BoundAggregateExpression &aggregate) {
+	return QuantileArgumentFromBindInfo(*aggregate.bind_info);
+}
+
+bool LptsExpressionRenderer::QuantileDesc(const BoundAggregateExpression &aggregate) {
+	// The `desc` flag is set both for `WITHIN GROUP (ORDER BY x DESC)` and for negative quantile
+	// arguments (DuckDB normalizes `quantile_disc(x, -0.5)` to quantile 0.5 with desc=true).
+	if (!aggregate.bind_info) {
+		return false;
+	}
+	return reinterpret_cast<const QuantileBindDataLayout *>(aggregate.bind_info.get())->desc;
+}
+
+string LptsExpressionRenderer::ApproxQuantileArgument(const BoundAggregateExpression &aggregate) {
+	return ApproxQuantileArgumentFromBindInfo(*aggregate.bind_info);
+}
+
+string LptsExpressionRenderer::ReservoirQuantileArguments(const BoundAggregateExpression &aggregate) {
+	return ReservoirQuantileArgumentsFromBindInfo(*aggregate.bind_info);
 }
 
 bool LptsExpressionRenderer::IsQuantileAggregate(const string &agg_name) {
@@ -332,6 +587,46 @@ string LptsExpressionRenderer::StringAggSeparator(const BoundAggregateExpression
 		string sep;
 	};
 	return reinterpret_cast<const StringAggBindDataLayout *>(aggregate.bind_info.get())->sep;
+}
+
+string LptsExpressionRenderer::ListAggrStringAggSeparatorArg(const BoundFunctionExpression &func_expr) {
+	// list_aggregate/list_aggr wrapping string_agg is how `array_to_string(list, sep)` compiles. The
+	// separator is not a child of list_aggr — it lives in the nested string_agg's bind data, reachable via
+	// ListAggregatesBindData::aggr_expr (the bound string_agg aggregate). Re-emit it as a trailing
+	// `, '<sep>'` argument (list_aggregate forwards extra args to the sub-aggregate). Returns "" when this
+	// is not a string_agg-wrapping list_aggr. ListAggregatesBindData is defined in a .cpp, so mirror its
+	// layout (like StringAggSeparator); keep this the single place that depends on it.
+	if ((func_expr.function.name != "list_aggr" && func_expr.function.name != "list_aggregate") ||
+	    !func_expr.bind_info) {
+		return string();
+	}
+	struct ListAggregatesBindDataLayout {
+		void *vtable;
+		LogicalType stype;
+		unique_ptr<Expression> aggr_expr;
+	};
+	const auto &bind_data = *reinterpret_cast<const ListAggregatesBindDataLayout *>(func_expr.bind_info.get());
+	if (!bind_data.aggr_expr || bind_data.aggr_expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+		return string();
+	}
+	const auto &aggregate = bind_data.aggr_expr->Cast<BoundAggregateExpression>();
+	if (aggregate.function.name == "string_agg") {
+		return ", '" + EscapeSingleQuotes(StringAggSeparator(aggregate)) + "'";
+	}
+	// Same recovery for quantile-family sub-aggregates (`list_aggr(l, 'quantile', 0.5)`): the quantile
+	// argument was consumed into the nested aggregate's bind data.
+	if (aggregate.bind_info) {
+		if (IsQuantileAggregate(aggregate.function.name)) {
+			return ", " + QuantileArgumentFromBindInfo(*aggregate.bind_info);
+		}
+		if (aggregate.function.name == "approx_quantile") {
+			return ", " + ApproxQuantileArgumentFromBindInfo(*aggregate.bind_info);
+		}
+		if (aggregate.function.name == "reservoir_quantile") {
+			return ", " + ReservoirQuantileArgumentsFromBindInfo(*aggregate.bind_info);
+		}
+	}
+	return string();
 }
 
 string LptsExpressionRenderer::GroupingSetsToClause(const vector<string> &group_names,
@@ -372,9 +667,81 @@ string LptsExpressionRenderer::GroupingSetsToClause(const vector<string> &group_
 	return "GROUPING SETS (" + VecToSeparatedList(set_clauses) + ")";
 }
 
+string LptsExpressionRenderer::RenderConstantContainingUnnamedStruct(const Value &value) const {
+	const LogicalType &type = value.type();
+	if (value.IsNull()) {
+		// A typed NULL of an unwritable type cannot be expressed; a bare NULL keeps the value and lets the
+		// surrounding expression's other operands pin the type.
+		return "NULL";
+	}
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		const auto &children = StructValue::GetChildren(value);
+		std::ostringstream out;
+		if (StructType::IsUnnamed(type)) {
+			out << "row(";
+			for (idx_t i = 0; i < children.size(); i++) {
+				out << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(children[i]);
+			}
+			out << ")";
+		} else {
+			out << "struct_pack(";
+			for (idx_t i = 0; i < children.size(); i++) {
+				out << (i ? ", " : "") << "\"" << StructType::GetChildName(type, i)
+				    << "\" := " << RenderConstantContainingUnnamedStruct(children[i]);
+			}
+			out << ")";
+		}
+		return out.str();
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY: {
+		const auto &children = ListValue::GetChildren(value);
+		std::ostringstream out;
+		out << "[";
+		for (idx_t i = 0; i < children.size(); i++) {
+			out << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(children[i]);
+		}
+		out << "]";
+		return out.str();
+	}
+	case LogicalTypeId::MAP: {
+		// A MAP value is physically a LIST of (key, value) entry structs; rebuild map(keys, values).
+		const auto &entries = ListValue::GetChildren(value);
+		std::ostringstream keys, vals;
+		for (idx_t i = 0; i < entries.size(); i++) {
+			const auto &kv = StructValue::GetChildren(entries[i]);
+			keys << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(kv[0]);
+			vals << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(kv[1]);
+		}
+		return "map([" + keys.str() + "], [" + vals.str() + "])";
+	}
+	case LogicalTypeId::UNION: {
+		// Rebuild via the union_value constructor, cast to the full union type so the other members —
+		// and hence the value's type — are preserved.
+		const Value &inner = UnionValue::GetValue(value);
+		const union_tag_t tag = UnionValue::GetTag(value);
+		const string &member = UnionType::GetMemberName(type, tag);
+		return "CAST(union_value(\"" + member + "\" := " + RenderConstantContainingUnnamedStruct(inner) + ") AS " +
+		       type.ToString() + ")";
+	}
+	default: {
+		// Leaf: go through the normal constant path so lossy types keep their type-fidelity CASTs.
+		unique_ptr<Expression> leaf = make_uniq<BoundConstantExpression>(value);
+		return ExpressionToAliasedString(leaf);
+	}
+	}
+}
+
 string LptsExpressionRenderer::OrderByToAliasedString(const BoundOrderByNode &order) const {
 	std::ostringstream result;
-	result << ExpressionToAliasedString(order.expression);
+	// A folded constant order key (e.g. `ORDER BY j` where j aliases the literal 10) would render as a
+	// bare integer and be re-read as an ORDINAL position. Parenthesize: `(10)` is a constant expression.
+	if (order.expression->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		result << "(" << ExpressionToAliasedString(order.expression) << ")";
+	} else {
+		result << ExpressionToAliasedString(order.expression);
+	}
 	switch (order.type) {
 	case OrderType::DESCENDING:
 		result << " DESC";
@@ -471,14 +838,29 @@ static string WindowFrameUnits(WindowBoundary boundary) {
 string LptsExpressionRenderer::WindowRangeFrameOffsetToAliasedString(const BoundWindowExpression &window,
                                                                      const unique_ptr<Expression> &expr,
                                                                      bool preceding) const {
+	// The plan stores a RANGE bound as `<order key> - <offset>` / `+ <offset>`; recover the bare offset.
+	// DuckDB may wrap the order key in casts inconsistently between the ORDER BY and the frame expression
+	// (e.g. `CAST(date AS TIMESTAMP)` for interval arithmetic) — compare the two modulo casts, or falling
+	// back to rendering the whole bound expression would re-bind the SUBTRACTION as the offset (a
+	// TIMESTAMP), which cannot be added to the order key.
+	auto peel_casts = [](const Expression *e) {
+		while (e && e->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			e = e->Cast<BoundCastExpression>().child.get();
+		}
+		return e;
+	};
 	if (!window.orders.empty() && expr && expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		const auto &func_expr = expr->Cast<BoundFunctionExpression>();
 		const string &func_name = func_expr.function.name;
 		if (func_expr.children.size() == 2 && ((preceding && func_name == "-") || (!preceding && func_name == "+"))) {
-			string order_expr = ExpressionToAliasedString(window.orders[0].expression);
-			string left_expr = ExpressionToAliasedString(func_expr.children[0]);
-			if (left_expr == order_expr) {
-				return ExpressionToAliasedString(func_expr.children[1]);
+			const Expression *order_peeled = peel_casts(window.orders[0].expression.get());
+			const Expression *left_peeled = peel_casts(func_expr.children[0].get());
+			if (order_peeled && left_peeled) {
+				unique_ptr<Expression> order_copy = order_peeled->Copy();
+				unique_ptr<Expression> left_copy = left_peeled->Copy();
+				if (ExpressionToAliasedString(left_copy) == ExpressionToAliasedString(order_copy)) {
+					return ExpressionToAliasedString(func_expr.children[1]);
+				}
 			}
 		}
 	}
@@ -561,6 +943,17 @@ string LptsExpressionRenderer::WindowFrameEndToAliasedString(const BoundWindowEx
 }
 
 string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindowExpression &window) const {
+	// `WITH ORDINALITY` compiles to a distinctive `row_number() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND
+	// CURRENT ROW)` — no PARTITION BY, no ORDER BY, and a ROWS frame (end = CURRENT_ROW_ROWS). The numbering
+	// follows an unspecified scan order, so the rewrite cannot reproduce it. Refuse. This is narrowed to the
+	// ROWS-frame signature so a plain `row_number() OVER ()` (which DuckDB gives a RANGE frame,
+	// end = CURRENT_ROW_RANGE) is not affected.
+	if (window.GetExpressionType() == ExpressionType::WINDOW_ROW_NUMBER && window.orders.empty() &&
+	    window.partitions.empty() && window.start == WindowBoundary::UNBOUNDED_PRECEDING &&
+	    window.end == WindowBoundary::CURRENT_ROW_ROWS) {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_WINDOW", dialect, "window_function", "row_number", "BOUND_WINDOW",
+		                        "WITH ORDINALITY (row_number over an unspecified row order) cannot be reproduced");
+	}
 	std::ostringstream result;
 	result << WindowFunctionName(window) << "(";
 	if (window.aggregate && window.aggregate->name == "count_star" && window.children.empty()) {
@@ -574,6 +967,19 @@ string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindow
 			result << "DISTINCT ";
 		}
 		result << ExpressionToAliasedString(window.children[i]);
+	}
+	// Quantile-family aggregates used as window functions: the quantile argument was consumed into the
+	// bind data at bind time (the children hold only the input), so it must be re-appended — same recovery
+	// as the aggregate path.
+	if (window.aggregate && window.bind_info && !window.children.empty()) {
+		const string &agg_name = window.aggregate->name;
+		if (IsQuantileAggregate(agg_name)) {
+			result << ", " << QuantileArgumentFromBindInfo(*window.bind_info);
+		} else if (agg_name == "approx_quantile") {
+			result << ", " << ApproxQuantileArgumentFromBindInfo(*window.bind_info);
+		} else if (agg_name == "reservoir_quantile") {
+			result << ", " << ReservoirQuantileArgumentsFromBindInfo(*window.bind_info);
+		}
 	}
 	if (window.offset_expr) {
 		if (!window.children.empty()) {
@@ -687,6 +1093,13 @@ string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindow
 // Converts a bound Expression into a SQL string.
 //--------------------------------------------------------------------------
 string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expression> &expression) const {
+	// VARIANT has no faithful, re-parseable SQL literal (Value::ToSQLString emits a `VARIANT(...)` form that
+	// does not round-trip), so any expression whose type contains VARIANT (directly or nested in a
+	// list/struct/map) is untranslatable — fail rather than emit a value that differs from the original.
+	if (TypeContainsVariant(expression->return_type)) {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", "VARIANT", "expression",
+		                        "VARIANT values have no faithful SQL literal");
+	}
 	const ExpressionClass e_class = expression->GetExpressionClass();
 	std::ostringstream expr_str;
 	switch (e_class) {
@@ -696,7 +1109,65 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		break;
 	}
 	case ExpressionClass::BOUND_CONSTANT: {
-		expr_str << expression->ToString();
+		// Render the constant as a re-parseable, type-faithful SQL literal. Value::ToSQLString() quotes and
+		// self-types the common cases (BLOB, DATE/TIME/TIMESTAMP, VARCHAR, STRUCT, LIST, VARIANT, ...). For the
+		// types it leaves bare and that would re-parse to a different type (TINYINT/HUGEINT/FLOAT/DECIMAL/BIT/
+		// BIGNUM/unsigned ints), emit CAST('<text>' AS <type>): the string form casts correctly for all of them
+		// (e.g. CAST('00000001' AS BIT) keeps the bitstring, unlike the bare 00000001 which is the integer 1).
+		const BoundConstantExpression &constant = expression->Cast<BoundConstantExpression>();
+		if (constant.value.IsNull()) {
+			// A bare NULL re-parses as the untyped SQLNULL; a typed NULL (e.g. NULL::INTEGER, common in
+			// view definitions) must keep its type so the result column type — and the type-sensitive
+			// bag-hash — match the original.
+			if (constant.value.type().id() == LogicalTypeId::SQLNULL) {
+				expr_str << "NULL";
+			} else {
+				expr_str << "CAST(NULL AS " << constant.value.type().ToString() << ")";
+			}
+		} else if (constant.value.type().id() == LogicalTypeId::TYPE) {
+			// A TYPE-typed value (from get_type()/make_type()) has no literal and no VARCHAR cast;
+			// reconstruct it as get_type(CAST(NULL AS <the type>)).
+			const string type_name = constant.value.ToString();
+			if (type_name == "NULL" || type_name == "\"NULL\"") {
+				expr_str << "get_type(NULL)";
+			} else {
+				expr_str << "get_type(CAST(NULL AS " << type_name << "))";
+			}
+		} else if (TypeNeedsStructuralRender(constant.value.type())) {
+			// A value containing an unnamed struct (ROW) or a UNION anywhere in its type (e.g.
+			// `(0, 0) < ANY(...)`, list_zip's STRUCT(DATE)[], `true::UNION(...)`) — no literal or
+			// text-cast form exists, so rebuild the value structurally.
+			expr_str << RenderConstantContainingUnnamedStruct(constant.value);
+		} else if (ConstantNeedsExplicitCast(constant.value.type()) ||
+		           IntegerConstantNeedsExplicitCast(constant.value)) {
+			expr_str << "CAST('" << EscapeSingleQuotes(constant.value.ToString()) << "' AS "
+			         << constant.value.type().ToString() << ")";
+		} else if (constant.value.type().id() == LogicalTypeId::VARCHAR &&
+		           StringValue::Get(constant.value).find('\0') != string::npos) {
+			// A NUL byte cannot appear inside a SQL string literal (the parser stops at it). Rebuild the
+			// value as a concatenation with chr(0) for each NUL: 'goo' || chr(0) || 'se'.
+			const string &s = StringValue::Get(constant.value);
+			expr_str << "(";
+			bool first_part = true;
+			size_t start = 0;
+			while (start <= s.size()) {
+				size_t nul = s.find('\0', start);
+				const string part = s.substr(start, (nul == string::npos ? s.size() : nul) - start);
+				if (!first_part) {
+					expr_str << " || ";
+				}
+				expr_str << "'" << EscapeSingleQuotes(part) << "'";
+				first_part = false;
+				if (nul == string::npos) {
+					break;
+				}
+				expr_str << " || chr(0)";
+				start = nul + 1;
+			}
+			expr_str << ")";
+		} else {
+			expr_str << constant.value.ToSQLString();
+		}
 		break;
 	}
 	case ExpressionClass::BOUND_COMPARISON: {
@@ -724,6 +1195,22 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		const BoundCastExpression &cast_expr = expression->Cast<BoundCastExpression>();
 		if (cast_expr.try_cast) {
 			ValidateTryCastForDialect(dialect);
+		}
+		// A cast to a type containing an UNNAMED struct (e.g. aligning row(...) values, or feeding
+		// map_from_entries) cannot be written — the type has no SQL syntax. When the cast only strips
+		// field names (same structure and child types), it is a no-op for re-binding: render the child
+		// bare and let the binder re-derive whatever internal cast it needs.
+		if (TypeContainsUnnamedStruct(cast_expr.return_type) &&
+		    TypesEqualIgnoringStructNames(cast_expr.child->return_type, cast_expr.return_type)) {
+			expr_str << ExpressionToAliasedString(cast_expr.child);
+			break;
+		}
+		// A cast whose target is (or contains) the untyped-NULL type is a binder-internal artifact of a
+		// fully-folded expression (e.g. a lambda body over an empty list): `CAST(x AS "NULL")` does not
+		// parse, and dropping it lets the re-bind derive its own typing.
+		if (TypeContainsNullType(cast_expr.return_type)) {
+			expr_str << ExpressionToAliasedString(cast_expr.child);
+			break;
 		}
 		expr_str << (cast_expr.try_cast ? "TRY_CAST(" : "CAST(");
 		expr_str << ExpressionToAliasedString(cast_expr.child);
@@ -755,6 +1242,71 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		if (!func_expr.children.empty() && (func_expr.function.name.rfind("__internal_compress_", 0) == 0 ||
 		                                    func_expr.function.name.rfind("__internal_decompress_", 0) == 0)) {
 			expr_str << ExpressionToAliasedString(func_expr.children[0]);
+			break;
+		}
+		// `alias(expr)` returns the *name* of its argument as a string. LPTS rewrites columns to its own
+		// names (t0_*) and re-renders expressions, so the name alias() observes — and therefore its value —
+		// cannot match the original. It is untranslatable; fail rather than emit a different value.
+		if (func_expr.function.name == "alias") {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", "alias", "BOUND_FUNCTION",
+			                        "alias() reflects column names that LPTS rewrites");
+		}
+		// list/array slicing with an OMITTED bound (`s[:2]`, `s[2:]`, and the array_pop_back/front
+		// rewrites) marks the omitted side with a sentinel constant of the *list's own type* (an empty
+		// list value). `array_slice(s, <list>, ...)` does not bind — "bounds must be a BIGINT" — and no
+		// function-call form can express the omission; only the bracket syntax can. Render brackets,
+		// leaving sentinel sides empty.
+		if ((func_expr.function.name == "array_slice" || func_expr.function.name == "list_slice") &&
+		    (func_expr.children.size() == 3 || func_expr.children.size() == 4)) {
+			auto is_omitted_bound = [](const unique_ptr<Expression> &e) {
+				return e->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+				       (e->return_type.id() == LogicalTypeId::LIST || e->return_type.id() == LogicalTypeId::ARRAY);
+			};
+			// Full-range step -1 slice is how list_reverse compiles; `[::-1]` itself does not parse.
+			if (func_expr.children.size() == 4 && is_omitted_bound(func_expr.children[1]) &&
+			    is_omitted_bound(func_expr.children[2]) &&
+			    func_expr.children[3]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+				const auto &step_val = func_expr.children[3]->Cast<BoundConstantExpression>().value;
+				if (!step_val.IsNull() && step_val.type().IsIntegral() && step_val.GetValue<int64_t>() == -1) {
+					expr_str << "list_reverse(" << ExpressionToAliasedString(func_expr.children[0]) << ")";
+					break;
+				}
+			}
+			if (is_omitted_bound(func_expr.children[1]) || is_omitted_bound(func_expr.children[2])) {
+				const bool has_step = func_expr.children.size() == 4;
+				expr_str << "(" << ExpressionToAliasedString(func_expr.children[0]) << ")[";
+				if (!is_omitted_bound(func_expr.children[1])) {
+					expr_str << ExpressionToAliasedString(func_expr.children[1]);
+				}
+				expr_str << ":";
+				if (!is_omitted_bound(func_expr.children[2])) {
+					expr_str << ExpressionToAliasedString(func_expr.children[2]);
+				} else if (has_step) {
+					// With a step, an omitted end is written as the `-` end marker (`a[start:-:step]`);
+					// a bare `start::step` does not parse.
+					expr_str << "-";
+				}
+				if (has_step) {
+					expr_str << ":" << ExpressionToAliasedString(func_expr.children[3]);
+				}
+				expr_str << "]";
+				break;
+			}
+		}
+		// The struct variant `date_part(['year','month'], d)` erases its constant list argument at bind
+		// time (Function::EraseArgument) — only the date child remains, so a plain rendering emits
+		// `date_part(d)`, which does not bind. The part names live on as the STRUCT return type's field
+		// names (in order); rebuild the list literal from them.
+		if ((func_expr.function.name == "date_part" || func_expr.function.name == "datepart") &&
+		    func_expr.return_type.id() == LogicalTypeId::STRUCT && func_expr.children.size() == 1) {
+			expr_str << func_expr.function.name << "([";
+			for (idx_t i = 0; i < StructType::GetChildCount(func_expr.return_type); i++) {
+				if (i > 0) {
+					expr_str << ", ";
+				}
+				expr_str << "'" << EscapeSingleQuotes(StructType::GetChildName(func_expr.return_type, i)) << "'";
+			}
+			expr_str << "], " << ExpressionToAliasedString(func_expr.children[0]) << ")";
 			break;
 		}
 		ValidateFunctionForDialect(func_expr, dialect);
@@ -813,76 +1365,187 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 					expr_str << ExpressionToAliasedString(func_expr.children[i]);
 				}
 			} else {
+				// Functions with NAMED arguments (`struct_insert(s, a := x)`, `write_log(msg, level := 'x')`):
+				// the parser records each `name := expr` as the bound child's alias. Re-emit the names — these
+				// functions reject (or misread) plain positional arguments.
+				// Lambda function: serialize the lambda expression from bind_info FIRST (into its own
+				// buffer), so it can be inserted at its declared argument position. list_transform's lambda
+				// is the last argument, but list_reduce(list, lambda, initial) has a trailing initial value:
+				// appending the lambda after the children would swap the arguments.
+				string lambda_text;
+				idx_t lambda_arg_pos = child_count; // default: append after all children
+				if (func_expr.function.bind_lambda != nullptr && func_expr.bind_info) {
+					auto &bind_data = func_expr.bind_info->Cast<ListLambdaBindData>();
+					if (bind_data.lambda_expr) {
+						for (idx_t ai = 0; ai < func_expr.function.arguments.size(); ai++) {
+							if (func_expr.function.arguments[ai].id() == LogicalTypeId::LAMBDA) {
+								lambda_arg_pos = ai;
+								break;
+							}
+						}
+						std::ostringstream lam;
+						std::map<idx_t, string> param_map;
+						CollectLambdaParamNames(*bind_data.lambda_expr, param_map);
+						idx_t total_refs = param_map.empty() ? 0 : param_map.rbegin()->first + 1;
+						// A lambda that closes over outer columns binds them as trailing "parameters": the real
+						// lambda parameters occupy body indices [0, real_count) (reverse declaration order) and the
+						// captures occupy [real_count, total_refs), mapping to the function's non-list children
+						// (child_count..). Only the real parameters go in the lambda's parameter list; captures are
+						// rendered as the outer expression (so LPTS's column renaming applies), else e.g.
+						// `x -> x + n` would render `lambda n, x: x + n` and shadow the outer column.
+						idx_t capture_count =
+						    func_expr.children.size() > child_count ? func_expr.children.size() - child_count : 0;
+						idx_t real_count = total_refs > capture_count ? total_refs - capture_count : total_refs;
+						// A fully constant-folded body (e.g. reducing an empty list) references no parameters,
+						// but the emitted lambda must still declare the arity the function requires —
+						// `lambda : body` does not parse. Pad with unused placeholders (only when no captures
+						// shift the body indices).
+						const idx_t min_params =
+						    (func_expr.function.name == "list_reduce" || func_expr.function.name == "array_reduce" ||
+						     func_expr.function.name == "reduce")
+						        ? 2
+						        : 1;
+						if ((capture_count == 0 || total_refs == 0) && real_count < min_params) {
+							real_count = min_params;
+						}
+						vector<string> param_names(real_count);
+						for (idx_t idx = 0; idx < real_count; idx++) {
+							auto it = param_map.find(idx);
+							string nm =
+							    (it != param_map.end() && !it->second.empty()) ? it->second : ("p" + to_string(idx));
+							// Quote when not a plain identifier (e.g. a `"x.y"` parameter) — used verbatim in
+							// both the parameter list and the body refs, so they stay consistent.
+							param_names[real_count - 1 - idx] =
+							    (QuoteIdentifier(nm) == nm) ? nm : DialectQuoteIdent(nm, dialect);
+						}
+						std::map<idx_t, string> captures;
+						for (idx_t idx = real_count; idx < total_refs; idx++) {
+							const idx_t cap_child = child_count + (idx - real_count);
+							if (cap_child < func_expr.children.size()) {
+								captures[idx] = ExpressionToAliasedString(func_expr.children[cap_child]);
+							}
+						}
+						// A lambda parameter must not SHADOW a captured outer column: the capture renders as
+						// a generated column name (t0_x) that the final de-prefixing pass may collapse to its
+						// bare form (x) — identical to a parameter named x. Rename such parameters (body refs
+						// follow via the canonical-name map).
+						for (auto &nm : param_names) {
+							bool renamed = true;
+							while (renamed) {
+								renamed = false;
+								for (const auto &cap : captures) {
+									if (StringUtil::Lower(StripTablePrefix(cap.second)) == StringUtil::Lower(nm) ||
+									    StringUtil::Lower(cap.second) == StringUtil::Lower(nm)) {
+										nm += "_1";
+										renamed = true;
+									}
+								}
+							}
+						}
+						if (UsesArrowLambdaSyntax(dialect)) {
+							if (real_count == 1) {
+								lam << param_names[0];
+							} else {
+								lam << "(";
+								for (idx_t i = 0; i < real_count; i++) {
+									if (i > 0) {
+										lam << ", ";
+									}
+									lam << param_names[i];
+								}
+								lam << ")";
+							}
+							lam << " -> ";
+						} else {
+							lam << "lambda ";
+							for (idx_t i = 0; i < real_count; i++) {
+								if (i > 0) {
+									lam << ", ";
+								}
+								lam << param_names[i];
+							}
+							lam << ": ";
+						}
+						// Render the body with capture indices substituted by their outer expressions and
+						// parameter indices rendered under their canonical names (a body ref can carry a
+						// different stored name for the same index, e.g. a comprehension's "result" alias).
+						std::map<idx_t, string> body_param_names;
+						for (idx_t idx = 0; idx < real_count; idx++) {
+							body_param_names[idx] = param_names[real_count - 1 - idx];
+						}
+						auto saved_captures = lambda_captures;
+						auto saved_params = lambda_param_names;
+						lambda_captures = std::move(captures);
+						lambda_param_names = std::move(body_param_names);
+						lam << ExpressionToAliasedString(bind_data.lambda_expr);
+						lambda_captures = std::move(saved_captures);
+						lambda_param_names = std::move(saved_params);
+						lambda_text = lam.str();
+					}
+				}
+				const bool uses_named_arguments =
+				    func_name == "struct_insert" || func_name == "struct_update" || func_name == "write_log";
+				idx_t emitted = 0;
 				for (idx_t i = 0; i < child_count; i++) {
-					if (i > 0) {
+					if (!lambda_text.empty() && i == lambda_arg_pos) {
+						if (emitted++ > 0) {
+							expr_str << ", ";
+						}
+						expr_str << lambda_text;
+					}
+					if (emitted++ > 0) {
 						expr_str << ", ";
 					}
 					if (is_struct_pack && i < StructType::GetChildCount(func_expr.return_type)) {
 						expr_str << "\"" << StructType::GetChildName(func_expr.return_type, i) << "\" := ";
+					} else if (uses_named_arguments && i > 0 && func_expr.children[i]->HasAlias() &&
+					           func_expr.children[i]->GetAlias().find('(') == string::npos) {
+						expr_str << "\"" << func_expr.children[i]->GetAlias() << "\" := ";
 					}
 					string converted_date_format;
 					if (i == 1 && IsDateFormatFunction(func_expr.function.name) &&
 					    TryRenderConvertedDateFormat(func_expr.children[i], dialect, converted_date_format)) {
 						expr_str << converted_date_format;
+					} else if (func_name == "equi_width_bins" &&
+					           func_expr.children[i]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+					           func_expr.children[i]->return_type.id() == LogicalTypeId::VARCHAR) {
+						// equi_width_bins is overloaded on VARCHAR vs numeric/timestamp; a bare string
+						// literal re-binds as STRING_LITERAL (castable to all) — "could not choose a best
+						// candidate". Pin the VARCHAR overload with an explicit cast.
+						expr_str << "CAST(" << ExpressionToAliasedString(func_expr.children[i]) << " AS VARCHAR)";
 					} else {
 						expr_str << ExpressionToAliasedString(func_expr.children[i]);
 					}
 				}
-			}
-			// Lambda function: serialize the lambda expression from bind_info
-			if (func_expr.function.bind_lambda != nullptr && func_expr.bind_info) {
-				auto &bind_data = func_expr.bind_info->Cast<ListLambdaBindData>();
-				if (bind_data.lambda_expr) {
-					if (child_count > 0) {
+				if (!lambda_text.empty() && lambda_arg_pos >= child_count) {
+					if (emitted++ > 0) {
 						expr_str << ", ";
 					}
-					std::map<idx_t, string> param_map;
-					CollectLambdaParamNames(*bind_data.lambda_expr, param_map);
-					idx_t param_count = param_map.empty() ? 0 : param_map.rbegin()->first + 1;
-					vector<string> param_names(param_count);
-					for (auto &entry : param_map) {
-						if (entry.first < param_count) {
-							param_names[param_count - 1 - entry.first] = entry.second;
-						}
-					}
-					for (idx_t i = 0; i < param_count; i++) {
-						if (param_names[i].empty()) {
-							param_names[i] = "p" + to_string(i);
-						}
-					}
-					if (UsesArrowLambdaSyntax(dialect)) {
-						if (param_count == 1) {
-							expr_str << param_names[0];
-						} else {
-							expr_str << "(";
-							for (idx_t i = 0; i < param_count; i++) {
-								if (i > 0) {
-									expr_str << ", ";
-								}
-								expr_str << param_names[i];
-							}
-							expr_str << ")";
-						}
-						expr_str << " -> ";
-					} else {
-						expr_str << "lambda ";
-						for (idx_t i = 0; i < param_count; i++) {
-							if (i > 0) {
-								expr_str << ", ";
-							}
-							expr_str << param_names[i];
-						}
-						expr_str << ": ";
-					}
-					expr_str << ExpressionToAliasedString(bind_data.lambda_expr);
+					expr_str << lambda_text;
 				}
 			}
+			// array_to_string compiles to list_aggr(list, 'string_agg'); re-emit the string_agg separator
+			// (recovered from the nested aggregate's bind data) as a trailing argument, else it's lost.
+			expr_str << ListAggrStringAggSeparatorArg(func_expr);
 			expr_str << ")";
 		}
 		break;
 	}
 	case ExpressionClass::BOUND_REF: {
-		expr_str << expression->ToString();
+		// Inside a lambda body, a captured outer column is a trailing BoundReferenceExpression — render it as
+		// the captured outer expression (see the lambda rendering), not as a lambda parameter name.
+		const auto &ref = expression->Cast<BoundReferenceExpression>();
+		auto cap = lambda_captures.find(ref.index);
+		if (cap != lambda_captures.end()) {
+			expr_str << cap->second;
+		} else {
+			auto par = lambda_param_names.find(ref.index);
+			if (par != lambda_param_names.end()) {
+				expr_str << par->second;
+			} else {
+				expr_str << expression->ToString();
+			}
+		}
 		break;
 	}
 	case ExpressionClass::BOUND_LAMBDA_REF: {

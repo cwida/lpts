@@ -123,3 +123,35 @@ SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE grp = 2;
 
 statement ok
 SELECT grp, list_transform(list(id), lambda x: x + 100) FROM items GROUP BY grp;
+
+# --- Lambda capturing an outer column ---
+# `lambda x: x + n` closes over the outer column n. DuckDB binds the capture as a trailing lambda
+# parameter; LPTS must render it as the (renamed) outer reference, not shadow it as a parameter.
+
+statement ok
+CREATE TABLE clists (n INTEGER, l INTEGER[]);
+
+statement ok
+INSERT INTO clists VALUES (1, [1]), (2, [1, 2, 3]), (3, NULL), (10, [-1, NULL, 2]);
+
+query I
+SELECT list_transform(l, lambda x: x + n) FROM clists ORDER BY n;
+----
+[2]
+[3, 4, 5]
+NULL
+[9, NULL, 12]
+
+statement ok
+SELECT list_transform(l, lambda x: x + n) FROM clists ORDER BY n;
+
+statement ok
+SELECT list_filter(l, lambda x: x <= n) FROM clists;
+
+# capture a positional column reference (#1 = first column = n), from a renamed scan
+statement ok
+SELECT list_transform([1, 2, 3], lambda x: x + #1) FROM clists;
+
+# capture used in a two-parameter lambda alongside the element and index
+statement ok
+SELECT list_transform(l, lambda x, i: x + i + n) FROM clists;

@@ -53,8 +53,9 @@ private:
 		case JoinType::RIGHT_ANTI:
 			return "";
 		default:
-			throw NotImplementedException("AstToInlineSQL: %s type %s not supported in recursive CTE step", context,
-			                              EnumUtil::ToString(join_type));
+			throw NotImplementedException(
+			    "LPTS_UNSUPPORTED_RECURSIVE_STEP: %s type %s not supported in recursive CTE step", context,
+			    EnumUtil::ToString(join_type));
 		}
 	}
 
@@ -104,7 +105,8 @@ private:
 					if (i > 0) {
 						sql += ", ";
 					}
-					string source_col = get.table_name == "(SELECT 1)"
+					const bool is_expr = i < get.column_is_expression.size() && get.column_is_expression[i];
+					string source_col = (get.table_name == "(SELECT 1)" || is_expr)
 					                        ? get.column_names[i]
 					                        : DialectQuoteIdent(get.column_names[i], dialect);
 					sql += source_col + " AS " + get.cte_column_names[i];
@@ -114,15 +116,28 @@ private:
 			if (!get.catalog.empty()) {
 				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect);
 			} else {
+				// An in-out (lateral) table function has the delim/correlation source as its AST child:
+				// inline it as the left comma-join input (mirrors GetNode's input_cte_name handling).
+				if (!ast_node.children.empty()) {
+					sql += "(" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + "), ";
+				}
 				sql += get.table_name;
 				if (get.table_name.find('(') != string::npos && get.table_name != "(SELECT 1)" &&
 				    !get.column_names.empty() && get.table_name.find("ducklake_table_") == string::npos) {
-					idx_t alias_count = get.table_function_output_count == DConstants::INVALID_INDEX
-					                        ? get.column_names.size()
-					                        : get.table_function_output_count;
 					vector<string> table_function_columns;
-					for (idx_t i = 0; i < alias_count && i < get.column_names.size(); i++) {
-						table_function_columns.push_back(DialectQuoteIdent(get.column_names[i], dialect));
+					if (!get.table_function_alias.empty()) {
+						// Output-ordered alias (same as GetNode::ToQuery): names every output position, so
+						// filter-only and function-derived columns (e.g. hive partition keys) stay correct.
+						for (const string &name : get.table_function_alias) {
+							table_function_columns.push_back(DialectQuoteIdent(name, dialect));
+						}
+					} else {
+						idx_t alias_count = get.table_function_output_count == DConstants::INVALID_INDEX
+						                        ? get.column_names.size()
+						                        : get.table_function_output_count;
+						for (idx_t i = 0; i < alias_count && i < get.column_names.size(); i++) {
+							table_function_columns.push_back(DialectQuoteIdent(get.column_names[i], dialect));
+						}
 					}
 					sql += " _tf(" + VecToSeparatedList(table_function_columns) + ")";
 				}
@@ -148,7 +163,8 @@ private:
 				if (i > 0) {
 					sql += ", ";
 				}
-				sql += src_cols[i] + " AS " + cte_ref.cte_column_names[i];
+				// The source columns are user-facing (stripped) names — quote reserved words.
+				sql += QuoteIdentifier(src_cols[i]) + " AS " + cte_ref.cte_column_names[i];
 			}
 			return sql + " FROM " + src_name;
 		}
@@ -202,8 +218,9 @@ private:
 			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
 			if (join.is_asof) {
 				if (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT) {
-					throw NotImplementedException("AstToInlineSQL: ASOF JOIN type %s is not supported",
-					                              EnumUtil::ToString(join.join_type));
+					throw NotImplementedException(
+					    "LPTS_UNSUPPORTED_RECURSIVE_STEP: ASOF JOIN type %s is not supported in a recursive CTE step",
+					    EnumUtil::ToString(join.join_type));
 				}
 				string join_kw = join.join_type == JoinType::LEFT ? "ASOF LEFT JOIN" : "ASOF JOIN";
 				string sql = "SELECT " + VecToSeparatedList(join.cte_column_names) + " FROM (" + left_sql + ") " +
@@ -266,7 +283,7 @@ private:
 			auto it = inline_delim_sources.find(delim_get.table_index);
 			if (it == inline_delim_sources.end()) {
 				throw NotImplementedException(
-				    "AstToInlineSQL: DelimGet table_index=%llu has no inline DELIM_JOIN source",
+				    "LPTS_UNSUPPORTED_RECURSIVE_STEP: DelimGet table_index=%llu has no inline DELIM_JOIN source",
 				    (unsigned long long)delim_get.table_index);
 			}
 			string sql = "SELECT DISTINCT ";
@@ -304,8 +321,11 @@ private:
 			const AstDistinctNode &d = static_cast<const AstDistinctNode &>(ast_node);
 			const auto &cols =
 			    d.cte_column_names.empty() ? ast_node.children[0]->OutputColumnNames() : d.cte_column_names;
-			return "SELECT DISTINCT " + VecToSeparatedList(cols) + " FROM (" +
-			       AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			const string child_sql = "(" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			if (d.is_distinct_on && !d.distinct_on_targets.empty()) {
+				return BuildDistinctOnQuery(cols, d.distinct_on_targets, d.distinct_on_orders, child_sql);
+			}
+			return "SELECT DISTINCT " + VecToSeparatedList(cols) + " FROM " + child_sql;
 		}
 
 		if (type == "Order") {
@@ -348,8 +368,7 @@ private:
 		}
 
 		throw NotImplementedException(
-		    "AstToInlineSQL: node type '%s' is not supported in a recursive CTE step — cannot serialize as inline SQL",
-		    type);
+		    "LPTS_UNSUPPORTED_RECURSIVE_STEP: node type '%s' cannot be serialized as inline SQL", type);
 	}
 
 	//--------------------------------------------------------------------------
@@ -479,6 +498,59 @@ private:
 			return nullptr;
 		}
 
+		// An UNGROUPED aggregate (no GROUP BY keys, e.g. an implicit single-group `count_star()` from a
+		// HAVING-without-GROUP-BY) collapses its input to exactly one row purely by virtue of being an
+		// aggregate. If we fuse a projection on top of it that drops every aggregate output (e.g.
+		// `SELECT 1 AS one ... HAVING 1<2`), the merged SELECT would have neither an aggregate in its
+		// select-list nor a GROUP BY, so it would no longer aggregate — emitting one row per input row.
+		// In that case do NOT fuse: return nullptr so the aggregate stays its own CTE (which does collapse
+		// to one row) and the projection reads from it. Fusion is still fine when the projection or HAVING
+		// references an aggregate output (the merged SELECT then remains an aggregating query).
+		if (agg_n && agg_n->group_by_columns.empty()) {
+			auto token_appears = [](const string &hay, const string &needle) {
+				if (needle.empty()) {
+					return false;
+				}
+				for (size_t pos = hay.find(needle); pos != string::npos; pos = hay.find(needle, pos + 1)) {
+					const bool left_ok =
+					    pos == 0 || !(std::isalnum((unsigned char)hay[pos - 1]) || hay[pos - 1] == '_');
+					const size_t end = pos + needle.size();
+					const bool right_ok =
+					    end >= hay.size() || !(std::isalnum((unsigned char)hay[end]) || hay[end] == '_');
+					if (left_ok && right_ok) {
+						return true;
+					}
+				}
+				return false;
+			};
+			bool aggregate_output_used = false;
+			// Ungrouped ⇒ every cte_column_name is an aggregate output.
+			for (const string &agg_out : agg_n->cte_column_names) {
+				if (proj_top) {
+					for (const string &e : proj_top->expressions) {
+						if (token_appears(e, agg_out)) {
+							aggregate_output_used = true;
+							break;
+						}
+					}
+				}
+				if (!aggregate_output_used && having_n) {
+					for (const string &c : having_n->conditions) {
+						if (token_appears(c, agg_out)) {
+							aggregate_output_used = true;
+							break;
+						}
+					}
+				}
+				if (aggregate_output_used) {
+					break;
+				}
+			}
+			if (proj_top && !aggregate_output_used) {
+				return nullptr;
+			}
+		}
+
 		// Materialize the FROM input: absorb the base-table scan, else recurse to a child CTE.
 		unordered_map<string, string> col_map; // visible col name → folded expr over FROM source.
 		vector<string> visible;                // visible column names, in order.
@@ -487,7 +559,11 @@ private:
 			from_clause =
 			    DialectQualifiedTableName(absorb_get->catalog, absorb_get->schema, absorb_get->table_name, dialect);
 			for (size_t i = 0; i < absorb_get->cte_column_names.size(); i++) {
-				col_map[absorb_get->cte_column_names[i]] = DialectQuoteIdent(absorb_get->column_names[i], dialect);
+				// Struct field-extraction columns are raw SQL expressions, emitted verbatim; plain columns
+				// are quoted identifiers.
+				const bool is_expr = i < absorb_get->column_is_expression.size() && absorb_get->column_is_expression[i];
+				col_map[absorb_get->cte_column_names[i]] =
+				    is_expr ? absorb_get->column_names[i] : DialectQuoteIdent(absorb_get->column_names[i], dialect);
 				visible.push_back(absorb_get->cte_column_names[i]);
 			}
 		} else {
@@ -692,8 +768,17 @@ private:
 			const string right_name = MarkRightSideMaterialized(right_cte_name);
 			LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: join_" + std::to_string(my_index) + " LEFT='" + left_cte_name +
 			                 "' RIGHT='" + right_name + "' mark_expr='" + dj.mark_expression + "'");
-			return make_uniq<JoinNode>(my_index, dj.cte_column_names, left_cte_name, right_name, dj.join_type,
-			                           dj.conditions, dj.mark_expression);
+			auto join_node = make_uniq<JoinNode>(my_index, dj.cte_column_names, left_cte_name, right_name, dj.join_type,
+			                                     dj.conditions, dj.mark_expression);
+			join_node->mark_lhs_key = dj.mark_lhs_key;
+			join_node->mark_rhs_key = dj.mark_rhs_key;
+			join_node->mark_correlation_conditions = dj.mark_correlation_conditions;
+			join_node->mark_membership_conditions = dj.mark_membership_conditions;
+			join_node->mark_membership_comparisons = dj.mark_membership_comparisons;
+			join_node->mark_membership_lhs = dj.mark_membership_lhs;
+			join_node->mark_membership_rhs = dj.mark_membership_rhs;
+			join_node->mark_join_has_equality = dj.mark_join_has_equality;
+			return join_node;
 		}
 
 		// DelimGet: leaf node — creates a SELECT DISTINCT CTE from the outer left CTE.
@@ -702,9 +787,9 @@ private:
 			const AstDelimGetNode &dg = static_cast<const AstDelimGetNode &>(ast_node);
 			auto it = delim_get_source_cte.find(dg.table_index);
 			if (it == delim_get_source_cte.end()) {
-				throw NotImplementedException(
-				    "LPTS: nested DelimGet table_index=%llu is not implemented without a parent DelimJoin source",
-				    (unsigned long long)dg.table_index);
+				throw NotImplementedException("LPTS_UNSUPPORTED_DELIM_GET: nested table_index=%llu is not implemented "
+				                              "without a parent DelimJoin source",
+				                              (unsigned long long)dg.table_index);
 			}
 			const string &source_cte_name = it->second;
 			const size_t my_index = node_count++;
@@ -727,11 +812,21 @@ private:
 			const vector<string> anchor_lpts_cols = anchor_tail->cte_column_list;
 			cte_nodes.push_back(std::move(anchor_tail));
 
-			// 2. Derive the stripped column names (user-visible, e.g. "n") for the CTE header.
+			// 2. Derive the stripped column names (user-visible, e.g. "n") for the CTE header. Dedup
+			//    (case-insensitively, like DuckDB's resolution): two anchor outputs can strip to the same
+			//    bare name (e.g. an anchor projecting one source column twice), and a CTE header must not
+			//    declare duplicate columns.
 			vector<string> stripped_cols;
+			unordered_set<string> seen_stripped;
 			for (const string &c : anchor_lpts_cols) {
 				const size_t pos = c.find('_');
-				stripped_cols.push_back((pos != string::npos && pos + 1 < c.size()) ? c.substr(pos + 1) : c);
+				string bare = (pos != string::npos && pos + 1 < c.size()) ? c.substr(pos + 1) : c;
+				string candidate = bare;
+				for (idx_t suffix = 1; seen_stripped.count(StringUtil::Lower(candidate)) > 0; suffix++) {
+					candidate = bare + "_" + std::to_string(suffix);
+				}
+				seen_stripped.insert(StringUtil::Lower(candidate));
+				stripped_cols.push_back(std::move(candidate));
 			}
 
 			// 3. Assign the recursive CTE's index and name; register in cte_index_to_body_info
@@ -795,9 +890,12 @@ private:
 			string catalog_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.catalog;
 			string schema_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.schema;
 			string input_cte_name = children_names.empty() ? string() : children_names[0];
-			return make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
-			                          get.table_index, get.table_filters, get.column_names, input_cte_name,
-			                          get.table_function_output_count);
+			auto get_node = make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
+			                                   get.table_index, get.table_filters, get.column_names, input_cte_name,
+			                                   get.table_function_output_count);
+			get_node->table_function_alias = get.table_function_alias;
+			get_node->column_is_expression = get.column_is_expression;
+			return get_node;
 		}
 
 		if (type == "Filter") {
@@ -833,8 +931,17 @@ private:
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
 			const string right_name = MarkRightSideMaterialized(children_names[1]);
-			return make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], right_name, join.join_type,
-			                           join.conditions, join.mark_expression, join.is_asof);
+			auto join_node = make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], right_name,
+			                                     join.join_type, join.conditions, join.mark_expression, join.is_asof);
+			join_node->mark_lhs_key = join.mark_lhs_key;
+			join_node->mark_rhs_key = join.mark_rhs_key;
+			join_node->mark_correlation_conditions = join.mark_correlation_conditions;
+			join_node->mark_membership_conditions = join.mark_membership_conditions;
+			join_node->mark_membership_comparisons = join.mark_membership_comparisons;
+			join_node->mark_membership_lhs = join.mark_membership_lhs;
+			join_node->mark_membership_rhs = join.mark_membership_rhs;
+			join_node->mark_join_has_equality = join.mark_join_has_equality;
+			return join_node;
 		}
 
 		if (type == "PositionalJoin") {
@@ -852,8 +959,13 @@ private:
 		if (type == "Union") {
 			const AstUnionNode &u = static_cast<const AstUnionNode &>(ast_node);
 			if (children_names.size() == 2) {
-				return make_uniq<UnionNode>(my_index, u.cte_column_names, children_names[0], children_names[1],
-				                            u.is_union_all);
+				auto union_node = make_uniq<UnionNode>(my_index, u.cte_column_names, children_names[0],
+				                                       children_names[1], u.is_union_all);
+				// Children can expose extra columns (e.g. an inner ORDER BY key) — the branch SELECTs
+				// only the union's arity (see UnionNode::ToQuery).
+				union_node->left_columns = children_column_lists[0];
+				union_node->right_columns = children_column_lists[1];
+				return union_node;
 			}
 			if (children_names.size() == 1) {
 				return make_uniq<ProjectNode>(my_index, u.cte_column_names, children_names[0], children_column_lists[0],
@@ -862,6 +974,7 @@ private:
 			// N-ary UNION: chain as left-deep binary UNIONs
 			// (A UNION B UNION C) → UNION(UNION(A, B), C)
 			string prev_cte_name = children_names[0];
+			vector<string> prev_columns = children_column_lists[0];
 			for (size_t ci = 1; ci < children_names.size(); ci++) {
 				const string &right_cte_name = children_names[ci];
 				if (ci < children_names.size() - 1) {
@@ -869,12 +982,18 @@ private:
 					size_t intermediate_index = node_count++;
 					auto intermediate = make_uniq<UnionNode>(intermediate_index, u.cte_column_names, prev_cte_name,
 					                                         right_cte_name, u.is_union_all);
+					intermediate->left_columns = prev_columns;
+					intermediate->right_columns = children_column_lists[ci];
 					prev_cte_name = intermediate->cte_name;
+					prev_columns = u.cte_column_names;
 					cte_nodes.push_back(std::move(intermediate));
 				} else {
 					// Final union — use the current my_index
-					return make_uniq<UnionNode>(my_index, u.cte_column_names, prev_cte_name, right_cte_name,
-					                            u.is_union_all);
+					auto final_union = make_uniq<UnionNode>(my_index, u.cte_column_names, prev_cte_name, right_cte_name,
+					                                        u.is_union_all);
+					final_union->left_columns = prev_columns;
+					final_union->right_columns = children_column_lists[ci];
+					return final_union;
 				}
 			}
 			// Shouldn't reach here, but just in case
@@ -921,11 +1040,16 @@ private:
 		if (type == "Distinct") {
 			const AstDistinctNode &d = static_cast<const AstDistinctNode &>(ast_node);
 			const auto &cols = d.cte_column_names.empty() ? children_column_lists[0] : d.cte_column_names;
-			return make_uniq<DistinctNode>(my_index, cols, children_names[0]);
+			auto distinct_node = make_uniq<DistinctNode>(my_index, cols, children_names[0]);
+			distinct_node->is_distinct_on = d.is_distinct_on;
+			distinct_node->distinct_on_targets = d.distinct_on_targets;
+			distinct_node->distinct_on_orders = d.distinct_on_orders;
+			return distinct_node;
 		}
 
 		// Operators not yet implemented.
-		throw NotImplementedException("AstFlattener: node type '%s' is not yet implemented", type);
+		throw NotImplementedException(
+		    "LPTS_UNSUPPORTED_OPERATOR: AST node type '%s' is not yet implemented by the flattener", type);
 	}
 
 public:

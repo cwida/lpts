@@ -144,3 +144,116 @@ SELECT CAST(val AS INTEGER) FROM null_cast;
 
 statement ok
 SELECT CAST(CAST(val AS INTEGER) AS VARCHAR) FROM nums;
+
+# ============================================================
+# ENUM / UNION constant type-fidelity
+# ============================================================
+# A folded ENUM constant (or the ENUM that union_tag(...) returns) must keep its
+# type on the round-trip — rendered bare it becomes a VARCHAR and the type-sensitive
+# result comparison diverges. LPTS emits CAST('<value>' AS ENUM(...)).
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+# --- enum literal via a named catalog type ---
+query I
+SELECT 'happy'::mood;
+----
+happy
+
+statement ok
+SELECT 'happy'::mood;
+
+# --- enum literal via an inline ENUM type ---
+query I
+SELECT 'hello'::ENUM('world', 'hello');
+----
+hello
+
+statement ok
+SELECT 'hello'::ENUM('world', 'hello');
+
+# --- comparison/greatest over enum values stays enum-typed ---
+query I
+SELECT greatest('ok'::mood, 'happy'::mood, 'sad'::mood);
+----
+happy
+
+statement ok
+SELECT greatest('ok'::mood, 'happy'::mood, 'sad'::mood);
+
+# --- union_tag returns an ENUM of the member names ---
+query I
+SELECT union_tag('foo'::UNION(num INTEGER, str VARCHAR));
+----
+str
+
+statement ok
+SELECT union_tag('foo'::UNION(num INTEGER, str VARCHAR));
+
+statement ok
+SELECT union_tag(1::INTEGER::UNION(f1 VARCHAR, t DOUBLE, f2 BOOLEAN));
+
+# ============================================================
+# Integer boundary + BIT-filter constant type fidelity
+# ============================================================
+# INT_MIN (-2147483648) is the one INTEGER value whose bare literal re-parses as BIGINT (2147483648
+# overflows INT32, then negated), so its type is lost on the round-trip. LPTS casts it explicitly.
+
+query II
+SELECT '2147483647.1'::INTEGER AS a, '-2147483648.1'::INTEGER AS b;
+----
+2147483647	-2147483648
+
+statement ok
+SELECT '2147483647.1'::INTEGER AS a, '-2147483648.1'::INTEGER AS b;
+
+# folded via other paths (exponent-string cast, BIT->INT, multiplication overflow) all reach INT_MIN
+statement ok
+SELECT '-214748364.8e1'::INTEGER;
+
+statement ok
+SELECT '10000000000000000000000000000000'::BIT::INT;
+
+statement ok
+SELECT -2::INTEGER * 1073741824::INTEGER;
+
+# the generated INT_MIN literal keeps type INTEGER (not BIGINT)
+query I
+SELECT sql LIKE '%CAST(''-2147483648'' AS INTEGER)%' FROM lpts_query('SELECT ''-2147483648.1''::INTEGER');
+----
+true
+
+# ordinary integers stay bare (no needless cast)
+query I
+SELECT sql LIKE '% 42%' AND sql NOT LIKE '%CAST(''42''%' FROM lpts_query('SELECT 42 AS x');
+----
+true
+
+# --- BIT constant in a pushed-down filter keeps its type (b = '111' must not become b = 111) ---
+statement ok
+CREATE TABLE bits (b BIT);
+
+statement ok
+INSERT INTO bits VALUES ('111'::BIT), ('101'::BIT), ('0101'::BIT);
+
+query I
+SELECT b::VARCHAR FROM bits WHERE b = '111';
+----
+111
+
+statement ok
+SELECT * FROM bits WHERE b = '111';
+
+# --- typed-NULL table-function argument keeps its type ---
+# test_vector_types(NULL::INT[]) selects which vectors to generate by the argument's type; a bare NULL
+# would generate different data, so LPTS must render CAST(NULL AS INTEGER[]).
+
+query I
+SELECT sql LIKE '%CAST(NULL AS INTEGER[])%'
+FROM lpts_query('SELECT c FROM test_vector_types(NULL::INT[]) t(c) WHERE len(c) > 0');
+----
+true
+
+statement ok
+SELECT list_reduce(c, lambda x, y: x + y) FROM test_vector_types(NULL::INT[]) t(c) WHERE len(c) > 0;

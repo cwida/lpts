@@ -233,3 +233,78 @@ SELECT product, region, GROUPING(product) AS product_grouping, GROUPING(region) 
 
 statement ok
 SELECT product, total_amount FROM (SELECT product, region, SUM(amount) AS total_amount FROM sales GROUP BY ROLLUP(product, region)) rollup_sales WHERE total_amount > 100 ORDER BY product, total_amount;
+
+# --- Descending / negative quantiles keep their direction ---
+# percentile_cont/disc WITHIN GROUP (ORDER BY x DESC) computes from the other end; DuckDB also stores a
+# negative quantile (quantile_disc(x, -p)) as abs(p) + a desc flag. The bare quantile_cont(x, p) drops the
+# direction, so LPTS must emit the in-aggregate ORDER BY ... DESC form. lpts_check verifies the round-trip.
+
+statement ok
+CREATE TABLE q_items (val INTEGER);
+
+statement ok
+INSERT INTO q_items VALUES (10), (20), (30), (40), (50), (60);
+
+# scalar percentile, descending
+query I
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY val DESC) FROM q_items;
+----
+47.5
+
+statement ok
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY val DESC) FROM q_items;
+
+# list percentile, descending
+statement ok
+SELECT percentile_disc([0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY val DESC) FROM q_items;
+
+# negative scalar quantile (stored as abs(p) + desc)
+statement ok
+SELECT quantile_disc(val, -0.5) FROM q_items;
+
+# negative list quantile
+statement ok
+SELECT quantile_disc(val, [-0.25, -0.5, -0.75]) FROM q_items;
+
+# ascending quantile still round-trips (regression guard)
+query I
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY val) FROM q_items;
+----
+35.0
+
+statement ok
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY val) FROM q_items;
+
+# --- Duplicate grouping columns across multiple grouping sets are refused ---
+# When the grouping keys include equal join keys (col1 = col3), DuckDB's duplicate-group optimizer
+# collapses col3 -> col1, so two CUBE/ROLLUP dimensions render to the same column name. SQL grouping sets
+# reference columns by name and cannot express the two collapsed dimensions independently, so LPTS refuses
+# rather than emit a plausible-but-wrong result.
+
+statement ok
+CREATE TABLE dg1 (col1 INTEGER, col2 INTEGER);
+
+statement ok
+CREATE TABLE dg2 (col3 INTEGER);
+
+statement error
+SELECT sql FROM lpts_query('SELECT col1, col2, col3 FROM dg1 JOIN dg2 ON dg1.col1 = dg2.col3 GROUP BY CUBE(col1, col2, col3)');
+----
+LPTS_DUPLICATE_GROUPING_SET_COLUMN
+
+statement error
+SELECT sql FROM lpts_query('SELECT col1, col2, col3 FROM dg1 JOIN dg2 ON dg1.col1 = dg2.col3 GROUP BY ROLLUP(col1, col2, col3)');
+----
+LPTS_DUPLICATE_GROUPING_SET_COLUMN
+
+# A plain GROUP BY over the same equal keys is fine (single grouping set — every dimension always present).
+statement ok
+SELECT col1, col2, col3 FROM dg1 JOIN dg2 ON dg1.col1 = dg2.col3 GROUP BY col1, col2, col3;
+
+# --- Lateral GROUPING SETS over a correlated constant projection is refused ---
+# The correlated `SELECT 1, 2` projects constants that become grouping-set keys; after decorrelation they
+# render as bare integers in GROUP BY (re-read as ordinals), so LPTS refuses rather than mis-group.
+statement error
+SELECT sql FROM lpts_query('SELECT x, a, b FROM (VALUES (1), (2)) t2(x), LATERAL (SELECT count(*), count(a) FROM (SELECT 1, 2 WHERE 1 = x) t(a, b) GROUP BY GROUPING SETS ((), (b), (a, b))) t3(a, b)');
+----
+LPTS_UNSUPPORTED_GROUP_BY

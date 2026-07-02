@@ -137,3 +137,31 @@ SELECT DISTINCT cat FROM nullable_distinct;
 
 statement ok
 SELECT DISTINCT age FROM users WHERE age >= 25;
+
+# --- DISTINCT ON: keep one row per target group, chosen by ORDER BY (must NOT collapse to SELECT DISTINCT) ---
+
+statement ok
+CREATE TABLE don (g INTEGER, k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO don VALUES (1,10,'a'),(1,20,'b'),(1,5,'c'),(2,7,'d'),(2,9,'e'),(3,1,'f');
+
+# one row per g, the one with the smallest k (total order via k) — round-trips exactly.
+query IIT
+SELECT DISTINCT ON (g) g, k, v FROM don ORDER BY g, k;
+----
+1	5	c
+2	7	d
+3	1	f
+
+# multi-key DISTINCT ON with a total-order tiebreak.
+query III
+SELECT DISTINCT ON (g) g, k, k * 2 AS k2 FROM don ORDER BY g, k DESC, v;
+----
+1	20	40
+2	9	18
+3	1	2
+
+# DISTINCT ON over a join, ordered by a total key — exercises the rewrite below a join/order.
+statement ok
+SELECT DISTINCT ON (u.id) u.id, d.v FROM users u JOIN don d ON u.age = d.k * 3 ORDER BY u.id, d.g;

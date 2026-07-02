@@ -180,3 +180,30 @@ SELECT struct_pack(name := name, n := age) FROM users;
 
 statement ok
 SELECT struct_pack(a := id, b := name, c := age) FROM users;
+
+# --- array_to_string separator is preserved (it compiles to list_aggr(list, 'string_agg') and the
+# separator lives in the nested string_agg's bind data, not as a child) ---
+query I
+SELECT array_to_string([i, i + 1], '-') FROM range(3) t(i) ORDER BY 1;
+----
+0-1
+1-2
+2-3
+
+statement ok
+SELECT array_to_string([i, i + 1], '-') FROM range(3) t(i) ORDER BY 1;
+
+# non-default multi-char separator
+query I
+SELECT array_to_string([10, 20, 30], ' <> ');
+----
+10 <> 20 <> 30
+
+statement ok
+SELECT array_to_string([10, 20, 30], ' <> ');
+
+# the generated SQL carries the separator as a string_agg argument
+query I
+SELECT sql LIKE '%''string_agg'', ''-''%' FROM lpts_query('SELECT array_to_string([i, i+1], ''-'') FROM range(3) t(i)');
+----
+true

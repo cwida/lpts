@@ -184,6 +184,11 @@ class GetNode : public CteNode {
 	idx_t table_function_output_count;
 
 public:
+	/// `_tf(...)` alias list in the table function's output order (empty = use projected column order).
+	vector<string> table_function_alias;
+	/// Parallel to `column_names`: true where the entry is a raw SQL expression (struct field-extraction
+	/// pushdown) emitted verbatim rather than quoted. Empty means "all plain identifiers".
+	vector<bool> column_is_expression;
 	~GetNode() override = default;
 	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
@@ -267,6 +272,18 @@ class JoinNode : public CteNode {
 	bool is_asof;
 
 public:
+	/// MARK join membership-comparison key expressions + null-safe correlation conditions, used to build
+	/// the 3-valued mark (see ToQuery).
+	string mark_lhs_key;
+	string mark_rhs_key;
+	vector<string> mark_correlation_conditions;
+	/// One indeterminate clause per NULL-propagating membership comparison (see ToQuery / the AST field).
+	vector<string> mark_membership_conditions;
+	/// Per-membership pieces + equality flag for the AND-vs-OR mark rendering choice (see AstJoinNode).
+	vector<string> mark_membership_comparisons;
+	vector<string> mark_membership_lhs;
+	vector<string> mark_membership_rhs;
+	bool mark_join_has_equality = false;
 	~JoinNode() override = default;
 	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
@@ -314,6 +331,11 @@ class UnionNode : public CteNode {
 	string right_cte_name;
 	const bool is_union_all; // Whether to use "UNION ALL" or just "UNION".
 public:
+	/// The children's own column lists. A union input can expose MORE columns than the union's arity
+	/// (e.g. an inner `ORDER BY a+1` keeps its order key as an extra projected column) — the branch then
+	/// selects only the first arity-many columns instead of `*`. Empty ⇒ render `SELECT *`.
+	vector<string> left_columns;
+	vector<string> right_columns;
 	~UnionNode() override = default;
 	// Constructor.
 	UnionNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
@@ -419,11 +441,16 @@ public:
 	string ToQuery(SqlDialect dialect) override;
 };
 
-/// DISTINCT node — wraps the child CTE with SELECT DISTINCT.
+/// DISTINCT node — wraps the child CTE with SELECT DISTINCT, or, for DISTINCT ON, a row_number() filter.
 class DistinctNode : public CteNode {
 	string child_cte_name;
 
 public:
+	/// DISTINCT ON (distinct_on_targets) keeping one row per group, ordered by distinct_on_orders.
+	bool is_distinct_on = false;
+	vector<string> distinct_on_targets;
+	vector<string> distinct_on_orders;
+
 	~DistinctNode() override = default;
 	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	DistinctNode(const size_t index, vector<string> cte_column_names, string _child_cte_name)

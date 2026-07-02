@@ -221,3 +221,11 @@ INSERT INTO customer_stats VALUES (1, 10), (2, 20), (3, 30);
 
 statement ok
 SELECT total_orders FROM customer_stats WHERE nationkey = (SELECT nationkey FROM scalar_nation WHERE name IN ('USA', 'CANADA') LIMIT 1);
+
+# --- WITH ORDINALITY is refused: it compiles to row_number() over an unspecified row order (a distinctive
+# ROWS-framed row_number with no PARTITION/ORDER), which the rewrite cannot reproduce. A plain
+# row_number() OVER () (RANGE frame) is unaffected. ---
+statement error
+SELECT sql FROM lpts_query('SELECT r, o FROM range(10) WITH ORDINALITY AS _(r, o)');
+----
+LPTS_UNSUPPORTED_WINDOW
