@@ -115,8 +115,7 @@ struct FileResult {
 // discarded, killed after timeout_sec. The child's exit code is irrelevant (a DuckDB test may fail on its
 // own merits); only the LPTS log it leaves behind matters.
 static void RunUnittestProcess(const std::string &unittest, const std::string &rel_test,
-                               const std::vector<std::pair<std::string, std::string>> &extra_env,
-                               int64_t timeout_sec) {
+                               const std::vector<std::pair<std::string, std::string>> &extra_env, int64_t timeout_sec) {
 #ifdef _WIN32
 	// Build an environment block: current environment minus overridden keys, plus the extras.
 	// CreateProcessA requires the ANSI block to be sorted case-insensitively by name.
@@ -165,8 +164,7 @@ static void RunUnittestProcess(const std::string &unittest, const std::string &r
 	PROCESS_INFORMATION pi {};
 	std::vector<char> cmd(cmdline.begin(), cmdline.end());
 	cmd.push_back('\0');
-	if (CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, (LPVOID)env_block.data(), nullptr, &si,
-	                   &pi)) {
+	if (CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, (LPVOID)env_block.data(), nullptr, &si, &pi)) {
 		if (WaitForSingleObject(pi.hProcess, (DWORD)(timeout_sec * 1000)) == WAIT_TIMEOUT) {
 			TerminateProcess(pi.hProcess, 1);
 			WaitForSingleObject(pi.hProcess, 10000);
@@ -548,9 +546,9 @@ int main(int argc, char **argv) {
 		std::ofstream(baseline_path) << report.str();
 		fprintf(stderr, "wrote baseline: %s (%lld files with activity)\n", baseline_path.generic_string().c_str(),
 		        (long long)active);
-		fprintf(stderr, "# totals: files=%zu ok=%lld wrong=%lld fail=%lld unsupported=%lld ndet=%lld\n",
-		        results.size(), (long long)totals.ok, (long long)totals.wrong, (long long)totals.fail,
-		        (long long)totals.unsupported, (long long)totals.ndet);
+		fprintf(stderr, "# totals: files=%zu ok=%lld wrong=%lld fail=%lld unsupported=%lld ndet=%lld\n", results.size(),
+		        (long long)totals.ok, (long long)totals.wrong, (long long)totals.fail, (long long)totals.unsupported,
+		        (long long)totals.ndet);
 	} else if (mode == "check") {
 		exit_code = RunGate(LoadSummaryLines(baseline_path), results);
 	} else {
