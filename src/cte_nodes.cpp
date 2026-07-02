@@ -222,9 +222,31 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	if (!mark_expression.empty() && !cte_column_list.empty()) {
 		vector<string> select_cols(cte_column_list.begin(), cte_column_list.end() - 1);
 		select_cols.push_back(mark_expression);
-		join_str << "SELECT " << VecToSeparatedList(select_cols) << " FROM ";
+		join_str << "SELECT ";
+		if (dialect == SqlDialect::SPARK && (broadcast_left || broadcast_right)) {
+			vector<string> hints;
+			if (broadcast_left) {
+				hints.push_back("BROADCAST(" + left_cte_name + ")");
+			}
+			if (broadcast_right) {
+				hints.push_back("BROADCAST(" + right_cte_name + ")");
+			}
+			join_str << "/*+ " << VecToSeparatedList(hints) << " */ ";
+		}
+		join_str << VecToSeparatedList(select_cols) << " FROM ";
 	} else {
-		join_str << "SELECT " << VecToSeparatedList(cte_column_list) << " FROM ";
+		join_str << "SELECT ";
+		if (dialect == SqlDialect::SPARK && (broadcast_left || broadcast_right)) {
+			vector<string> hints;
+			if (broadcast_left) {
+				hints.push_back("BROADCAST(" + left_cte_name + ")");
+			}
+			if (broadcast_right) {
+				hints.push_back("BROADCAST(" + right_cte_name + ")");
+			}
+			join_str << "/*+ " << VecToSeparatedList(hints) << " */ ";
+		}
+		join_str << VecToSeparatedList(cte_column_list) << " FROM ";
 	}
 	// RIGHT_SEMI / RIGHT_ANTI: the preserved (output) side is the RIGHT CTE.
 	// Emit as "right SEMI/ANTI JOIN left" so the preserved side is on the left in SQL.

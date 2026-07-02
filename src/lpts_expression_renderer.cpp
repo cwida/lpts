@@ -144,6 +144,37 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 	}
 }
 
+static string RenderConstantForDialect(const BoundConstantExpression &constant, SqlDialect dialect) {
+	if (IsDuckDBDialect(dialect)) {
+		return constant.ToString();
+	}
+	const auto &value = constant.value;
+	if (value.IsNull()) {
+		return "CAST(NULL AS " + RenderCastTargetType(value.type(), dialect) + ")";
+	}
+	switch (value.type().id()) {
+	case LogicalTypeId::DATE:
+		return "DATE '" + EscapeSingleQuotes(value.ToString()) + "'";
+	case LogicalTypeId::TIMESTAMP:
+		return "TIMESTAMP '" + EscapeSingleQuotes(value.ToString()) + "'";
+	case LogicalTypeId::VARCHAR:
+		return "'" + EscapeSingleQuotes(value.GetValue<string>()) + "'";
+	default:
+		return value.ToSQLString();
+	}
+}
+
+static string RenderComparisonForDialect(const string &lhs, const string &rhs, ExpressionType comparison,
+                                         SqlDialect dialect) {
+	if (dialect == SqlDialect::SPARK && comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return "(" + lhs + " <=> " + rhs + ")";
+	}
+	if (dialect == SqlDialect::SPARK && comparison == ExpressionType::COMPARE_DISTINCT_FROM) {
+		return "(NOT (" + lhs + " <=> " + rhs + "))";
+	}
+	return "(" + lhs + ") " + ExpressionTypeToOperator(comparison) + " (" + rhs + ")";
+}
+
 static void ValidateTryCastForDialect(SqlDialect dialect) {
 	if (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY ||
 	    dialect == SqlDialect::REDSHIFT || dialect == SqlDialect::MYSQL_MARIADB) {
@@ -696,18 +727,14 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		break;
 	}
 	case ExpressionClass::BOUND_CONSTANT: {
-		expr_str << expression->ToString();
+		const BoundConstantExpression &constant = expression->Cast<BoundConstantExpression>();
+		expr_str << RenderConstantForDialect(constant, dialect);
 		break;
 	}
 	case ExpressionClass::BOUND_COMPARISON: {
 		const BoundComparisonExpression &cmp = expression->Cast<BoundComparisonExpression>();
-		expr_str << "(";
-		expr_str << ExpressionToAliasedString(cmp.left);
-		expr_str << ") ";
-		expr_str << ExpressionTypeToOperator(cmp.GetExpressionType());
-		expr_str << " (";
-		expr_str << ExpressionToAliasedString(cmp.right);
-		expr_str << ")";
+		expr_str << RenderComparisonForDialect(ExpressionToAliasedString(cmp.left), ExpressionToAliasedString(cmp.right),
+		                                       cmp.GetExpressionType(), dialect);
 		break;
 	}
 	case ExpressionClass::BOUND_BETWEEN: {

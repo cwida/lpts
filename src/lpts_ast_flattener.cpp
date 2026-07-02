@@ -19,6 +19,7 @@ private:
 	size_t node_count = 0;
 	vector<unique_ptr<CteNode>> cte_nodes;
 	SqlDialect dialect;             // Controls dialect-specific SQL rendering.
+	bool emit_spark_hints;          // Emits optimizer hints for Spark when the plan shape is known.
 	bool has_recursive_cte = false; // True when a RecursiveCteNode has been pushed.
 
 	/// Maps LogicalMaterializedCTE::table_index → (lpts_cte_name, lpts_cte_column_list)
@@ -55,6 +56,10 @@ private:
 			throw NotImplementedException("AstToInlineSQL: %s type %s not supported in recursive CTE step", context,
 			                              EnumUtil::ToString(join_type));
 		}
+	}
+
+	static bool IsOpenIvmDeltaTable(const string &table_name) {
+		return table_name.rfind("openivm_delta_", 0) == 0;
 	}
 
 	static string InlineJoinSql(JoinType join_type, vector<string> select_cols, const string &left_sql,
@@ -501,9 +506,12 @@ private:
 			string catalog_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.catalog;
 			string schema_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.schema;
 			string input_cte_name = children_names.empty() ? string() : children_names[0];
-			return make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
-			                          get.table_index, get.table_filters, get.column_names, input_cte_name,
-			                          get.table_function_output_count);
+			auto node = make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
+			                               get.table_index, get.table_filters, get.column_names, input_cte_name,
+			                               get.table_function_output_count);
+			node->spark_broadcast_hint =
+			    emit_spark_hints && dialect == SqlDialect::SPARK && IsOpenIvmDeltaTable(get.table_name);
+			return node;
 		}
 
 		if (type == "Filter") {
@@ -511,25 +519,34 @@ private:
 			// Filters are pass-through operators: SELECT * keeps the child's column
 			// layout. Preserve it so a filter-rooted subtree can produce a valid
 			// FinalReadNode instead of an empty SELECT list.
-			return make_uniq<FilterNode>(my_index, children_column_lists[0], children_names[0], filter.conditions);
+			auto node = make_uniq<FilterNode>(my_index, children_column_lists[0], children_names[0], filter.conditions);
+			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
+			return node;
 		}
 
 		if (type == "Project") {
 			const AstProjectNode &proj = static_cast<const AstProjectNode &>(ast_node);
-			return make_uniq<ProjectNode>(my_index, proj.cte_column_names, children_names[0], proj.expressions,
-			                              proj.table_index);
+			auto node =
+			    make_uniq<ProjectNode>(my_index, proj.cte_column_names, children_names[0], proj.expressions,
+			                           proj.table_index);
+			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
+			return node;
 		}
 
 		if (type == "Aggregate") {
 			const AstAggregateNode &agg = static_cast<const AstAggregateNode &>(ast_node);
-			return make_uniq<AggregateNode>(my_index, agg.cte_column_names, children_names[0], agg.group_by_columns,
-			                                agg.group_by_clause, agg.aggregate_expressions);
+			auto node = make_uniq<AggregateNode>(my_index, agg.cte_column_names, children_names[0],
+			                                     agg.group_by_columns, agg.group_by_clause, agg.aggregate_expressions);
+			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
+			return node;
 		}
 
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
 			return make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], children_names[1],
-			                           join.join_type, join.conditions, join.mark_expression, join.is_asof);
+			                           join.join_type, join.conditions, join.mark_expression, join.is_asof,
+			                           cte_nodes[cte_nodes.size() - 2]->spark_broadcast_hint,
+			                           cte_nodes[cte_nodes.size() - 1]->spark_broadcast_hint);
 		}
 
 		if (type == "PositionalJoin") {
@@ -614,7 +631,8 @@ private:
 	}
 
 public:
-	explicit AstFlattener(SqlDialect dialect = SqlDialect::DUCKDB) : dialect(dialect) {
+	explicit AstFlattener(SqlDialect dialect = SqlDialect::DUCKDB, bool emit_spark_hints = false)
+	    : dialect(dialect), emit_spark_hints(emit_spark_hints) {
 	}
 
 	/// Flatten the AST rooted at `root` into a CteList.
@@ -631,7 +649,8 @@ public:
 			auto insert_node =
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
-			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte, dialect);
+			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte, dialect,
+			                          emit_spark_hints);
 		}
 
 		// Regular SELECT: FlattenNode handles the entire subtree bottom-up.
@@ -657,15 +676,16 @@ public:
 		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, last_cte->cte_column_list,
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
-		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte, dialect);
+		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte, dialect,
+		                          emit_spark_hints);
 	}
 };
 
 //==============================================================================
 // Phase 2 entry point
 //==============================================================================
-unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect) {
-	AstFlattener flattener(dialect);
+unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect, bool emit_spark_hints) {
+	AstFlattener flattener(dialect, emit_spark_hints);
 	return flattener.Flatten(root);
 }
 

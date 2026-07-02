@@ -135,6 +135,8 @@ public:
 	string cte_name;
 	/// The "external" names of the CTE columns (the names ancestors use to reference them).
 	vector<string> cte_column_list;
+	/// True when this CTE is small enough to broadcast in Spark joins.
+	bool spark_broadcast_hint = false;
 };
 
 class GetNode : public CteNode {
@@ -231,14 +233,19 @@ public:
 	~JoinNode() override = default;
 	// Constructor.
 	JoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
-	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "", bool _is_asof = false)
+	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "", bool _is_asof = false,
+	         bool _broadcast_left = false, bool _broadcast_right = false)
 	    : CteNode(index, "join_" + std::to_string(index), std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)), join_type(_join_type),
 	      join_conditions(std::move(_join_conditions)), mark_expression(std::move(_mark_expression)),
-	      is_asof(_is_asof) {
+	      is_asof(_is_asof), broadcast_left(_broadcast_left), broadcast_right(_broadcast_right) {
 	}
 	// Functions.
 	string ToQuery(SqlDialect dialect) override;
+
+private:
+	bool broadcast_left;
+	bool broadcast_right;
 };
 
 class PositionalJoinNode : public CteNode {
@@ -430,13 +437,14 @@ class CteList {
 	unique_ptr<RootNode> final_node;   ///< The closing statement (SELECT or INSERT).
 	bool has_recursive_cte;            ///< True if any node is a RecursiveCteNode.
 	SqlDialect dialect;                ///< Dialect propagated into every node's ToQuery().
+	bool emit_spark_hints;             ///< Emit Spark optimizer hints when supported.
 
 public:
 	// Constructor.
 	CteList(vector<unique_ptr<CteNode>> _nodes, unique_ptr<RootNode> _final_node, bool _has_recursive_cte = false,
-	        SqlDialect _dialect = SqlDialect::DUCKDB)
+	        SqlDialect _dialect = SqlDialect::DUCKDB, bool _emit_spark_hints = false)
 	    : nodes(std::move(_nodes)), final_node(std::move(_final_node)), has_recursive_cte(_has_recursive_cte),
-	      dialect(_dialect) {
+	      dialect(_dialect), emit_spark_hints(_emit_spark_hints) {
 	}
 	/// Serialize the CTE list into a SQL query string.
 	/// If `use_newlines` is true, the string uses newlines between CTEs for readability.
