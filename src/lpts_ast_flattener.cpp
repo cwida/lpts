@@ -1008,6 +1008,14 @@ public:
 // Phase 2 entry point
 //==============================================================================
 unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect, bool emit_spark_hints, bool merge_pipeline) {
+	// openivm-spark's refresh rewriter drives its statement-by-statement rewriting off the
+	// classic per-operator CTE layout (scan_0 / aggregate_1 / …). Pipeline fusion collapses
+	// those into one flat SELECT, which that rewriter mis-handles — the Spark MV ends up with
+	// wrong contents even though the fused SQL is correct in native DuckDB. Fusion is a pure
+	// optimization, so keep it off for the SPARK dialect.
+	if (dialect == SqlDialect::SPARK) {
+		merge_pipeline = false;
+	}
 	AstFlattener flattener(dialect, emit_spark_hints, merge_pipeline);
 	return flattener.Flatten(root);
 }
