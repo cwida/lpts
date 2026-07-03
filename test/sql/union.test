@@ -195,3 +195,19 @@ query I
 PRAGMA lpts_check('SELECT id FROM users UNION SELECT id FROM staff UNION SELECT user_id FROM orders');
 ----
 true
+
+# --- Set-operation output column dedup (SPARK dialect regression) ---
+# A UNION whose arms are un-aliased self-joins exposes two columns that share a
+# base name (x.id / y.id, x.name / y.name). The set-operation node must mint
+# unique CTE column names (via MakeDedupedColumn) so the downstream projection
+# can reference each distinctly; otherwise duplicate names collapse to the first
+# occurrence and yield wrong results.
+query I
+PRAGMA lpts_check('SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION ALL SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id EXCEPT SELECT y.id, x.id FROM users x JOIN users y ON x.id < y.id');
+----
+true

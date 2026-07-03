@@ -1428,11 +1428,12 @@ private:
 			const LogicalSetOperation &set_op = op->Cast<LogicalSetOperation>();
 			const idx_t table_index = set_op.table_index;
 			vector<string> cte_column_names;
+			unordered_set<string> seen_names;
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &union_bindings = op->GetColumnBindings();
 			for (size_t i = 0; i < lhs_bindings.size(); ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "union lhs");
-				auto new_col = make_uniq<ColStruct>(table_index, lhs_col->column_name, lhs_col->alias);
+				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, i);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());
 				column_map[MappableColumnBinding(union_bindings[i])] = std::move(new_col);
 			}
@@ -1444,6 +1445,7 @@ private:
 			const LogicalSetOperation &set_op = op->Cast<LogicalSetOperation>();
 			const idx_t table_index = set_op.table_index;
 			vector<string> cte_column_names;
+			unordered_set<string> seen_names;
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &setop_bindings = op->GetColumnBindings();
 			if (lhs_bindings.size() < setop_bindings.size()) {
@@ -1452,7 +1454,7 @@ private:
 			}
 			for (size_t i = 0; i < setop_bindings.size(); ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "setop lhs");
-				auto new_col = make_uniq<ColStruct>(table_index, lhs_col->column_name, lhs_col->alias);
+				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, i);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());
 				column_map[MappableColumnBinding(setop_bindings[i])] = std::move(new_col);
 			}
