@@ -511,7 +511,7 @@ private:
 			                               get.table_function_output_count);
 			node->spark_broadcast_hint =
 			    emit_spark_hints && dialect == SqlDialect::SPARK && IsOpenIvmDeltaTable(get.table_name);
-			return node;
+			return unique_ptr<CteNode>(std::move(node));
 		}
 
 		if (type == "Filter") {
@@ -521,7 +521,7 @@ private:
 			// FinalReadNode instead of an empty SELECT list.
 			auto node = make_uniq<FilterNode>(my_index, children_column_lists[0], children_names[0], filter.conditions);
 			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
-			return node;
+			return unique_ptr<CteNode>(std::move(node));
 		}
 
 		if (type == "Project") {
@@ -530,7 +530,7 @@ private:
 			    make_uniq<ProjectNode>(my_index, proj.cte_column_names, children_names[0], proj.expressions,
 			                           proj.table_index);
 			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
-			return node;
+			return unique_ptr<CteNode>(std::move(node));
 		}
 
 		if (type == "Aggregate") {
@@ -538,7 +538,7 @@ private:
 			auto node = make_uniq<AggregateNode>(my_index, agg.cte_column_names, children_names[0],
 			                                     agg.group_by_columns, agg.group_by_clause, agg.aggregate_expressions);
 			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
-			return node;
+			return unique_ptr<CteNode>(std::move(node));
 		}
 
 		if (type == "Join") {
