@@ -406,7 +406,7 @@ static string LptsPragmaFunction(ClientContext &context, const FunctionParameter
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
+	auto cte_list = AstToCteList(*ast, dialect, /*emit_spark_hints=*/false, ReadMergePipeline(context));
 	string result_sql = cte_list->ToQuery(true);
 
 	// Return a substitute query that displays the result
@@ -453,7 +453,7 @@ static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunct
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
+	auto cte_list = AstToCteList(*ast, dialect, /*emit_spark_hints=*/false, ReadMergePipeline(context));
 
 	return BindSingleSqlResult(cte_list->ToQuery(true), return_types, names);
 }
@@ -494,7 +494,7 @@ static string LptsExecPragmaFunction(ClientContext &context, const FunctionParam
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
+	auto cte_list = AstToCteList(*ast, dialect, /*emit_spark_hints=*/false, ReadMergePipeline(context));
 	return cte_list->ToQuery(true);
 }
 
@@ -516,7 +516,7 @@ static string LptsCheckPragmaFunction(ClientContext &context, const FunctionPara
 
 	SqlDialect dialect = ReadDialect(context);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect, ReadMergePipeline(context));
+	auto cte_list = AstToCteList(*ast, dialect, /*emit_spark_hints=*/false, ReadMergePipeline(context));
 	string lpts_sql = cte_list->ToQuery(true);
 
 	// Normalize the original query to DuckDB's first parsed statement before embedding
