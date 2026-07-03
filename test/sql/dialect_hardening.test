@@ -42,6 +42,29 @@ SELECT sql FROM lpts_query('SELECT TRY_CAST(name AS INTEGER) FROM users');
 ----
 LPTS_DIALECT_SEMANTIC_RISK
 
+# Untyped NULL literals (SQLNULL) have no target-dialect cast type. They must render
+# as a bare NULL, not CAST(NULL AS NULL) — which would trip the cast-type whitelist.
+# Regression: the openivm to_date/to_timestamp shim expands to
+# CAST(CASE WHEN s IS NOT NULL THEN NULL WHEN s IS NULL THEN NULL END AS DATE),
+# whose CASE branches are untyped NULLs.
+statement ok
+SET lpts_dialect = 'spark';
+
+statement ok
+SELECT sql FROM lpts_query('SELECT CAST(CASE WHEN name IS NOT NULL THEN NULL WHEN name IS NULL THEN NULL END AS DATE) AS d FROM users');
+
+query I
+SELECT sql NOT LIKE '%AS NULL)%' AS no_null_type_cast
+FROM lpts_query('SELECT CAST(CASE WHEN name IS NOT NULL THEN NULL WHEN name IS NULL THEN NULL END AS DATE) AS d FROM users');
+----
+true
+
+# A bare untyped NULL projection also renders as NULL, not CAST(NULL AS NULL).
+query I
+SELECT sql NOT LIKE '%AS NULL)%' AS bare_null_ok FROM lpts_query('SELECT NULL AS n FROM users');
+----
+true
+
 # Unknown date format tokens should not silently pass through converted format strings.
 statement ok
 SET lpts_dialect = 'spark';

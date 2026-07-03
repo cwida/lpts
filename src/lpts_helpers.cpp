@@ -345,7 +345,20 @@ static bool ContainsNormalizedPhrase(const string &sql, const string &phrase) {
 static bool HasFunctionCall(const string &sql, const string &function_name) {
 	string lower_sql = LowerASCII(sql);
 	string needle = LowerASCII(function_name) + "(";
-	return lower_sql.find(needle) != string::npos;
+	// Require a word boundary before the name so a function whose name merely ENDS with `function_name`
+	// is not misclassified: an unanchored substring match would treat e.g. `moving_avg(` as `avg(`,
+	// `watchlist(` as `list(`, `mystats(` as `stats(`, `know(` as `now(`. A false "nondeterministic"
+	// verdict would silently pass a genuinely wrong rewrite in STRICT mode, eroding the wrong=0 invariant.
+	size_t pos = lower_sql.find(needle);
+	while (pos != string::npos) {
+		const char prev = pos == 0 ? '\0' : lower_sql[pos - 1];
+		const bool ident_char = (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_';
+		if (!ident_char) {
+			return true;
+		}
+		pos = lower_sql.find(needle, pos + 1);
+	}
+	return false;
 }
 
 static bool HasWindowFunctionCall(const string &sql, const string &function_name) {
@@ -429,9 +442,23 @@ bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 		reason = "LIMIT/OFFSET/FETCH selects an unspecified subset of rows";
 		return true;
 	}
-	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
+	// Floating aggregates whose exact (bit-for-bit) result depends on the summation/evaluation order, which
+	// the original and LPTS-rewritten plans need not share. Includes the fast variants (favg/fsum), the
+	// covariance/correlation family (corr/covar_*), the regression family (regr_*), and higher moments
+	// (skewness/kurtosis/sem). NOTE: several of these were previously matched only by accident by the
+	// unanchored substring matcher (favg via "avg", covar_pop/covar_samp via "var_pop"/"var_samp"); now that
+	// HasFunctionCall is word-boundary anchored, they must be listed explicitly.
+	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "favg") || HasFunctionCall(sql, "mean") ||
+	    HasFunctionCall(sql, "fsum") || HasFunctionCall(sql, "kahan_sum") || HasFunctionCall(sql, "sumkahan") ||
+	    HasFunctionCall(sql, "geomean") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
 	    HasFunctionCall(sql, "stddev_samp") || HasFunctionCall(sql, "variance") || HasFunctionCall(sql, "var_pop") ||
-	    HasFunctionCall(sql, "var_samp")) {
+	    HasFunctionCall(sql, "var_samp") || HasFunctionCall(sql, "corr") || HasFunctionCall(sql, "covar_pop") ||
+	    HasFunctionCall(sql, "covar_samp") || HasFunctionCall(sql, "sem") || HasFunctionCall(sql, "skewness") ||
+	    HasFunctionCall(sql, "kurtosis") || HasFunctionCall(sql, "kurtosis_pop") || HasFunctionCall(sql, "entropy") ||
+	    HasFunctionCall(sql, "regr_avgx") || HasFunctionCall(sql, "regr_avgy") ||
+	    HasFunctionCall(sql, "regr_intercept") || HasFunctionCall(sql, "regr_r2") ||
+	    HasFunctionCall(sql, "regr_slope") || HasFunctionCall(sql, "regr_sxx") || HasFunctionCall(sql, "regr_sxy") ||
+	    HasFunctionCall(sql, "regr_syy")) {
 		reason = "strict floating aggregate equality may depend on evaluation order";
 		return true;
 	}
@@ -452,6 +479,18 @@ bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 	    HasFunctionCall(sql, "reservoir_quantile") || HasFunctionCall(sql, "approx_top_k")) {
 		reason = "approximate aggregate result is not exactly reproducible";
 		return true;
+	}
+	// A raw exported aggregate STATE materialized as bytes — e.g. `(sum(x) EXPORT_STATE)::BLOB` — serializes
+	// implementation-defined state memory (which can include uninitialized padding), so its exact bytes are
+	// not reproducible between two executions of the same query. A finalize()/combine() over the state IS
+	// deterministic and is not flagged (those queries pass the round-trip check). The translation itself is
+	// faithful; only the serialized-state bytes are non-reproducible.
+	{
+		const string lower = LowerASCII(sql);
+		if (lower.find("export_state") != string::npos && lower.find("blob") != string::npos) {
+			reason = "raw exported aggregate state materialized as BLOB is not byte-reproducible";
+			return true;
+		}
 	}
 	return false;
 }

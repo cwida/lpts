@@ -12,9 +12,10 @@ unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalO
 
 /// Phase 2: Convert an AST into a flat CTE list.
 /// `dialect` controls dialect-specific SQL rendering (default: DuckDB).
+/// `emit_spark_hints` emits Spark optimizer hints when the plan shape is known.
 /// `merge_pipeline` fuses chains of single-child pipeline operators into one flat
 /// SELECT (one CTE per query block) instead of emitting one CTE per operator.
 unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect = SqlDialect::DUCKDB,
-                                 bool merge_pipeline = true);
+                                 bool emit_spark_hints = false, bool merge_pipeline = true);
 
 } // namespace duckdb

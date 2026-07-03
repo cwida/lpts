@@ -41,6 +41,18 @@
 
 ### Changed
 
+- Bumped the DuckDB target from v1.5.3 to **v1.5.4** and regenerated the coverage-gate baseline
+  against v1.5.4's sqllogic corpus (`files=3346`, `wrong=0 fail=0`).
+- The `lpts_check` nondeterminism heuristic's function-call matcher is now anchored on a word boundary,
+  so a function whose name merely ends with a flagged token is no longer misclassified (e.g. `moving_avg`
+  as `avg`, `watchlist` as `list`, `covar_pop` as `var_pop`). This closes a hole where a genuinely wrong
+  rewrite in such a query could be silently excused as nondeterministic in strict mode. The
+  covariance/correlation/regression/higher-moment float aggregates (`corr`, `covar_pop`, `covar_samp`,
+  `favg`, `fsum`, `regr_*`, `skewness`, `kurtosis`, `sem`, …) — some previously matched only by that
+  substring accident — are now listed explicitly.
+- A raw exported aggregate state materialized as bytes (`(sum(x) EXPORT_STATE)::BLOB`) is now treated as
+  nondeterministic: it serializes implementation-defined state memory (incl. uninitialized padding) whose
+  exact bytes are not reproducible between executions. `finalize()`/`combine()` over a state are unaffected.
 - The `lpts_check` nondeterminism detection now also scans the bound plan for sequence functions
   (`nextval`/`currval`/`lastval`), not just the query text. A sequence call hidden inside a macro
   (`SELECT my_macro(...)`) was invisible to the text heuristic, so the round-trip — which runs the original

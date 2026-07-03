@@ -350,6 +350,45 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 	}
 }
 
+static string RenderConstantForDialect(const BoundConstantExpression &constant, SqlDialect dialect) {
+	if (IsDuckDBDialect(dialect)) {
+		return constant.ToString();
+	}
+	const auto &value = constant.value;
+	if (value.IsNull()) {
+		// An untyped NULL literal (SQLNULL) has no target-dialect cast type; emit a
+		// bare NULL, which is valid in every non-DuckDB dialect. Casting it to its own
+		// "NULL" type would hit the RenderCastTargetType whitelist and fail (e.g. the
+		// to_date/to_timestamp shim's CASE ... THEN NULL branches). Typed NULLs keep
+		// their explicit CAST so downstream type inference is preserved.
+		if (value.type().id() == LogicalTypeId::SQLNULL) {
+			return "NULL";
+		}
+		return "CAST(NULL AS " + RenderCastTargetType(value.type(), dialect) + ")";
+	}
+	switch (value.type().id()) {
+	case LogicalTypeId::DATE:
+		return "DATE '" + EscapeSingleQuotes(value.ToString()) + "'";
+	case LogicalTypeId::TIMESTAMP:
+		return "TIMESTAMP '" + EscapeSingleQuotes(value.ToString()) + "'";
+	case LogicalTypeId::VARCHAR:
+		return "'" + EscapeSingleQuotes(value.GetValue<string>()) + "'";
+	default:
+		return value.ToSQLString();
+	}
+}
+
+static string RenderComparisonForDialect(const string &lhs, const string &rhs, ExpressionType comparison,
+                                         SqlDialect dialect) {
+	if (dialect == SqlDialect::SPARK && comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return "(" + lhs + " <=> " + rhs + ")";
+	}
+	if (dialect == SqlDialect::SPARK && comparison == ExpressionType::COMPARE_DISTINCT_FROM) {
+		return "(NOT (" + lhs + " <=> " + rhs + "))";
+	}
+	return "(" + lhs + ") " + ExpressionTypeToOperator(comparison) + " (" + rhs + ")";
+}
+
 static void ValidateTryCastForDialect(SqlDialect dialect) {
 	if (dialect == SqlDialect::POSTGRES || dialect == SqlDialect::HIVE || dialect == SqlDialect::BIGQUERY ||
 	    dialect == SqlDialect::REDSHIFT || dialect == SqlDialect::MYSQL_MARIADB) {
@@ -1109,12 +1148,19 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		break;
 	}
 	case ExpressionClass::BOUND_CONSTANT: {
+		const BoundConstantExpression &constant = expression->Cast<BoundConstantExpression>();
+		// Non-DuckDB dialects render constants through the dialect-aware path (target-specific
+		// literal/cast forms, bare NULL for untyped SQLNULL). The faithful, re-parseable rendering
+		// below is DuckDB-specific.
+		if (!IsDuckDBDialect(dialect)) {
+			expr_str << RenderConstantForDialect(constant, dialect);
+			break;
+		}
 		// Render the constant as a re-parseable, type-faithful SQL literal. Value::ToSQLString() quotes and
 		// self-types the common cases (BLOB, DATE/TIME/TIMESTAMP, VARCHAR, STRUCT, LIST, VARIANT, ...). For the
 		// types it leaves bare and that would re-parse to a different type (TINYINT/HUGEINT/FLOAT/DECIMAL/BIT/
 		// BIGNUM/unsigned ints), emit CAST('<text>' AS <type>): the string form casts correctly for all of them
 		// (e.g. CAST('00000001' AS BIT) keeps the bitstring, unlike the bare 00000001 which is the integer 1).
-		const BoundConstantExpression &constant = expression->Cast<BoundConstantExpression>();
 		if (constant.value.IsNull()) {
 			// A bare NULL re-parses as the untyped SQLNULL; a typed NULL (e.g. NULL::INTEGER, common in
 			// view definitions) must keep its type so the result column type — and the type-sensitive
@@ -1172,13 +1218,8 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	}
 	case ExpressionClass::BOUND_COMPARISON: {
 		const BoundComparisonExpression &cmp = expression->Cast<BoundComparisonExpression>();
-		expr_str << "(";
-		expr_str << ExpressionToAliasedString(cmp.left);
-		expr_str << ") ";
-		expr_str << ExpressionTypeToOperator(cmp.GetExpressionType());
-		expr_str << " (";
-		expr_str << ExpressionToAliasedString(cmp.right);
-		expr_str << ")";
+		expr_str << RenderComparisonForDialect(ExpressionToAliasedString(cmp.left),
+		                                       ExpressionToAliasedString(cmp.right), cmp.GetExpressionType(), dialect);
 		break;
 	}
 	case ExpressionClass::BOUND_BETWEEN: {

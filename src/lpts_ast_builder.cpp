@@ -218,6 +218,49 @@ private:
 		}
 	}
 
+	static string RenderNullLiteral(const LogicalType &type, SqlDialect dialect) {
+		if (dialect == SqlDialect::DUCKDB) {
+			return "NULL::" + type.ToString();
+		}
+		switch (type.id()) {
+		case LogicalTypeId::BOOLEAN:
+			return "CAST(NULL AS BOOLEAN)";
+		case LogicalTypeId::TINYINT:
+			return "CAST(NULL AS TINYINT)";
+		case LogicalTypeId::SMALLINT:
+			return "CAST(NULL AS SMALLINT)";
+		case LogicalTypeId::INTEGER:
+			return "CAST(NULL AS INTEGER)";
+		case LogicalTypeId::BIGINT:
+			return "CAST(NULL AS BIGINT)";
+		case LogicalTypeId::FLOAT:
+			return "CAST(NULL AS FLOAT)";
+		case LogicalTypeId::DOUBLE:
+			return "CAST(NULL AS DOUBLE)";
+		case LogicalTypeId::DECIMAL:
+			return "CAST(NULL AS " + type.ToString() + ")";
+		case LogicalTypeId::VARCHAR:
+			return "CAST(NULL AS VARCHAR)";
+		case LogicalTypeId::DATE:
+			return "CAST(NULL AS DATE)";
+		case LogicalTypeId::TIMESTAMP:
+			return "CAST(NULL AS TIMESTAMP)";
+		default:
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "LOGICAL_EMPTY_RESULT",
+			                        "no verified target dialect null literal type mapping");
+		}
+	}
+
+	string RenderJoinComparison(const string &lhs, const string &rhs, ExpressionType comparison) const {
+		if (dialect == SqlDialect::SPARK && comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			return "(" + lhs + " <=> " + rhs + ")";
+		}
+		if (dialect == SqlDialect::SPARK && comparison == ExpressionType::COMPARE_DISTINCT_FROM) {
+			return "(NOT (" + lhs + " <=> " + rhs + "))";
+		}
+		return "(" + lhs + " " + ExpressionTypeToOperator(comparison) + " " + rhs + ")";
+	}
+
 	static string SampleMethodToSql(SampleMethod method) {
 		switch (method) {
 		case SampleMethod::SYSTEM_SAMPLE:
@@ -1744,8 +1787,7 @@ private:
 				RegisterChildBindingFallbacks(*cond.right, child_bindings);
 				string lhs = ExpressionToAliasedString(cond.left);
 				string rhs = ExpressionToAliasedString(cond.right);
-				string cmp = ExpressionTypeToOperator(cond.comparison);
-				conditions.push_back("(" + lhs + " " + cmp + " " + rhs + ")");
+				conditions.push_back(RenderJoinComparison(lhs, rhs, cond.comparison));
 			}
 			AppendJoinPredicateCondition(join_op.predicate, child_bindings, conditions);
 
@@ -2016,7 +2058,7 @@ private:
 				string col_name = "c" + std::to_string(i);
 				auto col_struct = make_uniq<ColStruct>(empty.bindings[i].table_index, col_name, "");
 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
-				column_names.push_back("NULL::" + empty.return_types[i].ToString());
+				column_names.push_back(RenderNullLiteral(empty.return_types[i], dialect));
 				column_map[MappableColumnBinding(empty.bindings[i])] = std::move(col_struct);
 			}
 			// Emit a real zero-row subquery. Using a fake table name here leaks
@@ -2310,8 +2352,7 @@ private:
 				}
 				string lhs = ExpressionToAliasedString(cond.left);
 				string rhs = ExpressionToAliasedString(cond.right);
-				string cmp = ExpressionTypeToOperator(cond.comparison);
-				conditions.push_back("(" + lhs + " " + cmp + " " + rhs + ")");
+				conditions.push_back(RenderJoinComparison(lhs, rhs, cond.comparison));
 			}
 			AppendJoinPredicateCondition(dj.predicate, child_bindings, conditions);
 			if (op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
