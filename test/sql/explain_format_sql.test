@@ -1,0 +1,80 @@
+# name: test/sql/explain_format_sql.test
+# description: EXPLAIN (FORMAT SQL) <query> — a real EXPLAIN whose value is the LPTS SQL
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE users (id INT, name VARCHAR, age INT);
+
+statement ok
+INSERT INTO users VALUES (1, 'alice', 30), (2, 'bob', 20), (3, 'carol', 40);
+
+# --- EXPLAIN (FORMAT SQL) is a genuine EXPLAIN: 2 columns (explain_key, explain_value).
+#     The connection API (used by the test runner and by JDBC/Python) sees the real result;
+#     the value is multi-line, matched with a DOTALL regex. ---
+#     (DuckDB >= 1.5.4 pushes the projection/filter into the scan, so the plan has no
+#      separate projection node — assert on the filter rendering instead.)
+
+query II
+EXPLAIN (FORMAT SQL) SELECT name FROM users WHERE age > 25;
+----
+logical_opt	<REGEX>:(?s).*WHERE.*
+
+# --- case-insensitive keywords, extra whitespace, and a leading block comment ---
+
+query II
+eXpLaIn  (  format   sql  )  /* a comment */ SELECT id FROM users;
+----
+logical_opt	<REGEX>:(?s).*users.*
+
+# --- aggregate query ---
+
+query II
+EXPLAIN (FORMAT SQL) SELECT age, count(*) FROM users GROUP BY age;
+----
+logical_opt	<REGEX>:(?s).*GROUP BY.*
+
+# --- round-trip correctness of the pipeline the feature reuses verbatim ---
+
+query I
+PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT age, count(*) FROM users GROUP BY age');
+----
+true
+
+# --- NO REGRESSION: native EXPLAIN (FORMAT JSON) still works ---
+
+statement ok
+EXPLAIN (FORMAT JSON) SELECT 1;
+
+# --- NO REGRESSION: plain EXPLAIN still works ---
+
+statement ok
+EXPLAIN SELECT 1;
+
+# --- NO REGRESSION: an unknown format still raises the native error ---
+
+statement error
+EXPLAIN (FORMAT XML) SELECT 1;
+----
+not a valid FORMAT argument
+
+# --- NO REGRESSION: normal queries are untouched by the parser override ---
+
+query III rowsort
+SELECT id, name, age FROM users WHERE age > 25;
+----
+1	alice	30
+3	carol	40
+
+# --- an inner query that fails to plan surfaces a normal error ---
+
+statement error
+EXPLAIN (FORMAT SQL) SELECT * FROM does_not_exist;
+----
+Catalog Error

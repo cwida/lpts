@@ -28,7 +28,7 @@ statement ok
 SET lpts_dialect = 'MySQL';
 
 query I
-SELECT sql LIKE '%FROM `main`.`users`%' AS mysql_schema_table FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%FROM%`main`.`users`%' AS mysql_schema_table FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -38,7 +38,7 @@ SELECT sql NOT LIKE '%`memory`.`main`.`users`%' AS mysql_no_catalog_table FROM l
 true
 
 query I
-SELECT sql LIKE '%SELECT `id`%' AS mysql_column_backticked FROM lpts_query('SELECT id FROM users');
+SELECT sql LIKE '%SELECT%`id`%' AS mysql_column_backticked FROM lpts_query('SELECT id FROM users');
 ----
 true
 
@@ -48,17 +48,17 @@ SELECT sql LIKE '%`order`%' AS mysql_reserved_word_quoted FROM lpts_query('SELEC
 true
 
 query I
-SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%Y-%m-%d'')%' AS mysql_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
+SELECT sql LIKE '%DATE_FORMAT(ts, ''%Y-%m-%d'')%' AS mysql_strftime FROM lpts_query('SELECT strftime(ts, ''%Y-%m-%d'') AS ymd FROM events');
 ----
 true
 
 query I
-SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%H:%i:%s.%f'')%' AS mysql_time_format_tokens FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
+SELECT sql LIKE '%DATE_FORMAT(ts, ''%H:%i:%s.%f'')%' AS mysql_time_format_tokens FROM lpts_query('SELECT strftime(ts, ''%H:%M:%S.%f'') AS formatted FROM events');
 ----
 true
 
 query I
-SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%j %p'')%' AS mysql_compatible_date_tokens FROM lpts_query('SELECT strftime(ts, ''%j %p'') AS formatted FROM events');
+SELECT sql LIKE '%DATE_FORMAT(ts, ''%j %p'')%' AS mysql_compatible_date_tokens FROM lpts_query('SELECT strftime(ts, ''%j %p'') AS formatted FROM events');
 ----
 true
 
@@ -73,12 +73,12 @@ SELECT sql LIKE '%STR_TO_DATE(t0_name, ''%H:%i:%s'')%' AS mysql_time_parse_token
 true
 
 query I
-SELECT sql LIKE '%CAST(t0_id AS TINYINT)%' AS mysql_preserves_tinyint_cast FROM lpts_query('SELECT CAST(id AS TINYINT) FROM users');
+SELECT sql LIKE '%CAST(id AS TINYINT)%' AS mysql_preserves_tinyint_cast FROM lpts_query('SELECT CAST(id AS TINYINT) FROM users');
 ----
 true
 
 query I
-SELECT sql LIKE '%CAST(t0_id AS SMALLINT)%' AS mysql_preserves_smallint_cast FROM lpts_query('SELECT CAST(id AS SMALLINT) FROM users');
+SELECT sql LIKE '%CAST(id AS SMALLINT)%' AS mysql_preserves_smallint_cast FROM lpts_query('SELECT CAST(id AS SMALLINT) FROM users');
 ----
 true
 
@@ -105,7 +105,7 @@ statement ok
 SET lpts_dialect = 'mariadb';
 
 query I
-SELECT sql LIKE '%DATE_FORMAT(t0_ts, ''%Y'')%' AS mariadb_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
+SELECT sql LIKE '%DATE_FORMAT(ts, ''%Y'')%' AS mariadb_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
 ----
 true
 

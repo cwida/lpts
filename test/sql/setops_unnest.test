@@ -46,6 +46,16 @@ PRAGMA lpts_check('SELECT id, label FROM left_t INTERSECT ALL SELECT id, label F
 ----
 true
 
+query I
+PRAGMA lpts_check('SELECT DISTINCT id, label FROM left_t INTERSECT ALL SELECT DISTINCT id, label FROM right_t');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT DISTINCT id, label FROM left_t EXCEPT ALL SELECT DISTINCT id, label FROM right_t');
+----
+true
+
 query I rowsort
 PRAGMA lpts_exec('SELECT id FROM left_t EXCEPT ALL SELECT id FROM right_t');
 ----

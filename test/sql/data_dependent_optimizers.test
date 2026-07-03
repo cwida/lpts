@@ -185,3 +185,29 @@ query I
 PRAGMA lpts_check('SELECT * FROM dd_a ORDER BY k LIMIT 10');
 ----
 true
+
+# Compressed materialization (active when data-dependent optimizers are on and group-key
+# stats allow compression) must round-trip: compress/decompress projections are skipped
+# only when order-preserving, otherwise emitted with the internal wrappers stripped —
+# either way no __internal_* function may leak into the SQL.
+statement ok
+SET lpts_enable_data_dependent_optimizers = true;
+
+statement ok
+CREATE TABLE dd_cm(region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO dd_cm VALUES ('E', 10), ('E', 20), ('W', 5);
+
+query I
+SELECT sql NOT LIKE '%__internal%' FROM lpts_query('SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dd_cm GROUP BY region');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dd_cm GROUP BY region');
+----
+true
+
+statement ok
+SET lpts_enable_data_dependent_optimizers = false;

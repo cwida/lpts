@@ -401,6 +401,34 @@ PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score'
 ----
 true
 
+# Regression: a FILTER above a barrier (aggregate / unnest) where COLUMN_LIFETIME prunes a
+# column at the filter via projection_map (the group key / list passthrough is only needed
+# below the filter). FilterNode must emit only the kept columns; emitting the pruned column
+# leaves the CTE body wider than its header, which breaks the moment the filter output feeds
+# an arity-sensitive parent — here a UNION ALL with a 1-column branch.
+query I
+PRAGMA lpts_check('SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25 UNION ALL SELECT 99');
+----
+true
+
+# Same filter-prunes-group-key shape without the set-op.
+query I
+PRAGMA lpts_check('SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25');
+----
+true
+
+# FILTER above UNNEST: the list passthrough column is pruned at the filter.
+statement ok
+CREATE TABLE arr_t (id INTEGER, arr INTEGER[]);
+
+statement ok
+INSERT INTO arr_t VALUES (1, [5, 15, 20]), (2, [3, 30]);
+
+query I
+PRAGMA lpts_check('SELECT elem FROM (SELECT unnest(arr) AS elem FROM arr_t) u WHERE elem > 10 UNION ALL SELECT 99');
+----
+true
+
 # COLUMN_LIFETIME disabled: same queries must still round-trip correctly.
 statement ok
 SET disabled_optimizers = 'COLUMN_LIFETIME';
@@ -417,6 +445,11 @@ true
 
 query I
 PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25 UNION ALL SELECT 99');
 ----
 true
 

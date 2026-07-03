@@ -741,8 +741,8 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	}
 	case ExpressionClass::BOUND_COMPARISON: {
 		const BoundComparisonExpression &cmp = expression->Cast<BoundComparisonExpression>();
-		expr_str << RenderComparisonForDialect(ExpressionToAliasedString(cmp.left), ExpressionToAliasedString(cmp.right),
-		                                       cmp.GetExpressionType(), dialect);
+		expr_str << RenderComparisonForDialect(ExpressionToAliasedString(cmp.left),
+		                                       ExpressionToAliasedString(cmp.right), cmp.GetExpressionType(), dialect);
 		break;
 	}
 	case ExpressionClass::BOUND_BETWEEN: {
