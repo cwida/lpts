@@ -106,9 +106,16 @@ private:
 		if (inner.find('(') != string::npos || inner.find(')') != string::npos) {
 			return cond;
 		}
-		static const char *const kOps[] = {" IS NOT DISTINCT FROM ", " IS DISTINCT FROM ", " <=> ", " >= ",
-		                                    " <= ",                   " <> ",              " != ",  " = ",
-		                                    " > ",                    " < "};
+		static const char *const kOps[] = {" IS NOT DISTINCT FROM ",
+		                                   " IS DISTINCT FROM ",
+		                                   " <=> ",
+		                                   " >= ",
+		                                   " <= ",
+		                                   " <> ",
+		                                   " != ",
+		                                   " = ",
+		                                   " > ",
+		                                   " < "};
 		const string inner_lower = StringUtil::Lower(inner);
 		for (const char *op : kOps) {
 			const string op_lower = StringUtil::Lower(op);
@@ -781,8 +788,8 @@ private:
 			// 4. Create the DELIM_JOIN as a regular JOIN CTE.
 			const size_t my_index = node_count++;
 			const string right_name = MarkRightSideMaterialized(right_cte_name);
-			vector<string> conditions = QualifyAmbiguousJoinConditions(dj.conditions, left_cte_cols, right_cte_cols,
-			                                                           left_cte_name, right_name);
+			vector<string> conditions =
+			    QualifyAmbiguousJoinConditions(dj.conditions, left_cte_cols, right_cte_cols, left_cte_name, right_name);
 			LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: join_" + std::to_string(my_index) + " LEFT='" + left_cte_name +
 			                 "' RIGHT='" + right_name + "' mark_expr='" + dj.mark_expression + "'");
 			return make_uniq<JoinNode>(my_index, dj.cte_column_names, left_cte_name, right_name, dj.join_type,
@@ -936,9 +943,8 @@ private:
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
 			const string right_name = MarkRightSideMaterialized(children_names[1]);
-			vector<string> conditions =
-			    QualifyAmbiguousJoinConditions(join.conditions, children_column_lists[0], children_column_lists[1],
-			                                   children_names[0], right_name);
+			vector<string> conditions = QualifyAmbiguousJoinConditions(
+			    join.conditions, children_column_lists[0], children_column_lists[1], children_names[0], right_name);
 			return make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], right_name, join.join_type,
 			                           conditions, join.mark_expression, join.is_asof,
 			                           cte_nodes[cte_nodes.size() - 2]->spark_broadcast_hint,
