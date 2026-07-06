@@ -87,6 +87,12 @@ bool DialectUsesSingleQuotedTablePath(SqlDialect dialect) {
 }
 
 string DialectQuoteIdent(const string &name, SqlDialect dialect) {
+	// A NUL byte cannot appear in a SQL string at all — the parser stops at it, no quoting can express
+	// it. Such identifiers (e.g. CSV headers from fuzzed files) are untranslatable.
+	if (name.find('\0') != string::npos) {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_IDENTIFIER", dialect, "identifier", "<contains NUL byte>",
+		                        "DialectQuoteIdent", "an identifier containing a NUL byte cannot be written in SQL");
+	}
 	if (DialectUsesBacktickQuotedIdentifiers(dialect)) {
 		std::ostringstream out;
 		out << '`';

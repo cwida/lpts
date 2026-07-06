@@ -2,12 +2,14 @@
 // SQLStorm TPC-H benchmark runner for LPTS.
 //
 // For each query, run DuckDB first to establish that the query is accepted, then
-// run PRAGMA lpts_check('<query>') to verify LPTS round-trip correctness.
+// re-run it under `SET lpts_check=true` to verify LPTS round-trip correctness (the
+// extension raises iff the LPTS-rewritten query diverges from the original).
 //
 
 #include "duckdb.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/connection.hpp"
+#include "lpts_helpers.hpp" // IsLikelyNondeterministicSQL (shared with the lpts extension)
 
 #include <algorithm>
 #include <cctype>
@@ -243,155 +245,6 @@ static string StateToString(QueryState state) {
 	default:
 		return "unknown";
 	}
-}
-
-static string LowerASCII(string input) {
-	std::transform(input.begin(), input.end(), input.begin(),
-	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-	return input;
-}
-
-static bool ContainsInsensitive(const string &haystack, const string &needle) {
-	return LowerASCII(haystack).find(LowerASCII(needle)) != string::npos;
-}
-
-static string NormalizeWhitespaceASCII(const string &input) {
-	string result;
-	bool last_was_space = true;
-	for (char c : input) {
-		if (std::isspace(static_cast<unsigned char>(c))) {
-			if (!last_was_space) {
-				result += ' ';
-				last_was_space = true;
-			}
-			continue;
-		}
-		result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-		last_was_space = false;
-	}
-	if (!result.empty() && result.back() != ' ') {
-		result += ' ';
-	}
-	return " " + result;
-}
-
-static bool ContainsNormalizedPhrase(const string &sql, const string &phrase) {
-	return NormalizeWhitespaceASCII(sql).find(NormalizeWhitespaceASCII(phrase)) != string::npos;
-}
-
-static string ExtractFunctionCall(const string &sql, idx_t open_paren) {
-	idx_t depth = 0;
-	bool in_string = false;
-	for (idx_t i = open_paren; i < sql.size(); i++) {
-		char c = sql[i];
-		if (c == '\'') {
-			if (in_string && i + 1 < sql.size() && sql[i + 1] == '\'') {
-				i++;
-				continue;
-			}
-			in_string = !in_string;
-			continue;
-		}
-		if (in_string) {
-			continue;
-		}
-		if (c == '(') {
-			depth++;
-		} else if (c == ')') {
-			if (depth == 0) {
-				return string();
-			}
-			depth--;
-			if (depth == 0) {
-				return sql.substr(open_paren + 1, i - open_paren - 1);
-			}
-		}
-	}
-	return string();
-}
-
-static bool HasUnorderedAggregateCall(const string &sql, const string &function_name) {
-	string lower_sql = LowerASCII(sql);
-	string needle = LowerASCII(function_name) + "(";
-	idx_t pos = lower_sql.find(needle);
-	while (pos != string::npos) {
-		string args = ExtractFunctionCall(sql, pos + function_name.size());
-		if (!args.empty() && !ContainsInsensitive(args, "order by")) {
-			return true;
-		}
-		pos = lower_sql.find(needle, pos + needle.size());
-	}
-	return false;
-}
-
-static bool HasFunctionCall(const string &sql, const string &function_name) {
-	string lower_sql = LowerASCII(sql);
-	string needle = LowerASCII(function_name) + "(";
-	return lower_sql.find(needle) != string::npos;
-}
-
-static bool HasWindowFunctionCall(const string &sql, const string &function_name) {
-	return HasFunctionCall(sql, function_name) && ContainsNormalizedPhrase(sql, "over");
-}
-
-static bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
-	if (HasUnorderedAggregateCall(sql, "string_agg")) {
-		reason = "unordered string_agg aggregate";
-		return true;
-	}
-	if (HasUnorderedAggregateCall(sql, "listagg")) {
-		reason = "unordered listagg aggregate";
-		return true;
-	}
-	if (HasUnorderedAggregateCall(sql, "list") || HasUnorderedAggregateCall(sql, "array_agg")) {
-		reason = "unordered order-sensitive aggregate";
-		return true;
-	}
-	if (HasFunctionCall(sql, "random")) {
-		reason = "volatile random() expression";
-		return true;
-	}
-	if (HasWindowFunctionCall(sql, "row_number")) {
-		reason = "row_number over potentially tied ordering keys";
-		return true;
-	}
-	if (HasWindowFunctionCall(sql, "rank")) {
-		reason = "rank over potentially tied ordering keys";
-		return true;
-	}
-	if (HasWindowFunctionCall(sql, "dense_rank")) {
-		reason = "dense_rank over potentially tied ordering keys";
-		return true;
-	}
-	if (HasWindowFunctionCall(sql, "lag") || HasWindowFunctionCall(sql, "lead") ||
-	    HasWindowFunctionCall(sql, "first_value") || HasWindowFunctionCall(sql, "last_value") ||
-	    HasWindowFunctionCall(sql, "nth_value")) {
-		reason = "window function over potentially tied ordering keys";
-		return true;
-	}
-	if (ContainsNormalizedPhrase(sql, "limit") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with LIMIT/OFFSET may have tied boundary rows";
-		return true;
-	}
-	if (ContainsNormalizedPhrase(sql, "fetch first") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with FETCH FIRST may have tied boundary rows";
-		return true;
-	}
-	if (ContainsNormalizedPhrase(sql, "fetch next") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with FETCH NEXT may have tied boundary rows";
-		return true;
-	}
-	if (ContainsNormalizedPhrase(sql, "offset") && ContainsNormalizedPhrase(sql, "order by")) {
-		reason = "ORDER BY with OFFSET may have tied boundary rows";
-		return true;
-	}
-	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
-	    HasFunctionCall(sql, "stddev_samp") || HasFunctionCall(sql, "variance") ||
-	    HasFunctionCall(sql, "var_pop") || HasFunctionCall(sql, "var_samp")) {
-		reason = "strict floating aggregate equality may depend on evaluation order";
-		return true;
-	}
-	return false;
 }
 
 static string TrimError(string error) {
@@ -656,18 +509,24 @@ static void ConfigureConnection(Connection &con) {
 					}
 				}
 
-				string check_sql = "PRAGMA lpts_check('" + EscapeSQLLiteral(sql) + "')";
+				// LPTS round-trip check: enable strict lpts_check mode and re-run the original query. The
+				// extension intercepts the SELECT, runs the original and the LPTS-rewritten query side by
+				// side, and raises iff their result bags differ. Nondeterministic queries are suppressed
+				// inside the extension (so they pass); a query LPTS cannot rewrite raises a specific
+				// "LPTS check: unsupported query" error, and a true divergence raises "LPTS check failed".
 				auto lpts_start = std::chrono::steady_clock::now();
-				unique_ptr<MaterializedQueryResult> check_result;
 				if (summary.state == QueryState::SUCCESS) {
 					WritePhase(write_fd, "lpts_check");
+					con.Query("SET lpts_check=true");
+					unique_ptr<MaterializedQueryResult> check_result;
 					try {
-						check_result = con.Query(check_sql);
+						check_result = con.Query(sql);
 					} catch (std::exception &ex) {
 						error = ex.what();
 					} catch (...) {
 						error = "unknown LPTS exception";
 					}
+					con.Query("SET lpts_check=false"); // restore before the next iteration's DuckDB phase
 					auto lpts_end = std::chrono::steady_clock::now();
 					summary.lpts_check_time_ms =
 					    std::chrono::duration<double, std::milli>(lpts_end - lpts_start).count();
@@ -675,40 +534,38 @@ static void ConfigureConnection(Connection &con) {
 					if (error.empty() && check_result && check_result->HasError()) {
 						error = check_result->GetError();
 					}
-					if (!error.empty()) {
+					summary.strict_check_ran = true;
+					if (error.empty()) {
+						// Clean run under strict mode => round-trip matched (or nondeterministic-suppressed).
+						summary.state = QueryState::SUCCESS;
+						summary.strict_match = true;
+						summary.diagnostic_state = "strict_match";
+					} else {
 						summary.error = TrimError(error);
 						summary.phase = "lpts_check";
+						summary.strict_match = false;
 						if (IsCrashError(summary.error)) {
 							summary.state = QueryState::CRASH;
-						} else if (IsNotImplementedError(summary.error)) {
-							summary.state = QueryState::NOT_IMPLEMENTED;
-						} else {
-							summary.state = QueryState::LPTS_ERROR;
-						}
-					} else if (!check_result || check_result->RowCount() == 0) {
-						summary.error = "lpts_check returned no rows";
-						summary.phase = "lpts_check";
-						summary.state = QueryState::LPTS_ERROR;
-					} else {
-						auto match_value = check_result->GetValue(0, 0);
-						summary.strict_check_ran = true;
-						summary.strict_match = match_value.ToString() == "true";
-						if (summary.strict_match) {
-							summary.state = QueryState::SUCCESS;
-							summary.diagnostic_state = "strict_match";
-						} else {
-							summary.phase = "lpts_check";
+						} else if (summary.error.find("LPTS check failed") != string::npos) {
+							// Result-bag mismatch on a query LPTS rewrote. Nondeterministic queries are
+							// suppressed inside the extension, so a mismatch reaching us is a real divergence;
+							// re-test the heuristic defensively to keep the nondeterministic bucket meaningful.
 							string diagnostic_reason;
 							if (IsLikelyNondeterministicSQL(sql, diagnostic_reason)) {
 								summary.state = QueryState::NONDETERMINISTIC;
 								summary.diagnostic_state = "nondeterministic";
 								summary.diagnostic_reason = diagnostic_reason;
-								summary.error = diagnostic_reason;
 							} else {
 								summary.state = QueryState::INCORRECT;
 								summary.diagnostic_state = "strict_mismatch";
-								summary.error = "lpts_check returned false";
 							}
+						} else if (IsNotImplementedError(summary.error)) {
+							// "LPTS check: unsupported query (LPTS could not check it): Not implemented Error: ..."
+							summary.state = QueryState::NOT_IMPLEMENTED;
+							summary.diagnostic_state = "unsupported";
+						} else {
+							summary.state = QueryState::LPTS_ERROR;
+							summary.diagnostic_state = "lpts_error";
 						}
 					}
 				}

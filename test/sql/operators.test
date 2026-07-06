@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE t (id INTEGER, val INTEGER, name VARCHAR);
 
 statement ok
@@ -17,35 +20,29 @@ INSERT INTO t VALUES (1, 10, 'Alice'), (2, NULL, 'Bob'), (3, 30, NULL), (4, 20, 
 # --- IS NULL in WHERE filter ---
 
 query I
-PRAGMA lpts_exec('SELECT id FROM t WHERE val IS NULL');
+SELECT id FROM t WHERE val IS NULL;
 ----
 2
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val IS NULL');
-----
-true
+statement ok
+SELECT id FROM t WHERE val IS NULL;
 
 # --- IS NOT NULL in WHERE filter ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT id FROM t WHERE name IS NOT NULL');
+SELECT id FROM t WHERE name IS NOT NULL;
 ----
 1
 2
 4
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE name IS NOT NULL');
-----
-true
+statement ok
+SELECT id FROM t WHERE name IS NOT NULL;
 
 # --- IS NULL on projected expression ---
 
-query I
-PRAGMA lpts_check('SELECT id, val IS NULL AS is_missing FROM t');
-----
-true
+statement ok
+SELECT id, val IS NULL AS is_missing FROM t;
 
 # ============================================================
 # IN / NOT IN
@@ -54,39 +51,33 @@ true
 # --- IN with literal list ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT id FROM t WHERE val IN (10, 30)');
+SELECT id FROM t WHERE val IN (10, 30);
 ----
 1
 3
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val IN (10, 30)');
-----
-true
+statement ok
+SELECT id FROM t WHERE val IN (10, 30);
 
 # --- NOT IN with literal list ---
 
 query I
-PRAGMA lpts_exec('SELECT id FROM t WHERE val NOT IN (10, 30)');
+SELECT id FROM t WHERE val NOT IN (10, 30);
 ----
 4
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val NOT IN (10, 30)');
-----
-true
+statement ok
+SELECT id FROM t WHERE val NOT IN (10, 30);
 
 # --- IN with single value ---
 
 query I
-PRAGMA lpts_exec('SELECT id FROM t WHERE val IN (20)');
+SELECT id FROM t WHERE val IN (20);
 ----
 4
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val IN (20)');
-----
-true
+statement ok
+SELECT id FROM t WHERE val IN (20);
 
 # ============================================================
 # NOT operator
@@ -95,28 +86,24 @@ true
 # --- NOT (IS NULL) ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT id FROM t WHERE NOT (val IS NULL)');
+SELECT id FROM t WHERE NOT (val IS NULL);
 ----
 1
 3
 4
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE NOT (val IS NULL)');
-----
-true
+statement ok
+SELECT id FROM t WHERE NOT (val IS NULL);
 
 # --- NOT with comparison ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT id FROM t WHERE NOT (val > 15)');
+SELECT id FROM t WHERE NOT (val > 15);
 ----
 1
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE NOT (val > 15)');
-----
-true
+statement ok
+SELECT id FROM t WHERE NOT (val > 15);
 
 # ============================================================
 # COALESCE
@@ -125,30 +112,26 @@ true
 # --- COALESCE in projection ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, COALESCE(val, 0) AS v FROM t');
+SELECT id, COALESCE(val, 0) AS v FROM t;
 ----
 1	10
 2	0
 3	30
 4	20
 
-query I
-PRAGMA lpts_check('SELECT id, COALESCE(val, 0) AS v FROM t');
-----
-true
+statement ok
+SELECT id, COALESCE(val, 0) AS v FROM t;
 
 # --- COALESCE in WHERE filter ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, COALESCE(val, 0) AS v FROM t WHERE COALESCE(val, 0) > 15');
+SELECT id, COALESCE(val, 0) AS v FROM t WHERE COALESCE(val, 0) > 15;
 ----
 3	30
 4	20
 
-query I
-PRAGMA lpts_check('SELECT id, COALESCE(val, 0) AS v FROM t WHERE COALESCE(val, 0) > 15');
-----
-true
+statement ok
+SELECT id, COALESCE(val, 0) AS v FROM t WHERE COALESCE(val, 0) > 15;
 
 # ============================================================
 # NULLIF
@@ -157,17 +140,15 @@ true
 # --- NULLIF in projection ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, NULLIF(val, 10) AS v FROM t');
+SELECT id, NULLIF(val, 10) AS v FROM t;
 ----
 1	NULL
 2	NULL
 3	30
 4	20
 
-query I
-PRAGMA lpts_check('SELECT id, NULLIF(val, 10) AS v FROM t');
-----
-true
+statement ok
+SELECT id, NULLIF(val, 10) AS v FROM t;
 
 # ============================================================
 # CASE WHEN (BOUND_CASE)
@@ -176,39 +157,33 @@ true
 # --- CASE WHEN with two branches and ELSE ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, CASE WHEN val > 25 THEN ''high'' WHEN val > 10 THEN ''mid'' ELSE ''low'' END AS band FROM t');
+SELECT id, CASE WHEN val > 25 THEN 'high' WHEN val > 10 THEN 'mid' ELSE 'low' END AS band FROM t;
 ----
 1	low
 2	low
 3	high
 4	mid
 
-query I
-PRAGMA lpts_check('SELECT id, CASE WHEN val > 25 THEN ''high'' WHEN val > 10 THEN ''mid'' ELSE ''low'' END AS band FROM t');
-----
-true
+statement ok
+SELECT id, CASE WHEN val > 25 THEN 'high' WHEN val > 10 THEN 'mid' ELSE 'low' END AS band FROM t;
 
 # --- CASE WHEN with IS NULL check ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, CASE WHEN val IS NULL THEN 0 ELSE val END AS safe_val FROM t');
+SELECT id, CASE WHEN val IS NULL THEN 0 ELSE val END AS safe_val FROM t;
 ----
 1	10
 2	0
 3	30
 4	20
 
-query I
-PRAGMA lpts_check('SELECT id, CASE WHEN val IS NULL THEN 0 ELSE val END AS safe_val FROM t');
-----
-true
+statement ok
+SELECT id, CASE WHEN val IS NULL THEN 0 ELSE val END AS safe_val FROM t;
 
 # --- CASE WHEN in WHERE (via aggregate) ---
 
-query I
-PRAGMA lpts_check('SELECT sum(CASE WHEN val > 10 THEN val ELSE 0 END) FROM t');
-----
-true
+statement ok
+SELECT sum(CASE WHEN val > 10 THEN val ELSE 0 END) FROM t;
 
 # --- CASE WHEN in GROUP BY aggregate ---
 
@@ -221,24 +196,20 @@ INSERT INTO orders VALUES
   ('EU', 300, '1-URGENT'), ('EU', 150, '3-LOW');
 
 query II rowsort
-PRAGMA lpts_exec('SELECT region, sum(CASE WHEN priority = ''1-URGENT'' THEN amount ELSE 0 END) AS urgent_total FROM orders GROUP BY region');
+SELECT region, sum(CASE WHEN priority = '1-URGENT' THEN amount ELSE 0 END) AS urgent_total FROM orders GROUP BY region;
 ----
 EU	300
 US	100
 
-query I
-PRAGMA lpts_check('SELECT region, sum(CASE WHEN priority = ''1-URGENT'' THEN amount ELSE 0 END) AS urgent_total FROM orders GROUP BY region');
-----
-true
+statement ok
+SELECT region, sum(CASE WHEN priority = '1-URGENT' THEN amount ELSE 0 END) AS urgent_total FROM orders GROUP BY region;
 
 # ============================================================
 # Combined: CASE + IN
 # ============================================================
 
-query I
-PRAGMA lpts_check('SELECT id, CASE WHEN val IN (10, 20) THEN ''small'' ELSE ''large'' END AS sz FROM t');
-----
-true
+statement ok
+SELECT id, CASE WHEN val IN (10, 20) THEN 'small' ELSE 'large' END AS sz FROM t;
 
 # ============================================================
 # Postgres dialect: table reference without catalog/schema prefix
@@ -257,10 +228,8 @@ SELECT sql LIKE '%memory.main.t%' AS uses_catalog FROM lpts_query('SELECT id FRO
 ----
 false
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val IS NULL');
-----
-true
+statement ok
+SELECT id FROM t WHERE val IS NULL;
 
 statement ok
 SET lpts_dialect = 'duckdb';

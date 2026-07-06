@@ -51,3 +51,12 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
     add_executable(lpts_sqlstorm_benchmark benchmark/sqlstorm/lpts_sqlstorm_benchmark.cpp)
     target_link_libraries(lpts_sqlstorm_benchmark ${LPTS_BENCHMARK_LINK_LIBS})
 endif()
+
+# Standalone driver for the DuckDB-sqllogic-corpus coverage gate (`make coverage-check`). It only spawns
+# `unittest` subprocesses and parses their LPTS verdict logs, so it links no DuckDB code.
+if(NOT EMSCRIPTEN)
+    add_executable(lpts_corpus_gate test/corpus_gate/lpts_corpus_gate.cpp)
+    set_target_properties(lpts_corpus_gate PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    find_package(Threads REQUIRED)
+    target_link_libraries(lpts_corpus_gate Threads::Threads)
+endif()

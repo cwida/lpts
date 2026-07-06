@@ -1,6 +1,6 @@
 ---
 name: explain-lpts-ddl
-description: Reference for LPTS DDL syntax — PRAGMA lpts, lpts_query, lpts_exec, lpts_check, dialect settings, and print_ast. Auto-loaded when discussing LPTS usage, pragmas, table functions, round-trip checks, or dialect configuration.
+description: Reference for LPTS DDL syntax — PRAGMA lpts, lpts_query, the lpts_check round-trip setting, lpts_normalize_query, dialect settings, and print_ast. Auto-loaded when discussing LPTS usage, pragmas, table functions, round-trip checks, or dialect configuration.
 ---
 
 ## LPTS DDL Overview
@@ -38,34 +38,47 @@ auto cte_list = AstToCteList(*ast, dialect);
 string result_sql = cte_list->ToQuery(true);
 ```
 
-### Round-Trip Execution
-
-**PRAGMA lpts_exec('query')** — Converts a query via LPTS, then executes the resulting SQL:
-
-```sql
-D PRAGMA lpts_exec('SELECT id, val FROM t');
-----
-1    10
-2    20
-3    30
-```
-
-Use this to verify that the LPTS-generated SQL produces correct result values.
-
 ### Round-Trip Correctness Check
 
-**PRAGMA lpts_check('query')** — The primary testing function. Converts a query via LPTS,
-executes both the original and the LPTS-generated SQL, and compares results using bag
-equality (EXCEPT ALL in both directions). Returns `true` if they match:
+**SET lpts_check = true** — The primary correctness mechanism. Once on, every top-level
+`SELECT` is intercepted: LPTS runs the original query and its LPTS rewrite side by side
+and compares their result bags with an order-independent hash. The query returns its
+normal rows unchanged.
 
 ```sql
-D PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
+D SET lpts_check = true;
+D SELECT name FROM users WHERE age > 25;   -- runs normally; raises if rewritten wrong
 ----
-true
+Carol
 ```
 
-**Every new test must include at least one `lpts_check`.** This is the authoritative
-correctness check for LPTS.
+By default the check is strict. On a mismatch it raises
+`Invalid Input Error: LPTS check failed: ...`; when LPTS cannot rewrite the query it
+raises `Invalid Input Error: LPTS check: unsupported query (LPTS could not check it):
+...`. Nondeterministic queries (no fully specified order, `random()`, unordered
+aggregates, etc.) are detected and pass without error. Queries that read LPTS's own
+table functions (`lpts_query`, `print_ast_query`, `lpts_normalize_query`) and queries
+running under statement verification (for example `PRAGMA enable_verification`) are
+skipped.
+
+Setting the `LPTS_CHECK_LOG` environment variable to a file path switches to log mode:
+with `lpts_check` on, LPTS never raises and instead appends one line per intercepted
+`SELECT` — `<n> FAIL` (could not rewrite), `<n> OK` (bags matched), `<n> WRONG` (bags
+differed), or `<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, with the
+heuristic's explanation) — where `<n>` is the 1-based interception index. This is how
+DuckDB's own sqllogic corpus is run through LPTS.
+
+**Every new test must turn on `lpts_check` and exercise the feature with a bare query.**
+This is the authoritative correctness check for LPTS.
+
+### Normalizing Input-Dialect SQL
+
+**lpts_normalize_query('query')** — Table function returning the input-dialect SQL
+normalized to DuckDB SQL (honors `lpts_input_dialect`):
+
+```sql
+SELECT sql FROM lpts_normalize_query('SELECT `order` FROM events LIMIT 5, 10');
+```
 
 ### AST Debugging
 

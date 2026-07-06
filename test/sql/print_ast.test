@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 
 statement ok
@@ -56,25 +59,17 @@ SELECT instr(sql, chr(10)) > 0 FROM lpts_query('SELECT u.name, sum(o.amount) FRO
 true
 
 # Cross product — should produce Join(INNER, ON TRUE)
-query I
-PRAGMA lpts_check('SELECT u.name, o.amount FROM users u CROSS JOIN orders o');
-----
-true
+statement ok
+SELECT u.name, o.amount FROM users u CROSS JOIN orders o;
 
 # Duplicate column names — deduplication in projection
-query I
-PRAGMA lpts_check('SELECT u.id, o.id FROM users u CROSS JOIN orders o');
-----
-true
+statement ok
+SELECT u.id, o.id FROM users u CROSS JOIN orders o;
 
 # UNION ALL — AST roundtrip
-query I
-PRAGMA lpts_check('SELECT id FROM users UNION ALL SELECT user_id FROM orders');
-----
-true
+statement ok
+SELECT id FROM users UNION ALL SELECT user_id FROM orders;
 
 # Arithmetic in projection — infix rendering
-query I
-PRAGMA lpts_check('SELECT id + age, age * 2 FROM users');
-----
-true
+statement ok
+SELECT id + age, age * 2 FROM users;

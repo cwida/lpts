@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE items (id INT, grp INT, val FLOAT[]);
 
 statement ok
@@ -18,7 +21,7 @@ INSERT INTO items VALUES
 # --- list_transform: add scalar to each element ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT grp, list_transform(val, lambda x: x + 1.0) FROM items');
+SELECT grp, list_transform(val, lambda x: x + 1.0) FROM items;
 ----
 1	[2.0, 3.0, 4.0]
 1	[5.0, 6.0]
@@ -26,46 +29,38 @@ PRAGMA lpts_exec('SELECT grp, list_transform(val, lambda x: x + 1.0) FROM items'
 2	[8.0]
 3	[]
 
-query I
-PRAGMA lpts_check('SELECT grp, list_transform(val, lambda x: x + 1.0) FROM items');
-----
-true
+statement ok
+SELECT grp, list_transform(val, lambda x: x + 1.0) FROM items;
 
 # --- list_transform: multiply by scalar ---
 
-query I
-PRAGMA lpts_check('SELECT grp, list_transform(val, lambda x: x * 2.0) FROM items');
-----
-true
+statement ok
+SELECT grp, list_transform(val, lambda x: x * 2.0) FROM items;
 
 # --- list_transform on single-element list ---
 
 query II
-PRAGMA lpts_exec('SELECT id, list_transform(val, lambda x: x + 10.0) FROM items WHERE id = 4');
+SELECT id, list_transform(val, lambda x: x + 10.0) FROM items WHERE id = 4;
 ----
 4	[17.0]
 
-query I
-PRAGMA lpts_check('SELECT id, list_transform(val, lambda x: x + 10.0) FROM items WHERE id = 4');
-----
-true
+statement ok
+SELECT id, list_transform(val, lambda x: x + 10.0) FROM items WHERE id = 4;
 
 # --- list_transform on empty list: returns empty list ---
 
 query II
-PRAGMA lpts_exec('SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE id = 5');
+SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE id = 5;
 ----
 5	[]
 
-query I
-PRAGMA lpts_check('SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE id = 5');
-----
-true
+statement ok
+SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE id = 5;
 
 # --- list_filter: retain elements matching condition ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT grp, list_filter(val, lambda x: x > 5.0) FROM items');
+SELECT grp, list_filter(val, lambda x: x > 5.0) FROM items;
 ----
 1	[]
 1	[]
@@ -73,74 +68,90 @@ PRAGMA lpts_exec('SELECT grp, list_filter(val, lambda x: x > 5.0) FROM items');
 2	[7.0]
 3	[]
 
-query I
-PRAGMA lpts_check('SELECT grp, list_filter(val, lambda x: x > 5.0) FROM items');
-----
-true
+statement ok
+SELECT grp, list_filter(val, lambda x: x > 5.0) FROM items;
 
 # --- list_filter: condition retains all elements ---
 
-query I
-PRAGMA lpts_check('SELECT list_filter(val, lambda x: x >= 0.0) FROM items');
-----
-true
+statement ok
+SELECT list_filter(val, lambda x: x >= 0.0) FROM items;
 
 # --- list_filter: condition retains no elements ---
 
-query I
-PRAGMA lpts_check('SELECT list_filter(val, lambda x: x > 999.0) FROM items');
-----
-true
+statement ok
+SELECT list_filter(val, lambda x: x > 999.0) FROM items;
 
 # --- list_filter on empty list: returns empty list ---
 
 query II
-PRAGMA lpts_exec('SELECT id, list_filter(val, lambda x: x > 0.0) FROM items WHERE id = 5');
+SELECT id, list_filter(val, lambda x: x > 0.0) FROM items WHERE id = 5;
 ----
 5	[]
 
-query I
-PRAGMA lpts_check('SELECT id, list_filter(val, lambda x: x > 0.0) FROM items WHERE id = 5');
-----
-true
+statement ok
+SELECT id, list_filter(val, lambda x: x > 0.0) FROM items WHERE id = 5;
 
 # --- list_transform with compound body expression ---
 
-query I
-PRAGMA lpts_check('SELECT list_transform(val, lambda x: x * x) FROM items');
-----
-true
+statement ok
+SELECT list_transform(val, lambda x: x * x) FROM items;
 
 # --- list_reduce with two-param lambda: element-wise sum across rows in a group ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total FROM items GROUP BY grp');
+SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total FROM items GROUP BY grp;
 ----
 1	[5.0, 7.0, NULL]
 2	[17.0, NULL]
 3	[]
 
-query I
-PRAGMA lpts_check('SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total FROM items GROUP BY grp');
-----
-true
+statement ok
+SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total FROM items GROUP BY grp;
 
 # --- list_transform combined with WHERE filter ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE grp = 2');
+SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE grp = 2;
 ----
 3	[11.0, 21.0]
 4	[8.0]
 
-query I
-PRAGMA lpts_check('SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE grp = 2');
-----
-true
+statement ok
+SELECT id, list_transform(val, lambda x: x + 1.0) FROM items WHERE grp = 2;
 
 # --- Lambda in aggregate context: list() + list_transform ---
 
+statement ok
+SELECT grp, list_transform(list(id), lambda x: x + 100) FROM items GROUP BY grp;
+
+# --- Lambda capturing an outer column ---
+# `lambda x: x + n` closes over the outer column n. DuckDB binds the capture as a trailing lambda
+# parameter; LPTS must render it as the (renamed) outer reference, not shadow it as a parameter.
+
+statement ok
+CREATE TABLE clists (n INTEGER, l INTEGER[]);
+
+statement ok
+INSERT INTO clists VALUES (1, [1]), (2, [1, 2, 3]), (3, NULL), (10, [-1, NULL, 2]);
+
 query I
-PRAGMA lpts_check('SELECT grp, list_transform(list(id), lambda x: x + 100) FROM items GROUP BY grp');
+SELECT list_transform(l, lambda x: x + n) FROM clists ORDER BY n;
 ----
-true
+[2]
+[3, 4, 5]
+NULL
+[9, NULL, 12]
+
+statement ok
+SELECT list_transform(l, lambda x: x + n) FROM clists ORDER BY n;
+
+statement ok
+SELECT list_filter(l, lambda x: x <= n) FROM clists;
+
+# capture a positional column reference (#1 = first column = n), from a renamed scan
+statement ok
+SELECT list_transform([1, 2, 3], lambda x: x + #1) FROM clists;
+
+# capture used in a two-parameter lambda alongside the element and index
+statement ok
+SELECT list_transform(l, lambda x, i: x + i + n) FROM clists;

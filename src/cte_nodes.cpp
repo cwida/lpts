@@ -27,11 +27,26 @@ bool GetNodeColumnsAreExpressions(const string &table_name) {
 	return table_name == "(SELECT 1)";
 }
 
+// Render a scan's projected columns: plain identifiers are dialect-quoted; entries flagged in `is_expr`
+// (struct field-extraction pushdowns like `struct_extract(c, 'a')`) are emitted verbatim. `is_expr` may be
+// empty (or shorter than `column_names`), in which case the missing entries are treated as identifiers.
+vector<string> RenderGetSelectColumns(const vector<string> &column_names, const vector<bool> &is_expr,
+                                      SqlDialect dialect) {
+	vector<string> out;
+	out.reserve(column_names.size());
+	for (size_t i = 0; i < column_names.size(); i++) {
+		const bool raw = i < is_expr.size() && is_expr[i];
+		out.push_back(raw ? column_names[i] : DialectQuoteIdent(column_names[i], dialect));
+	}
+	return out;
+}
+
 void RequireDuckDBDialect(SqlDialect dialect, const string &node_name, const string &feature) {
 	if (dialect == SqlDialect::DUCKDB) {
 		return;
 	}
-	throw NotImplementedException("LPTS %s: %s is only implemented for the DuckDB dialect", node_name, feature);
+	throw NotImplementedException("LPTS_UNSUPPORTED_DIALECT_FEATURE: %s: %s is only implemented for the DuckDB dialect",
+	                              node_name, feature);
 }
 
 //------------------------------------------------------------------------------
@@ -44,6 +59,38 @@ void RequireDuckDBDialect(SqlDialect dialect, const string &node_name, const str
 //------------------------------------------------------------------------------
 constexpr size_t MAX_WIDTH = 100;
 constexpr size_t INDENT_WIDTH = 4;
+
+/// An ORDER BY item whose expression is a bare integer literal (e.g. a substituted constant projection,
+/// `ORDER BY 10 ASC`) would be re-read as an ORDINAL position — and DuckDB constant-folds even `(10)`
+/// back to an ordinal, while non-integer literals are rejected outright. Ordering by a constant is a
+/// semantic no-op (every row compares equal), so such items are DROPPED.
+bool IsConstantIntegerOrderItem(const string &item) {
+	size_t p = 0;
+	if (p < item.size() && item[p] == '-') {
+		p++;
+	}
+	const size_t digits_start = p;
+	while (p < item.size() && isdigit(static_cast<unsigned char>(item[p]))) {
+		p++;
+	}
+	if (p == digits_start || (p != item.size() && item[p] != ' ')) {
+		return false; // not a bare leading integer
+	}
+	// The remainder must be only order modifiers, not an operator continuing the expression.
+	const string rest = item.substr(p);
+	return rest.empty() || rest.rfind(" ASC", 0) == 0 || rest.rfind(" DESC", 0) == 0 || rest.rfind(" NULLS", 0) == 0;
+}
+
+vector<string> GuardOrdinalOrderItems(const vector<string> &items) {
+	vector<string> out;
+	out.reserve(items.size());
+	for (const auto &it : items) {
+		if (!IsConstantIntegerOrderItem(it)) {
+			out.push_back(it);
+		}
+	}
+	return out;
+}
 
 /// Single-line tail (" FROM ... [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT/OFFSET]").
 string RenderTail(const SelectParts &p) {
@@ -64,8 +111,9 @@ string RenderTail(const SelectParts &p) {
 			t << (i ? " AND " : "") << "(" << p.having_conds[i] << ")";
 		}
 	}
-	if (!p.order_items.empty()) {
-		t << " ORDER BY " << VecToSeparatedList(p.order_items);
+	const vector<string> tail_order_items = GuardOrdinalOrderItems(p.order_items);
+	if (!tail_order_items.empty()) {
+		t << " ORDER BY " << VecToSeparatedList(tail_order_items);
 	}
 	if (!p.limit.empty()) {
 		t << " LIMIT " << p.limit;
@@ -169,9 +217,10 @@ string RenderSelectPretty(const SelectParts &p, const vector<string> &out_names,
 		s << "\n";
 		EmitClauseList(s, pos, expr_col, "HAVING", "", h, " AND ");
 	}
-	if (!p.order_items.empty()) {
+	const vector<string> pretty_order_items = GuardOrdinalOrderItems(p.order_items);
+	if (!pretty_order_items.empty()) {
 		s << "\n";
-		EmitClauseList(s, pos, expr_col, "ORDER BY", "", p.order_items, ", ");
+		EmitClauseList(s, pos, expr_col, "ORDER BY", "", pretty_order_items, ", ");
 	}
 	if (!p.limit.empty()) {
 		s << "\n";
@@ -189,9 +238,16 @@ string RenderCteHeader(const string &name, const vector<string> &cols) {
 	std::ostringstream s;
 	s << name;
 	if (!cols.empty()) {
+		// Quote where needed: generated t{N}_ names pass through unchanged, but a recursive CTE header
+		// carries user-facing (stripped) names that can be reserved words ("begin", "end").
+		vector<string> quoted;
+		quoted.reserve(cols.size());
+		for (const auto &c : cols) {
+			quoted.push_back(QuoteIdentifier(c));
+		}
 		s << " (";
 		size_t col = name.size() + 2; // after "<name> ("
-		AppendWrapped(s, col, cols, ", ", name.size() + 2);
+		AppendWrapped(s, col, quoted, ", ", name.size() + 2);
 		s << ")";
 	}
 	s << " AS (";
@@ -265,7 +321,7 @@ string InsertNode::ToQuery(SqlDialect dialect) {
 			// PostgreSQL ON CONFLICT DO UPDATE requires explicit conflict columns and SET
 			// clauses — metadata not available at this stage. Surface as an error.
 			throw NotImplementedException(
-			    "LPTS POSTGRES dialect: OR REPLACE / OR UPDATE conflict action requires "
+			    "LPTS_UNSUPPORTED_DIALECT_FEATURE: POSTGRES OR REPLACE / OR UPDATE conflict action requires "
 			    "ON CONFLICT (columns) DO UPDATE SET ... syntax. "
 			    "Explicit conflict columns are not available in the logical plan. "
 			    "Use ON CONFLICT DO NOTHING or handle conflict resolution at the application level.");
@@ -325,28 +381,45 @@ string GetNode::ToQuery(SqlDialect dialect) {
 	} else if (GetNodeColumnsAreExpressions(table_name)) {
 		get_str << VecToSeparatedList(column_names);
 	} else {
-		get_str << DialectVecToQuotedIdentifierList(column_names, dialect);
+		get_str << VecToSeparatedList(RenderGetSelectColumns(column_names, column_is_expression, dialect));
 	}
 	get_str << " FROM ";
 	if (!catalog.empty()) {
 		// Fully-qualified: catalog.schema.table (DuckDB / Spark dialect)
 		get_str << DialectQualifiedTableName(catalog, schema, table_name, dialect);
 	} else {
-		if (!input_cte_name.empty()) {
-			get_str << input_cte_name << ", ";
+		// A TABLE-argument function: the child CTE is the function's argument, not a lateral input.
+		const size_t table_arg_pos = table_name.find("%LPTS_TABLE_ARG%");
+		if (table_arg_pos != string::npos && !input_cte_name.empty()) {
+			string fn = table_name;
+			fn.replace(table_arg_pos, string("%LPTS_TABLE_ARG%").size(), "(SELECT * FROM " + input_cte_name + ")");
+			get_str << fn;
+		} else {
+			if (!input_cte_name.empty()) {
+				get_str << input_cte_name << ", ";
+			}
+			// Unqualified: table function or simple table name
+			get_str << table_name;
 		}
-		// Unqualified: table function or simple table name
-		get_str << table_name;
 		// For table functions, add column aliases so renamed columns resolve correctly.
 		// Skip for DuckLake functions — the _tf alias mismatches when virtual columns
 		// (snapshot_id, rowid) are in the SELECT but not in the function's output schema.
 		if (table_name.find('(') != string::npos && table_name != "(SELECT 1)" && !column_names.empty() &&
 		    table_name.find("ducklake_table_") == string::npos) {
-			idx_t alias_count = table_function_output_count == DConstants::INVALID_INDEX ? column_names.size()
-			                                                                             : table_function_output_count;
 			vector<string> table_function_columns;
-			for (idx_t i = 0; i < alias_count && i < column_names.size(); i++) {
-				table_function_columns.push_back(DialectQuoteIdent(column_names[i], dialect));
+			if (!table_function_alias.empty()) {
+				// Output-ordered alias (read_csv/read_parquet/range/...): names every output column at its
+				// true position so the SELECT (which references the names) resolves correctly.
+				for (const string &name : table_function_alias) {
+					table_function_columns.push_back(DialectQuoteIdent(name, dialect));
+				}
+			} else {
+				idx_t alias_count = table_function_output_count == DConstants::INVALID_INDEX
+				                        ? column_names.size()
+				                        : table_function_output_count;
+				for (idx_t i = 0; i < alias_count && i < column_names.size(); i++) {
+					table_function_columns.push_back(DialectQuoteIdent(column_names[i], dialect));
+				}
 			}
 			get_str << " _tf(" << VecToSeparatedList(table_function_columns) << ")";
 		}
@@ -365,10 +438,7 @@ bool GetNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 	    table_name.find('(') != string::npos) {
 		return false;
 	}
-	out.select_exprs.reserve(column_names.size());
-	for (const auto &c : column_names) {
-		out.select_exprs.push_back(DialectQuoteIdent(c, dialect));
-	}
+	out.select_exprs = RenderGetSelectColumns(column_names, column_is_expression, dialect);
 	out.from = catalog.empty() ? table_name : DialectQualifiedTableName(catalog, schema, table_name, dialect);
 	out.where_conds = table_filters; // already complete conditions; the renderer wraps each in parens
 	return true;
@@ -452,18 +522,78 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	if (is_asof) {
 		RequireDuckDBDialect(dialect, "JoinNode", "ASOF JOIN");
 		if (join_type != JoinType::INNER && join_type != JoinType::LEFT) {
-			throw NotImplementedException("LPTS ASOF JOIN: join type %s is not implemented",
+			throw NotImplementedException("LPTS_UNSUPPORTED_JOIN_TYPE: ASOF join type %s is not implemented",
 			                              EnumUtil::ToString(join_type));
 		}
 	}
+	// IN/ANY/ALL mark join, single NULL-propagating comparison (keys captured): render as a correlated
+	// EXISTS in the SELECT. This produces exactly one row per LHS row (a LEFT join on an inequality could
+	// match several RHS rows and multiply the LHS row, which is wrong for the IN/ANY directions that keep
+	// the mark), and builds a 3-valued mark: TRUE if a row matches; else NULL if the comparison is
+	// indeterminate (the RHS key has a NULL, or the LHS key is NULL and the RHS is non-empty); else FALSE.
+	// Multi-condition mark join with NO equality condition: executed as a nested-loop join whose
+	// conditions match INDEPENDENTLY — found iff ANY condition matches ANY rhs row (e.g. the decomposed
+	// row `!=` of `x != ANY(...)` / `= ALL(...)`, where per-row OR distributes over the existential).
+	// NULL semantics mirror PhysicalJoin::ConstructMarkJoinResult: a NULL in any LHS key → NULL (this
+	// overrides a match); else found → TRUE; else a NULL in any RHS key → NULL; else FALSE.
+	if (!mark_expression.empty() && mark_membership_comparisons.size() > 1 && !mark_join_has_equality) {
+		auto or_list = [](const vector<string> &items) {
+			string out;
+			for (size_t i = 0; i < items.size(); i++) {
+				out += (i ? " OR " : "") + items[i];
+			}
+			return out;
+		};
+		vector<string> lhs_nulls, rhs_nulls;
+		for (const auto &l : mark_membership_lhs) {
+			lhs_nulls.push_back("(" + l + ") IS NULL");
+		}
+		for (const auto &r : mark_membership_rhs) {
+			rhs_nulls.push_back("(" + r + ") IS NULL");
+		}
+		const string matched =
+		    "EXISTS (SELECT 1 FROM " + right_cte_name + " WHERE " + or_list(mark_membership_comparisons) + ")";
+		const string rhs_has_null = "EXISTS (SELECT 1 FROM " + right_cte_name + " WHERE " + or_list(rhs_nulls) + ")";
+		const string mark = "CASE WHEN " + or_list(lhs_nulls) + " THEN NULL WHEN " + matched + " THEN TRUE WHEN " +
+		                    rhs_has_null + " THEN NULL ELSE FALSE END";
+		vector<string> select_cols(cte_column_list.begin(), cte_column_list.end() - 1);
+		select_cols.push_back(mark);
+		return "SELECT " + VecToSeparatedList(select_cols) + " FROM " + left_cte_name;
+	}
+	if (!mark_expression.empty() && !mark_membership_conditions.empty()) {
+		// matched: a correlated row satisfies every join condition (all membership comparisons AND any
+		// correlation keys).
+		const string matched =
+		    "EXISTS (SELECT 1 FROM " + right_cte_name + " WHERE " + JoinConditionsToSQL(join_conditions) + ")";
+		// indeterminate: no TRUE match, but a *correlated* row exists whose per-row membership predicate is
+		// NULL — i.e. every membership comparison is not-definitely-false (holds or has a NULL operand). The
+		// null-safe correlation keys still gate which rows count. AND-ing one clause per comparison handles
+		// single- and multi-column IN/ANY/ALL alike (matched rows are caught by the TRUE branch first). This
+		// unifies the uncorrelated case (no correlation conditions) and the correlated case.
+		vector<string> indeterminate_conds = mark_correlation_conditions;
+		for (const auto &mc : mark_membership_conditions) {
+			indeterminate_conds.push_back(mc);
+		}
+		const string indeterminate =
+		    "EXISTS (SELECT 1 FROM " + right_cte_name + " WHERE " + JoinConditionsToSQL(indeterminate_conds) + ")";
+		const string mark = "CASE WHEN " + matched + " THEN TRUE WHEN " + indeterminate + " THEN NULL ELSE FALSE END";
+		vector<string> select_cols(cte_column_list.begin(), cte_column_list.end() - 1);
+		select_cols.push_back(mark);
+		return "SELECT " + VecToSeparatedList(select_cols) + " FROM " + left_cte_name;
+	}
 	const string hint = SparkBroadcastHint(dialect);
 	std::ostringstream join_str;
-	// Use explicit column list instead of SELECT * to avoid including
-	// duplicate join key columns from both sides of the join.
-	// For MARK→LEFT joins, the last column is a computed mark expression.
+	// Other MARK joins (EXISTS, correlated/DELIM, multi-condition) render as LEFT JOIN + a 2-valued mark.
+	// The mark must express "did the RHS have a matching row?". A key-based `(rhs_key IS NOT NULL)` is WRONG
+	// when the correlation key can itself be NULL and legitimately matches (`NULL IS NOT DISTINCT FROM NULL`):
+	// the matched rhs_key is NULL, so `IS NOT NULL` reads false even though a row matched. Instead attach a
+	// non-null sentinel (`TRUE AS _lpts_matched`) to the deduped RHS and test THAT — it is NULL only when the
+	// LEFT JOIN found no partner, regardless of the join key's nullability. (The `true` mark — an EXISTS with
+	// no join condition — needs no sentinel.)
+	const bool use_match_sentinel = !mark_expression.empty() && mark_expression != "true";
 	if (!mark_expression.empty() && !cte_column_list.empty()) {
 		vector<string> select_cols(cte_column_list.begin(), cte_column_list.end() - 1);
-		select_cols.push_back(mark_expression);
+		select_cols.push_back(use_match_sentinel ? "(_rhs_dedup._lpts_matched IS NOT NULL)" : mark_expression);
 		join_str << "SELECT " << hint;
 		join_str << VecToSeparatedList(select_cols) << " FROM ";
 	} else {
@@ -475,7 +605,7 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	// cte_column_list already contains only the preserved side's columns (from GetColumnBindings).
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		if (is_asof) {
-			throw NotImplementedException("LPTS ASOF JOIN: RIGHT_SEMI/RIGHT_ANTI are not implemented");
+			throw NotImplementedException("LPTS_UNSUPPORTED_JOIN_TYPE: ASOF RIGHT_SEMI/RIGHT_ANTI are not implemented");
 		}
 		join_str << right_cte_name << " ";
 		join_str << (join_type == JoinType::RIGHT_SEMI ? "SEMI" : "ANTI");
@@ -512,12 +642,14 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 		                        "JoinNode", "join type is not implemented by LPTS");
 	}
 	join_str << " JOIN ";
-	// MARK→LEFT joins: deduplicate the right side to prevent left-row multiplication
-	// when the RHS has duplicate matching values. IN subquery semantics treat the RHS
-	// as a set, so (SELECT DISTINCT * FROM rhs) preserves correctness.
-	if (!mark_expression.empty()) {
-		LPTS_DEBUG_PRINT("[LPTS-CTE] MARK join: wrapping right CTE '" + right_cte_name +
-		                 "' in SELECT DISTINCT to prevent duplicate rows");
+	// Deduplicate the right side so a left row isn't multiplied by duplicate RHS rows. MARK→LEFT joins need
+	// this because IN/EXISTS treat the RHS as a set; SINGLE joins (scalar subqueries) need it because the
+	// subquery must yield at most one row per outer row, but a decorrelated non-aggregated subquery can
+	// carry duplicate rows per correlation key.
+	if (use_match_sentinel) {
+		// Non-null match sentinel (see above): NULL after the LEFT JOIN iff no RHS partner.
+		join_str << "(SELECT DISTINCT *, TRUE AS _lpts_matched FROM " << right_cte_name << ") AS _rhs_dedup";
+	} else if (!mark_expression.empty() || join_type == JoinType::SINGLE) {
 		join_str << "(SELECT DISTINCT * FROM " << right_cte_name << ") AS _rhs_dedup";
 	} else {
 		join_str << right_cte_name;
@@ -529,8 +661,10 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 
 bool JoinNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 	(void)dialect;
-	// MARK→LEFT, RIGHT_SEMI/ANTI and ASOF joins have bespoke single-line rendering — keep those.
-	if (!mark_expression.empty() || is_asof || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+	// MARK→LEFT, RIGHT_SEMI/ANTI, ASOF and SINGLE joins have bespoke rendering (SINGLE deduplicates its
+	// RHS in ToQuery) — keep those.
+	if (!mark_expression.empty() || is_asof || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI ||
+	    join_type == JoinType::SINGLE) {
 		return false;
 	}
 	std::ostringstream f;
@@ -582,16 +716,25 @@ string SampleNode::ToQuery(SqlDialect dialect) {
 }
 
 string UnionNode::ToQuery(SqlDialect dialect) {
+	// A branch that exposes MORE columns than the union's arity (e.g. an inner ORDER BY key kept as an
+	// extra projected column) must select only the first arity-many columns — `SELECT *` would make the
+	// two sides' column counts differ.
+	const size_t arity = cte_column_list.size();
+	auto branch_select = [&](const vector<string> &branch_cols) {
+		if (arity > 0 && branch_cols.size() > arity) {
+			vector<string> first_cols(branch_cols.begin(), branch_cols.begin() + arity);
+			return "SELECT " + VecToSeparatedList(first_cols) + " FROM ";
+		}
+		return string("SELECT * FROM ");
+	};
 	std::ostringstream union_str;
-	union_str << "SELECT * FROM ";
-	union_str << left_cte_name;
+	union_str << branch_select(left_columns) << left_cte_name;
 	if (is_union_all) {
 		union_str << " UNION ALL ";
 	} else {
 		union_str << " UNION ";
 	}
-	union_str << "SELECT * FROM ";
-	union_str << right_cte_name;
+	union_str << branch_select(right_columns) << right_cte_name;
 	return union_str.str();
 }
 
@@ -687,6 +830,11 @@ string TopNNode::ToQuery(SqlDialect dialect) {
 
 bool DistinctNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 	(void)dialect;
+	// DISTINCT ON renders as a row_number() subquery + filter (see ToQuery), which is not a plain SELECT
+	// block, so it cannot be fused into a parent SELECT.
+	if (is_distinct_on) {
+		return false;
+	}
 	out.distinct = true;
 	out.select_exprs = cte_column_list;
 	out.from = child_cte_name;
@@ -694,6 +842,9 @@ bool DistinctNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const 
 }
 
 string DistinctNode::ToQuery(SqlDialect dialect) {
+	if (is_distinct_on && !distinct_on_targets.empty()) {
+		return BuildDistinctOnQuery(cte_column_list, distinct_on_targets, distinct_on_orders, child_cte_name);
+	}
 	vector<string> items;
 	string tail;
 	bool distinct;
@@ -781,12 +932,14 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	for (size_t i = 0; i < emit_count; i++) {
 		cte_names.insert(nodes[i]->cte_name);
 	}
+	// Uniqueness is judged CASE-INSENSITIVELY: DuckDB resolves identifiers ignoring case, so de-prefixing
+	// both t0_hello and t1_HeLlO (distinct as strings) would make every later `hello` reference ambiguous.
 	unordered_map<string, int> bare_count;
 	unordered_set<string> seen_full;
 	for (size_t i = 0; i < emit_count; i++) {
 		for (const auto &col : nodes[i]->cte_column_list) {
 			if (seen_full.insert(col).second) {
-				bare_count[StripGeneratedTablePrefix(col)]++;
+				bare_count[StringUtil::Lower(StripGeneratedTablePrefix(col))]++;
 			}
 		}
 	}
@@ -798,7 +951,8 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 		const string bare = StripGeneratedTablePrefix(full);
 		// Unsafe to expose bare: a reserved keyword / non-identifier (QuoteIdentifier would quote it)
 		// or a name that itself looks like a generated prefix. Keep those prefixed.
-		if (bare_count[bare] == 1 && QuoteIdentifier(bare) == bare && !HasGeneratedTablePrefix(bare)) {
+		if (bare_count[StringUtil::Lower(bare)] == 1 && QuoteIdentifier(bare) == bare &&
+		    !HasGeneratedTablePrefix(bare)) {
 			rename[full] = bare;
 		}
 	}

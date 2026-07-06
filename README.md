@@ -26,9 +26,14 @@ PRAGMA lpts('SELECT name FROM users WHERE age > 25');
 ```
 
 ```text
-WITH scan_0 (t0_name) AS (SELECT name FROM memory.main.users WHERE age>25),
-projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
-SELECT t1_name AS "name" FROM projection_1;
+WITH
+t0_scan (t0_name) AS (
+    SELECT  "name"
+    FROM    memory.main.users
+    WHERE   (age>25)
+)
+SELECT  t0_name AS "name"
+FROM    t0_scan;
 ```
 
 LPTS plans the query through DuckDB, optimizes it, then serializes the optimized
@@ -51,9 +56,14 @@ EXPLAIN (FORMAT SQL) SELECT name FROM users WHERE age > 25;
 ││  Optimized Logical Plan   ││
 │└───────────────────────────┘│
 └─────────────────────────────┘
-WITH scan_0 (t0_name) AS (SELECT "name" FROM memory.main.users WHERE age>25),
-projection_1 (t1_name) AS (SELECT t0_name FROM scan_0)
-SELECT t1_name AS "name" FROM projection_1;
+WITH
+t0_scan (t0_name) AS (
+    SELECT  "name"
+    FROM    memory.main.users
+    WHERE   (age>25)
+)
+SELECT  t0_name AS "name"
+FROM    t0_scan;
 ```
 
 Because it is a genuine `EXPLAIN` statement, every client treats it like any other
@@ -85,14 +95,15 @@ The dialect settings accept these values:
 | `EXPLAIN (FORMAT SQL) query` | Explain a query as equivalent CTE SQL, via a real `EXPLAIN` statement |
 | `PRAGMA lpts('query')` | Return generated CTE SQL |
 | `lpts_query('query')` | Table-function form of `PRAGMA lpts` |
-| `PRAGMA lpts_exec('query')` | Execute the generated SQL |
-| `PRAGMA lpts_check('query')` | Compare original and generated SQL with bag equality |
 | `PRAGMA print_ast('query')` | Print the AST to stdout |
 | `print_ast_query('query')` | Table-function form of `PRAGMA print_ast` |
 | `lpts_normalize_query('query')` | Return input-dialect SQL normalized to DuckDB SQL |
 
-`lpts_check` can return `false` for nondeterministic queries, for example when
-row order or tie-breaking is not fully specified.
+To verify round-trip correctness, turn on the `lpts_check` session setting (see
+[Settings](#settings)). Once on, every top-level `SELECT` runs normally and is
+transparently compared against its LPTS rewrite. Nondeterministic queries — for
+example when row order or tie-breaking is not fully specified — are detected and
+pass without error.
 
 ## Use Cases
 
@@ -107,11 +118,16 @@ row order or tie-breaking is not fully specified.
 ## Supported Operators
 
 LPTS is intended to cover all logical operators produced by optimized DuckDB
-SELECT plans. The current regression suite round-trips all 22 TPC-H queries and
-exercises joins, aggregates, windows, set operations, CTEs, recursive CTEs,
-table functions, DuckLake scans, and inserts.
+SELECT plans. The regression suite round-trips all 22 TPC-H queries, the SQLStorm
+TPC-H corpus (17k queries, zero incorrect results), and DuckDB's own sqllogic test
+corpus (~3300 files run under `lpts_check`, gated in CI-style via `make test`:
+zero wrong translations and zero invalid-SQL failures). It exercises joins,
+aggregates, windows, set operations, CTEs, recursive CTEs, lateral joins, table
+functions, DuckLake scans, and inserts.
 
-Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
+Anything LPTS cannot faithfully reproduce fails explicitly with an
+`LPTS_<CODE>: ...` "not supported" error (a `NotImplementedException`) — it never
+silently emits wrong SQL.
 
 ## Settings
 
@@ -119,12 +135,46 @@ Unsupported optimizer edge cases fail explicitly with `NotImplementedException`.
 |---|---|---|---|
 | `lpts_dialect` | VARCHAR | `duckdb` | Output dialect for generated SQL |
 | `lpts_input_dialect` | VARCHAR | `duckdb` | Input dialect to normalize before DuckDB parses and plans the query |
+| `lpts_check` | BOOLEAN | `false` | Transparently verify round-trip correctness of every top-level `SELECT` (see below) |
 | `lpts_enable_data_dependent_optimizers` | BOOLEAN | `false` | Allow LPTS planning to use optimizers that depend on current data, statistics, cardinality estimates, row groups, or runtime dynamic filters |
 
 By default, LPTS avoids data-dependent optimizers so generated SQL does not bake
 in snapshot-specific facts such as `WHERE false` from current table statistics.
 Enable `lpts_enable_data_dependent_optimizers` when you want DuckDB's full
 optimized plan shape and accept that the SQL may depend on planning-time data.
+
+### Round-trip checking with `lpts_check`
+
+Turn on `lpts_check` to verify LPTS transparently:
+
+```sql
+SET lpts_check = true;
+```
+
+Once on, every top-level `SELECT` you run is intercepted. LPTS runs the original
+query and its LPTS rewrite side by side and compares their result bags with an
+order-independent hash. The query returns its normal rows unchanged.
+
+By default the check is strict. If the rewrite's result bag differs, LPTS raises
+`Invalid Input Error: LPTS check failed: ...`. If LPTS cannot rewrite the query at
+all, it raises `Invalid Input Error: LPTS check: unsupported query (LPTS could not
+check it): ...`. Nondeterministic queries — no fully specified order, `random()`,
+unordered aggregates, and the like — are detected and pass without error.
+
+Queries that read LPTS's own table functions (`lpts_query`, `print_ast_query`,
+`lpts_normalize_query`) are skipped, as are queries running under statement
+verification (for example `PRAGMA enable_verification`).
+
+Set the environment variable `LPTS_CHECK_LOG` to a file path to switch to log
+mode. With `lpts_check` on and `LPTS_CHECK_LOG` set, LPTS never raises; instead it
+appends one line per intercepted `SELECT` tagging the outcome: `<n> OK` (bags
+matched), `<n> WRONG` (bags differed), `<n> UNSUPPORTED` (LPTS deliberately refused
+the query with an `LPTS_<CODE>: ...` "not supported" error), `<n> FAIL` (LPTS could
+not rewrite it and the error was *not* a deliberate refusal — a translation bug), or
+`<n> NONDETERMINISTIC: <reason>` (rewritten but nondeterministic, so the comparison is
+not trusted, with the heuristic's explanation). `<n>` is the 1-based interception index.
+This is how DuckDB's own sqllogic corpus is run through LPTS (see
+[docs/test.md](docs/test.md#duckdb-suite-coverage-regression-gate)).
 
 ## Examples
 
@@ -155,30 +205,31 @@ FROM lpts_query(
 ```
 
 ```text
-WITH scan_0 (t0_ts) AS (SELECT ts FROM events WHERE id>10),
-projection_1 (t1_day) AS (SELECT to_char(t0_ts, 'YYYY-MM-DD') FROM scan_0),
-order_2 (t1_day) AS (SELECT t1_day FROM projection_1 ORDER BY t1_day ASC NULLS LAST)
-SELECT t1_day AS "day" FROM order_2;
+WITH
+t0_scan (ts) AS (
+    SELECT  ts
+    FROM    events
+    WHERE   (id>10)
+)
+SELECT    to_char(ts, 'YYYY-MM-DD') AS "day"
+FROM      t0_scan
+ORDER BY  to_char(ts, 'YYYY-MM-DD') ASC NULLS LAST;
 ```
 
 ```sql
 SET lpts_dialect = 'duckdb';
 
--- Execute the generated SQL and return the query result.
-PRAGMA lpts_exec('SELECT name FROM events WHERE id > 10 ORDER BY name');
+-- Turn on transparent round-trip checking once per session.
+SET lpts_check = true;
 
--- Compare original and generated SQL using bag equality.
-PRAGMA lpts_check('SELECT name FROM events WHERE id > 10 ORDER BY name');
+-- Runs normally and returns its rows; raises only if LPTS rewrites it wrong.
+SELECT name FROM events WHERE id > 10 ORDER BY name;
 ```
 
 ```text
 name
 ----
 beta
-
-match
------
-true
 ```
 
 ```sql
@@ -207,7 +258,7 @@ SELECT "order", strftime(ts, '%Y-%m-%d %H:%M:%S') AS formatted FROM events LIMIT
 ## Documentation
 
 - **[Building](docs/building.md)** - build, local loading, updating, and CLion setup
-- **[Tests](docs/test.md)** - SQLLogicTest conventions
+- **[Tests](docs/test.md)** - SQLLogicTest conventions and the DuckDB-corpus coverage gate (`make test`)
 - **[Benchmark](docs/benchmark.md)** - SQLStorm benchmark runner
 
 Maintainer: [ila](https://github.com/ila)

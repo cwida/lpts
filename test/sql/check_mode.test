@@ -1,0 +1,155 @@
+# name: test/sql/check_mode.test
+# description: SET lpts_check = true transparently verifies each SELECT round-trips through LPTS
+# group: [sql]
+
+require lpts
+
+statement ok
+CREATE TABLE t(a INTEGER, b VARCHAR, c INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1,'x',10),(2,'y',20),(2,'y',20),(3,NULL,NULL),(4,'z',40);
+
+# Baseline (mode off): expected result.
+query ITI
+SELECT a, b, c FROM t WHERE a >= 2 ORDER BY a, b, c;
+----
+2	y	20
+2	y	20
+3	NULL	NULL
+4	z	40
+
+statement ok
+SET lpts_check = true;
+
+# With the mode on, the query returns its normal result unchanged (the round-trip check is transparent),
+# including the duplicate row and the NULLs.
+query ITI
+SELECT a, b, c FROM t WHERE a >= 2 ORDER BY a, b, c;
+----
+2	y	20
+2	y	20
+3	NULL	NULL
+4	z	40
+
+# Aggregate with a NULL group round-trips.
+query TI
+SELECT b, count(*) FROM t GROUP BY b ORDER BY b;
+----
+x	1
+y	2
+z	1
+NULL	1
+
+# Joins and UNION round-trip (the check is robust to inner UNIONs/joins via "last one out").
+statement ok
+CREATE TABLE u(a INTEGER, d VARCHAR);
+
+statement ok
+INSERT INTO u VALUES (1,'one'),(2,'two'),(4,'four');
+
+query ITT
+SELECT t.a, t.b, u.d FROM t JOIN u USING (a) ORDER BY t.a, t.b;
+----
+1	x	one
+2	y	two
+2	y	two
+4	z	four
+
+query I
+SELECT a FROM t UNION ALL SELECT a FROM u ORDER BY a;
+----
+1
+1
+2
+2
+2
+3
+4
+4
+
+# Non-SELECT statements pass through untouched while the mode is on.
+statement ok
+CREATE TABLE w(x INTEGER);
+
+statement ok
+INSERT INTO w SELECT i FROM range(100) s(i);
+
+query II
+SELECT count(*), sum(x) FROM w;
+----
+100	4950
+
+# Nondeterministic queries are suppressed (a divergence is not treated as a failure): no error.
+statement ok
+SELECT i FROM range(64) s(i) WHERE random() < 0.5;
+
+statement ok
+SELECT a FROM t ORDER BY a LIMIT 2;
+
+# Order-sensitive aggregates are treated as potentially nondeterministic even with an in-aggregate
+# ORDER BY, because the ordering key may not be unique (here grp has duplicate (grp, nm) rows, so the
+# concatenation order of the tied rows is unspecified). The original and LPTS-rewritten plans may order
+# the ties differently, so the check must suppress rather than raise.
+statement ok
+CREATE TABLE agg_src(grp INTEGER, nm VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO agg_src VALUES (1,'a',1),(1,'a',2),(1,'a',3),(1,'b',4),(2,'x',5),(2,'x',6);
+
+statement ok
+SELECT grp, string_agg(v::VARCHAR, ',' ORDER BY nm) FROM agg_src GROUP BY grp;
+
+statement ok
+SELECT grp, list(v ORDER BY nm) FROM agg_src GROUP BY grp;
+
+# Sequence functions (nextval/currval/lastval) are side-effecting, so running the original then the
+# rewritten query sees different sequence values — a divergence that must be suppressed, not raised. This
+# holds even when the sequence call is hidden inside a macro (the query text shows only the macro call, so
+# it is detected by scanning the bound plan, where the macro is expanded).
+statement ok
+CREATE SEQUENCE check_seq1;
+
+statement ok
+CREATE SEQUENCE check_seq2;
+
+statement ok
+CREATE MACRO seq_sum(a, b, c) AS nextval(a) + nextval(b) + c;
+
+statement ok
+CREATE TABLE seq_ints(i INTEGER);
+
+statement ok
+INSERT INTO seq_ints VALUES (1), (2), (3);
+
+statement ok
+SELECT seq_sum('check_seq1', 'check_seq2', i) FROM seq_ints;
+
+# A scalar subquery that can return more than one row is nondeterministic when
+# scalar_subquery_error_on_multiple_rows=false (DuckDB returns an arbitrary row). LPTS decorrelates it to a
+# LEFT JOIN over the deduped RHS, which cannot reproduce that arbitrary choice — so a divergence here is
+# suppressed as nondeterministic (detected by scanning the plan for a SINGLE join whose subquery side is
+# not row-count-bounded), not raised. A guaranteed-single-row scalar subquery (aggregate) is NOT suppressed.
+statement ok
+SET scalar_subquery_error_on_multiple_rows=false;
+
+statement ok
+CREATE TABLE ssq(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO ssq VALUES (1, 10), (1, 20), (2, 30);
+
+statement ok
+SELECT k, (SELECT v FROM ssq s2 WHERE s2.k = s1.k) AS any_v FROM ssq s1 ORDER BY k;
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows=true;
+
+# The SQL/AST inspector table functions keep working with the mode on (the check skips them).
+query I
+SELECT count(*) FROM lpts_query('SELECT a FROM t WHERE a >= 2');
+----
+1
+
+statement ok
+SET lpts_check = false;

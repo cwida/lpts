@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE window_items (id INTEGER, grp VARCHAR, val INTEGER);
 
 statement ok
@@ -17,59 +20,43 @@ INSERT INTO window_items VALUES
 
 # --- row_number() over (order by id) ---
 
-query I
-PRAGMA lpts_check('SELECT id, row_number() OVER (ORDER BY id) AS rn FROM window_items ORDER BY id');
-----
-true
+statement ok
+SELECT id, row_number() OVER (ORDER BY id) AS rn FROM window_items ORDER BY id;
 
 # --- rank() and dense_rank() with partition by and multi-column order by ---
 
-query I
-PRAGMA lpts_check('SELECT grp, id, rank() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rnk, dense_rank() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS drnk FROM window_items ORDER BY grp, id');
-----
-true
+statement ok
+SELECT grp, id, rank() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rnk, dense_rank() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS drnk FROM window_items ORDER BY grp, id;
 
 # --- aggregate windows: count(*) and sum(...) ---
 
-query I
-PRAGMA lpts_check('SELECT grp, id, count(*) OVER (PARTITION BY grp) AS grp_count, sum(val) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM window_items ORDER BY grp, id');
-----
-true
+statement ok
+SELECT grp, id, count(*) OVER (PARTITION BY grp) AS grp_count, sum(val) OVER (PARTITION BY grp ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM window_items ORDER BY grp, id;
 
 # --- window output consumed by parent filter/order via subquery ---
 
-query I
-PRAGMA lpts_check('SELECT grp, id, rn FROM (SELECT grp, id, row_number() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rn FROM window_items) ranked WHERE rn <= 2 ORDER BY grp, rn');
-----
-true
+statement ok
+SELECT grp, id, rn FROM (SELECT grp, id, row_number() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rn FROM window_items) ranked WHERE rn <= 2 ORDER BY grp, rn;
 
 # --- repeatable SAMPLE feeding a window ---
 
-query I
-PRAGMA lpts_check('SELECT grp, id, val, row_number() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rn FROM window_items USING SAMPLE reservoir(4 ROWS) REPEATABLE (11) ORDER BY grp, rn');
-----
-true
+statement ok
+SELECT grp, id, val, row_number() OVER (PARTITION BY grp ORDER BY val DESC, id ASC) AS rn FROM window_items USING SAMPLE reservoir(4 ROWS) REPEATABLE (11) ORDER BY grp, rn;
 
 # --- lead()/lag() with offset and default ---
 
-query I
-PRAGMA lpts_check('SELECT grp, id, lag(val, 1, -1) OVER (PARTITION BY grp ORDER BY id) AS prev_val, lead(val, 1, -1) OVER (PARTITION BY grp ORDER BY id) AS next_val FROM window_items ORDER BY grp, id');
-----
-true
+statement ok
+SELECT grp, id, lag(val, 1, -1) OVER (PARTITION BY grp ORDER BY id) AS prev_val, lead(val, 1, -1) OVER (PARTITION BY grp ORDER BY id) AS next_val FROM window_items ORDER BY grp, id;
 
 # --- materialized CTE refs preserve pruned window CTE column order ---
 
-query I
-PRAGMA lpts_check('WITH ranked AS (SELECT id, grp, val, row_number() OVER (PARTITION BY grp ORDER BY val DESC) AS rn FROM window_items) SELECT grp, string_agg(CAST(val AS VARCHAR), '', '' ORDER BY val) FROM ranked GROUP BY grp ORDER BY grp');
-----
-true
+statement ok
+WITH ranked AS (SELECT id, grp, val, row_number() OVER (PARTITION BY grp ORDER BY val DESC) AS rn FROM window_items) SELECT grp, string_agg(CAST(val AS VARCHAR), ', ' ORDER BY val) FROM ranked GROUP BY grp ORDER BY grp;
 
 # --- regrouped CTE aggregate columns with duplicate internal names ---
 
-query I
-PRAGMA lpts_check('WITH left_totals AS (SELECT grp, sum(val) AS total FROM window_items GROUP BY grp), right_totals AS (SELECT grp, sum(id) AS total FROM window_items GROUP BY grp) SELECT left_totals.total, right_totals.total, rank() OVER (ORDER BY sum(right_totals.total) DESC) AS total_rank FROM left_totals JOIN right_totals USING (grp) GROUP BY left_totals.total, right_totals.total ORDER BY left_totals.total, right_totals.total');
-----
-true
+statement ok
+WITH left_totals AS (SELECT grp, sum(val) AS total FROM window_items GROUP BY grp), right_totals AS (SELECT grp, sum(id) AS total FROM window_items GROUP BY grp) SELECT left_totals.total, right_totals.total, rank() OVER (ORDER BY sum(right_totals.total) DESC) AS total_rank FROM left_totals JOIN right_totals USING (grp) GROUP BY left_totals.total, right_totals.total ORDER BY left_totals.total, right_totals.total;
 
 # --- RANGE frame with INTERVAL boundary expression ---
 
@@ -83,7 +70,5 @@ INSERT INTO window_history VALUES
 	('a', '2026-02-20 00:00:00', 11),
 	('b', '2026-01-05 00:00:00', 13);
 
-query I
-PRAGMA lpts_check('SELECT grp, ts, amount, COUNT(*) OVER (PARTITION BY grp ORDER BY ts RANGE BETWEEN INTERVAL ''30 days'' PRECEDING AND CURRENT ROW) AS rolling_count FROM window_history');
-----
-true
+statement ok
+SELECT grp, ts, amount, COUNT(*) OVER (PARTITION BY grp ORDER BY ts RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS rolling_count FROM window_history;

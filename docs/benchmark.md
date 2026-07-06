@@ -18,9 +18,9 @@ Run the benchmark:
 build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10
 ```
 
-The runner executes the SQLStorm TPC-H query set through `PRAGMA lpts_check`.
-It reports success, DuckDB errors, LPTS errors, unsupported cases, timeouts, and
-incorrect results.
+The runner re-runs each SQLStorm TPC-H query under `SET lpts_check = true` to
+verify round-trip correctness. It reports success, DuckDB errors, LPTS errors,
+unsupported cases, timeouts, and incorrect results.
 
 Useful options:
 
@@ -34,3 +34,12 @@ Useful options:
 
 Run SQLStorm only when a feature is complete or before pushing. A regression in
 the number of successful queries needs investigation before the change is ready.
+
+## DuckDB sqllogic suite
+
+A second, broader correctness sweep runs DuckDB's own sqllogic corpus
+(`duckdb/test/sql/**`) through LPTS in parallel and gates against a committed
+baseline — this is part of `make test` (also available as `make coverage-check`
+/ `make coverage-baseline`). See
+[test.md](test.md#duckdb-suite-coverage-regression-gate) and the driver
+`test/corpus_gate/lpts_corpus_gate.cpp`.

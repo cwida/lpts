@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 
 statement ok
@@ -13,156 +16,130 @@ INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35), (4,
 # --- SELECT *: all rows and columns round-trip correctly ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT * FROM users');
+SELECT * FROM users;
 ----
 1	Alice	30
 2	Bob	25
 3	Carol	35
 4	Dave	25
 
-query I
-PRAGMA lpts_check('SELECT * FROM users');
-----
-true
+statement ok
+SELECT * FROM users;
 
 # --- SELECT specific columns: projection reduces column set ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, name FROM users');
+SELECT id, name FROM users;
 ----
 1	Alice
 2	Bob
 3	Carol
 4	Dave
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users');
-----
-true
+statement ok
+SELECT id, name FROM users;
 
 # --- SELECT single column ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT name FROM users');
+SELECT name FROM users;
 ----
 Alice
 Bob
 Carol
 Dave
 
-query I
-PRAGMA lpts_check('SELECT name FROM users');
-----
-true
+statement ok
+SELECT name FROM users;
 
 # --- SELECT with equality filter: exact match ---
 
 query III
-PRAGMA lpts_exec('SELECT * FROM users WHERE id = 1');
+SELECT * FROM users WHERE id = 1;
 ----
 1	Alice	30
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE id = 1');
-----
-true
+statement ok
+SELECT * FROM users WHERE id = 1;
 
 # --- SELECT with range filter (>): filters rows correctly ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT * FROM users WHERE age > 25');
+SELECT * FROM users WHERE age > 25;
 ----
 1	Alice	30
 3	Carol	35
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE age > 25');
-----
-true
+statement ok
+SELECT * FROM users WHERE age > 25;
 
 # --- SELECT with >= filter: boundary value included ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT * FROM users WHERE age >= 30');
+SELECT * FROM users WHERE age >= 30;
 ----
 1	Alice	30
 3	Carol	35
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE age >= 30');
-----
-true
+statement ok
+SELECT * FROM users WHERE age >= 30;
 
 # --- SELECT with < filter ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT * FROM users WHERE age < 30');
+SELECT * FROM users WHERE age < 30;
 ----
 2	Bob	25
 4	Dave	25
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE age < 30');
-----
-true
+statement ok
+SELECT * FROM users WHERE age < 30;
 
 # --- SELECT with string equality filter ---
 
 query III
-PRAGMA lpts_exec('SELECT * FROM users WHERE name = ''Alice''');
+SELECT * FROM users WHERE name = 'Alice';
 ----
 1	Alice	30
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE name = ''Alice''');
-----
-true
+statement ok
+SELECT * FROM users WHERE name = 'Alice';
 
 # --- SELECT with AND conjunction: both conditions must hold ---
 
 query III
-PRAGMA lpts_exec('SELECT * FROM users WHERE age > 20 AND name = ''Bob''');
+SELECT * FROM users WHERE age > 20 AND name = 'Bob';
 ----
 2	Bob	25
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE age > 20 AND name = ''Bob''');
-----
-true
+statement ok
+SELECT * FROM users WHERE age > 20 AND name = 'Bob';
 
 # --- SELECT with OR conjunction: either condition sufficient ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT * FROM users WHERE name = ''Alice'' OR name = ''Carol''');
+SELECT * FROM users WHERE name = 'Alice' OR name = 'Carol';
 ----
 1	Alice	30
 3	Carol	35
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE name = ''Alice'' OR name = ''Carol''');
-----
-true
+statement ok
+SELECT * FROM users WHERE name = 'Alice' OR name = 'Carol';
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users WHERE id = 1 OR id = 2');
-----
-true
+statement ok
+SELECT id, name FROM users WHERE id = 1 OR id = 2;
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE id IN (SELECT id FROM users WHERE id < 3)');
-----
-true
+statement ok
+SELECT * FROM users WHERE id IN (SELECT id FROM users WHERE id < 3);
 
 # --- SELECT with filter that matches no rows: empty result ---
 
 query III
-PRAGMA lpts_exec('SELECT * FROM users WHERE age > 100');
+SELECT * FROM users WHERE age > 100;
 ----
 
-query I
-PRAGMA lpts_check('SELECT * FROM users WHERE age > 100');
-----
-true
+statement ok
+SELECT * FROM users WHERE age > 100;
 
 # --- SELECT from empty table: zero rows ---
 
@@ -170,20 +147,16 @@ statement ok
 CREATE TABLE empty_tbl (x INTEGER, y VARCHAR);
 
 query II
-PRAGMA lpts_exec('SELECT * FROM empty_tbl');
+SELECT * FROM empty_tbl;
 ----
 
-query I
-PRAGMA lpts_check('SELECT * FROM empty_tbl');
-----
-true
+statement ok
+SELECT * FROM empty_tbl;
 
 # --- SELECT constant expression in projection ---
 
-query I
-PRAGMA lpts_check('SELECT 1 + age FROM users');
-----
-true
+statement ok
+SELECT 1 + age FROM users;
 
 # --- SELECT with NULL values: NULLs propagate through the plan ---
 
@@ -194,59 +167,45 @@ statement ok
 INSERT INTO nullable VALUES (1, 10), (2, NULL), (3, 30);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM nullable');
+SELECT id, val FROM nullable;
 ----
 1	10
 2	NULL
 3	30
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM nullable');
-----
-true
+statement ok
+SELECT id, val FROM nullable;
 
 # --- SELECT with IS NULL filter ---
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM nullable WHERE val IS NULL');
+SELECT id, val FROM nullable WHERE val IS NULL;
 ----
 2	NULL
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM nullable WHERE val IS NULL');
-----
-true
+statement ok
+SELECT id, val FROM nullable WHERE val IS NULL;
 
 # --- SELECT with IS NOT NULL filter ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM nullable WHERE val IS NOT NULL');
+SELECT id, val FROM nullable WHERE val IS NOT NULL;
 ----
 1	10
 3	30
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM nullable WHERE val IS NOT NULL');
-----
-true
+statement ok
+SELECT id, val FROM nullable WHERE val IS NOT NULL;
 
 # Arithmetic expressions — rendered as infix (a + b), not function calls +(a, b)
-query I
-PRAGMA lpts_check('SELECT id + age FROM users');
-----
-true
+statement ok
+SELECT id + age FROM users;
 
-query I
-PRAGMA lpts_check('SELECT id * age + 1 FROM users');
-----
-true
+statement ok
+SELECT id * age + 1 FROM users;
 
-query I
-PRAGMA lpts_check('SELECT age / NULLIF(id, 0) FROM users');
-----
-true
+statement ok
+SELECT age / NULLIF(id, 0) FROM users;
 
-query I
-PRAGMA lpts_check('SELECT age - id, age % 3 FROM users');
-----
-true
+statement ok
+SELECT age - id, age % 3 FROM users;

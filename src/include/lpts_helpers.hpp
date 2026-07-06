@@ -74,4 +74,22 @@ string SubstituteColumnTokens(const string &sql, const std::unordered_map<string
 /// Remove redundant whitespace from a query string.
 void RemoveRedundantWhitespaces(string &query);
 
+/// Heuristic: returns true when `sql` is likely to have a nondeterministic result *value or row order*
+/// — so a strict round-trip comparison can spuriously differ even when the rewrite is correct. On a
+/// match, `reason` is set to a short human-readable explanation. Covers unordered order-sensitive
+/// aggregates (string_agg/listagg/list/array_agg without ORDER BY), random(), window functions over
+/// potentially-tied keys (row_number/rank/dense_rank/lag/lead/first_value/last_value/nth_value),
+/// ORDER BY with LIMIT/OFFSET/FETCH (tied boundary rows), and floating aggregates whose strict equality
+/// can depend on evaluation order (avg/stddev*/variance/var_*).
+bool IsLikelyNondeterministicSQL(const string &sql, string &reason);
+
+// Build the SQL for `DISTINCT ON (targets) ... [ORDER BY orders]` as a portable row_number() filter:
+//   SELECT <cols> FROM (SELECT <cols>, row_number() OVER (PARTITION BY <targets> [ORDER BY <orders>])
+//                       AS _lpts_distinct_on_rn FROM <from_clause>) AS _lpts_distinct_on
+//   WHERE _lpts_distinct_on_rn = 1
+// `from_clause` is a CTE name or a parenthesized subquery. `orders` may be empty (arbitrary row per group).
+// The rn column is consumed by the WHERE and never selected outward, so the fixed alias is safe when nested.
+string BuildDistinctOnQuery(const vector<string> &cols, const vector<string> &targets, const vector<string> &orders,
+                            const string &from_clause);
+
 } // namespace duckdb

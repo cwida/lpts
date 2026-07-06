@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE single_join_lineitem (orderkey INTEGER, partkey INTEGER);
 
 statement ok
@@ -23,7 +26,5 @@ statement ok
 INSERT INTO single_join_customer VALUES (100, 'alice'), (200, 'bob'), (300, 'carol');
 
 # Correlated scalar subquery in a JOIN predicate plans as JoinType::SINGLE.
-query I
-PRAGMA lpts_check('SELECT l.partkey, c.name FROM single_join_lineitem l JOIN single_join_customer c ON c.custkey = (SELECT o.custkey FROM single_join_orders o WHERE o.orderkey = l.orderkey) ORDER BY l.partkey');
-----
-true
+statement ok
+SELECT l.partkey, c.name FROM single_join_lineitem l JOIN single_join_customer c ON c.custkey = (SELECT o.custkey FROM single_join_orders o WHERE o.orderkey = l.orderkey) ORDER BY l.partkey;

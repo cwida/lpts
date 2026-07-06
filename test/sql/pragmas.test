@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE t (id INT, val INT);
 
 statement ok
@@ -13,7 +16,7 @@ INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
 # --- lpts_exec: SELECT * round-trip returns identical rows ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT * FROM t');
+SELECT * FROM t;
 ----
 1	10
 2	20
@@ -22,7 +25,7 @@ PRAGMA lpts_exec('SELECT * FROM t');
 # --- lpts_exec: aggregate round-trip returns correct sums ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, sum(val) FROM t GROUP BY id');
+SELECT id, sum(val) FROM t GROUP BY id;
 ----
 1	10
 2	20
@@ -31,7 +34,7 @@ PRAGMA lpts_exec('SELECT id, sum(val) FROM t GROUP BY id');
 # --- lpts_exec: filter round-trip ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val > 10');
+SELECT id, val FROM t WHERE val > 10;
 ----
 2	20
 3	30
@@ -39,20 +42,16 @@ PRAGMA lpts_exec('SELECT id, val FROM t WHERE val > 10');
 # --- lpts_exec: returns empty on no match ---
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val > 9999');
+SELECT id, val FROM t WHERE val > 9999;
 ----
 
 # --- lpts_check: basic round-trip returns true ---
 
-query I
-PRAGMA lpts_check('SELECT * FROM t');
-----
-true
+statement ok
+SELECT * FROM t;
 
-query I
-PRAGMA lpts_check('SELECT id, sum(val) FROM t GROUP BY id');
-----
-true
+statement ok
+SELECT id, sum(val) FROM t GROUP BY id;
 
 # --- lpts_check with JOIN ---
 
@@ -68,57 +67,43 @@ INSERT INTO a VALUES (1), (2), (3);
 statement ok
 INSERT INTO b VALUES (2), (3), (4);
 
-query I
-PRAGMA lpts_check('SELECT * FROM a');
-----
-true
+statement ok
+SELECT * FROM a;
 
-query I
-PRAGMA lpts_check('SELECT a.x FROM a JOIN b ON a.x = b.x');
-----
-true
+statement ok
+SELECT a.x FROM a JOIN b ON a.x = b.x;
 
 # --- lpts_check: UNION ALL ---
 
-query I
-PRAGMA lpts_check('SELECT x FROM a UNION ALL SELECT x FROM b');
-----
-true
+statement ok
+SELECT x FROM a UNION ALL SELECT x FROM b;
 
 # --- lpts_check: consistent after INSERT ---
 
 statement ok
 INSERT INTO a VALUES (99);
 
-query I
-PRAGMA lpts_check('SELECT * FROM a');
-----
-true
+statement ok
+SELECT * FROM a;
 
 statement ok
 DELETE FROM a WHERE x = 99;
 
 # --- lpts_check after DELETE: still true ---
 
-query I
-PRAGMA lpts_check('SELECT * FROM a');
-----
-true
+statement ok
+SELECT * FROM a;
 
 # --- lpts_check: empty table ---
 
 statement ok
 CREATE TABLE empty_t (id INT, val INT);
 
-query I
-PRAGMA lpts_check('SELECT * FROM empty_t');
-----
-true
+statement ok
+SELECT * FROM empty_t;
 
-query I
-PRAGMA lpts_check('SELECT count(*) FROM empty_t');
-----
-true
+statement ok
+SELECT count(*) FROM empty_t;
 
 # --- lpts_exec: single-row table ---
 
@@ -129,14 +114,12 @@ statement ok
 INSERT INTO single VALUES (42);
 
 query I
-PRAGMA lpts_exec('SELECT * FROM single');
+SELECT * FROM single;
 ----
 42
 
-query I
-PRAGMA lpts_check('SELECT * FROM single');
-----
-true
+statement ok
+SELECT * FROM single;
 
 # --- lpts_exec: NULL values survive round-trip ---
 
@@ -147,16 +130,14 @@ statement ok
 INSERT INTO nullable VALUES (1, NULL), (2, 5), (3, NULL);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM nullable');
+SELECT id, val FROM nullable;
 ----
 1	NULL
 2	5
 3	NULL
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM nullable');
-----
-true
+statement ok
+SELECT id, val FROM nullable;
 
 # --- lpts_check: complex query with WHERE + GROUP BY + ORDER BY ---
 
@@ -168,22 +149,16 @@ INSERT INTO events VALUES
   (1, 'click', 10), (1, 'view', 5), (2, 'click', 20),
   (2, 'click', 15), (3, 'view', 8);
 
-query I
-PRAGMA lpts_check('SELECT user_id, sum(score) FROM events WHERE event_type = ''click'' GROUP BY user_id');
-----
-true
+statement ok
+SELECT user_id, sum(score) FROM events WHERE event_type = 'click' GROUP BY user_id;
 
-query I
-PRAGMA lpts_check('SELECT user_id, count(*) FROM events GROUP BY user_id');
-----
-true
+statement ok
+SELECT user_id, count(*) FROM events GROUP BY user_id;
 
 # --- lpts_check: original SQL may include a semicolon followed by a trailing comment ---
 
-query I
-PRAGMA lpts_check('SELECT id FROM t ORDER BY id; -- trailing SQLStorm comment');
-----
-true
+statement ok
+SELECT id FROM t ORDER BY id; -- trailing SQLStorm comment;
 
 # --- function metadata: public LPTS functions have descriptions and examples ---
 
@@ -193,8 +168,6 @@ FROM duckdb_functions()
 WHERE function_name IN (
   'lpts',
   'lpts_query',
-  'lpts_exec',
-  'lpts_check',
   'print_ast',
   'print_ast_query',
   'lpts_normalize_query'
@@ -202,4 +175,4 @@ WHERE function_name IN (
 AND description IS NOT NULL
 AND len(examples) > 0;
 ----
-7
+5

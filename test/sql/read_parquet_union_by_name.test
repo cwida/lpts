@@ -1,0 +1,40 @@
+# name: test/sql/read_parquet_union_by_name.test
+# description: read_parquet named arguments that change the schema/read must round-trip. union_by_name
+# group: [sql]
+
+#   unifies differing per-file schemas into a superset (missing columns -> NULL); an explicit
+#   hive_partitioning=false must be preserved to suppress auto-detection of path-derived columns.
+
+require lpts
+
+require parquet
+
+statement ok
+SET lpts_check = true;
+
+statement ok
+COPY (SELECT 42 AS a, 43 AS b) TO '__TEST_DIR__/ubn_f1.parquet';
+
+statement ok
+COPY (SELECT 100 AS a, 101 AS c) TO '__TEST_DIR__/ubn_f2.parquet';
+
+# Superset schema (a, b, c) with NULLs for columns absent from a file — only correct when
+# union_by_name is preserved in the rewrite.
+query III
+SELECT a, b, c FROM read_parquet('__TEST_DIR__/ubn_f*.parquet', union_by_name = TRUE) ORDER BY a;
+----
+42	43	NULL
+100	NULL	101
+
+# lpts_query exposes the round-tripped SQL: union_by_name must survive, and an explicit
+# hive_partitioning=false must be re-emitted (dropping it lets read_parquet auto-detect a path
+# partition and derive columns from the path). The combined case is exercised end-to-end by the DuckDB
+# suite's copy/parquet/union_by_name_hive_partitioning.test in the coverage gate.
+query I
+SELECT sql LIKE '%union_by_name = true%' AND sql LIKE '%hive_partitioning = false%'
+FROM lpts_query('SELECT a, b FROM read_parquet(''__TEST_DIR__/ubn_f*.parquet'', hive_partitioning = 0, union_by_name = 1)');
+----
+true
+
+statement ok
+SET lpts_check = false;

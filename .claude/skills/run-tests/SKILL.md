@@ -27,13 +27,13 @@ description: Build and run LPTS test suite (or a specific test file).
 | `test/sql/lambda.test` | Lambda expressions |
 | `test/sql/cast.test` | CAST expressions |
 | `test/sql/print_ast.test` | AST ToString() output |
-| `test/sql/pragmas.test` | lpts_exec, lpts_check round-trip correctness |
+| `test/sql/check_mode.test` | lpts_check round-trip correctness (canonical example) |
+| `test/sql/pragmas.test` | Public function metadata (5 functions) |
 
 ## Key test functions
 
-- **`PRAGMA lpts_check('query')`** — Primary correctness check. Returns `true` if LPTS output matches original query via bag equality. Every test must include at least one.
-- **`PRAGMA lpts_exec('query')`** — Executes LPTS-generated SQL. Use to verify concrete output values.
-- **`lpts_query('query')`** — Returns the generated SQL string. Use to assert exact SQL structure.
+- **`SET lpts_check = true`** — Primary correctness mechanism. Set once after `require lpts`, then run queries directly; every top-level `SELECT` is transparently compared against its LPTS rewrite and raises on a mismatch. Use a bare `SELECT ...;` in a `query` block to also assert rows, or `statement ok` when no row assertion is needed. A wrong rewrite is a `statement error` whose text contains `LPTS check failed`. Every test must turn this on.
+- **`lpts_query('query')`** — Returns the generated SQL string. Use to assert exact SQL structure, or for input-dialect tests that cannot run as bare DuckDB statements (`SELECT sql FROM lpts_query('...')`).
 
 ## TPC-H tests
 
@@ -43,20 +43,22 @@ require lpts
 require tpch
 
 statement ok
+SET lpts_check = true;
+
+statement ok
 CALL dbgen(sf=0.01);
 
-query I
-PRAGMA lpts_check('<tpch_query>');
-----
-true
+statement ok
+<tpch_query>;
 ```
 
 ## SQL Storm tests
 
 The `SQL-Storm-queries/` directory contains 1000 complex queries over TPC-H tables.
 Select representative samples that exercise different operator combinations.
-Use `lpts_check` to verify correctness. Unsupported operators will throw
-`NotImplementedException` (expected during incremental development).
+Turn on `lpts_check` and run each query directly to verify correctness.
+Unsupported operators will throw `NotImplementedException` (expected during
+incremental development).
 
 ## Debugging test failures
 

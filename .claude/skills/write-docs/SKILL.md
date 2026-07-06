@@ -109,12 +109,14 @@ SELECT t1_name AS name FROM projection_2;
 ```
 
 ```sql
--- Verify round-trip correctness
-PRAGMA lpts_check('SELECT name FROM users WHERE age > 25');
+-- Verify round-trip correctness: turn the check on once, then run the query
+SET lpts_check = true;
+SELECT name FROM users WHERE age > 25;
 ```
 
 ```text
-true
+Alice
+Carol
 ```
 
 ### 4.3 SQL Comment Style
@@ -137,7 +139,7 @@ Three types, used sparingly:
 
 ### Important -- Can cause incorrect results if ignored
 ```markdown
-> **Important:** The `lpts_check` function compares bag equality. ORDER BY differences
+> **Important:** The `lpts_check` setting compares bag equality. ORDER BY differences
 > alone will not cause a mismatch.
 ```
 
@@ -163,8 +165,8 @@ Use tables for structured reference data:
 |---|---|---|
 | `PRAGMA lpts('query')` | Interactive | Returns CTE SQL for the given query |
 | `lpts_query('query')` | Table function | Same as above, usable in SELECT |
-| `PRAGMA lpts_exec('query')` | Testing | Runs LPTS-transformed query |
-| `PRAGMA lpts_check('query')` | Testing | Round-trip correctness check |
+| `SET lpts_check = true` | Testing | Transparent round-trip correctness check |
+| `lpts_normalize_query('query')` | Table function | Input-dialect SQL normalized to DuckDB SQL |
 ```
 
 - Left-align text columns
@@ -232,8 +234,7 @@ docs/
 │   └── debugging.md            <- Using LPTS_DEBUG, print_ast, EXPLAIN
 ├── sql-reference/
 │   ├── pragma-lpts.md
-│   ├── pragma-lpts-exec.md
-│   ├── pragma-lpts-check.md
+│   ├── setting-lpts-check.md
 │   ├── lpts-query.md
 │   └── configuration.md
 └── limitations.md              <- Global limitations page

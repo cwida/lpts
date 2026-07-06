@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR);
 
 statement ok
@@ -25,7 +28,7 @@ INSERT INTO staff VALUES (1, 'eng', 50000), (2, 'sales', 60000);
 # --- UNION ALL same table: duplicates rows are preserved ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, name FROM users UNION ALL SELECT id, name FROM users');
+SELECT id, name FROM users UNION ALL SELECT id, name FROM users;
 ----
 1	Alice
 1	Alice
@@ -34,15 +37,13 @@ PRAGMA lpts_exec('SELECT id, name FROM users UNION ALL SELECT id, name FROM user
 3	Carol
 3	Carol
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users UNION ALL SELECT id, name FROM users');
-----
-true
+statement ok
+SELECT id, name FROM users UNION ALL SELECT id, name FROM users;
 
 # --- UNION ALL different tables with compatible schema ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, name FROM users UNION ALL SELECT id, dept FROM staff');
+SELECT id, name FROM users UNION ALL SELECT id, dept FROM staff;
 ----
 1	Alice
 1	eng
@@ -50,49 +51,41 @@ PRAGMA lpts_exec('SELECT id, name FROM users UNION ALL SELECT id, dept FROM staf
 2	sales
 3	Carol
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users UNION ALL SELECT id, dept FROM staff');
-----
-true
+statement ok
+SELECT id, name FROM users UNION ALL SELECT id, dept FROM staff;
 
 # --- UNION ALL with WHERE on each branch independently ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, name FROM users WHERE id > 1 UNION ALL SELECT id, dept FROM staff WHERE salary > 55000');
+SELECT id, name FROM users WHERE id > 1 UNION ALL SELECT id, dept FROM staff WHERE salary > 55000;
 ----
 2	Bob
 2	sales
 3	Carol
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users WHERE id > 1 UNION ALL SELECT id, dept FROM staff WHERE salary > 55000');
-----
-true
+statement ok
+SELECT id, name FROM users WHERE id > 1 UNION ALL SELECT id, dept FROM staff WHERE salary > 55000;
 
 # --- UNION ALL where one branch is empty after filter ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, name FROM users WHERE id > 100 UNION ALL SELECT id, dept FROM staff');
+SELECT id, name FROM users WHERE id > 100 UNION ALL SELECT id, dept FROM staff;
 ----
 1	eng
 2	sales
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users WHERE id > 100 UNION ALL SELECT id, dept FROM staff');
-----
-true
+statement ok
+SELECT id, name FROM users WHERE id > 100 UNION ALL SELECT id, dept FROM staff;
 
 # --- UNION ALL where both branches produce data ---
 
-query I
-PRAGMA lpts_check('SELECT id FROM users UNION ALL SELECT id FROM orders');
-----
-true
+statement ok
+SELECT id FROM users UNION ALL SELECT id FROM orders;
 
 # --- UNION ALL with JOIN on one branch ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id');
+SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id;
 ----
 1	Alice
 1	Alice
@@ -101,61 +94,47 @@ PRAGMA lpts_exec('SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id =
 2	Bob
 2	Bob
 
-query I
-PRAGMA lpts_check('SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id');
-----
-true
+statement ok
+SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id;
 
 # --- UNION ALL with aggregate on top: group after combining both branches ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT name, SUM(amount) FROM (SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id) GROUP BY name');
+SELECT name, SUM(amount) FROM (SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id) GROUP BY name;
 ----
 Alice	500.0
 Bob	400.0
 
-query I
-PRAGMA lpts_check('SELECT name, SUM(amount) FROM (SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id) GROUP BY name');
-----
-true
+statement ok
+SELECT name, SUM(amount) FROM (SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id) GROUP BY name;
 
 # --- UNION ALL count: total row count is sum of both branches ---
 
 query I
-PRAGMA lpts_exec('SELECT count(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff)');
+SELECT count(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff);
 ----
 5
 
-query I
-PRAGMA lpts_check('SELECT count(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff)');
-----
-true
+statement ok
+SELECT count(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff);
 
 # --- UNION ALL with filter on the aggregate result ---
 
-query I
-PRAGMA lpts_check('SELECT name, SUM(amount) FROM (SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id) GROUP BY name HAVING SUM(amount) > 400');
-----
-true
+statement ok
+SELECT name, SUM(amount) FROM (SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id) GROUP BY name HAVING SUM(amount) > 400;
 
 # --- Three-way UNION ALL ---
 
-query I
-PRAGMA lpts_check('SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT id FROM orders');
-----
-true
+statement ok
+SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT id FROM orders;
 
 # UNION ALL with duplicate column names (tests column_map scoping)
-query I
-PRAGMA lpts_check('SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT s.id, s.dept FROM staff s INNER JOIN orders o ON s.id = o.user_id');
-----
-true
+statement ok
+SELECT u.id, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id UNION ALL SELECT s.id, s.dept FROM staff s INNER JOIN orders o ON s.id = o.user_id;
 
 # 3-way UNION ALL (N-ary, tests chaining in AstFlattener)
-query I
-PRAGMA lpts_check('SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders');
-----
-true
+statement ok
+SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders;
 
 # 4-way UNION ALL
 statement ok
@@ -164,63 +143,43 @@ CREATE TABLE extra (val INTEGER);
 statement ok
 INSERT INTO extra VALUES (99);
 
-query I
-PRAGMA lpts_check('SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders UNION ALL SELECT val FROM extra');
-----
-true
+statement ok
+SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders UNION ALL SELECT val FROM extra;
 
 # --- N-ary UNION with aggregate on top (regression) ---
 # The AstFlattener splits N-ary UNION into left-deep binary UNIONs and appends
 # intermediate CTEs to cte_nodes. Parent operators must reference each child
 # CTE by NAME — not by cte_nodes[child->idx] — because the intermediate insertion
 # breaks the idx==vector-position invariant.
-query I
-PRAGMA lpts_check('SELECT COUNT(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders) t');
-----
-true
+statement ok
+SELECT COUNT(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders) t;
 
-query I
-PRAGMA lpts_check('SELECT id, COUNT(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders) t GROUP BY id');
-----
-true
+statement ok
+SELECT id, COUNT(*) FROM (SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders) t GROUP BY id;
 
 # --- N-ary UNION (implicit DISTINCT) with aggregate on top ---
-query I
-PRAGMA lpts_check('SELECT COUNT(*) FROM (SELECT id FROM users UNION SELECT id FROM staff UNION SELECT user_id FROM orders) t');
-----
-true
+statement ok
+SELECT COUNT(*) FROM (SELECT id FROM users UNION SELECT id FROM staff UNION SELECT user_id FROM orders) t;
 
 # --- Plain N-ary UNION (implicit DISTINCT) ---
-query I
-PRAGMA lpts_check('SELECT id FROM users UNION SELECT id FROM staff UNION SELECT user_id FROM orders');
-----
-true
+statement ok
+SELECT id FROM users UNION SELECT id FROM staff UNION SELECT user_id FROM orders;
 
 # Set-op output columns must be deduped (cwida/lpts#16): a UNION / EXCEPT /
 # INTERSECT over an un-aliased self-join exposes two columns sharing a base
 # name (x.id / y.id); without unique names the downstream projection collapses
 # them to the first occurrence and returns wrong results.
-query I
-PRAGMA lpts_check('SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION ALL SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id');
-----
-true
+statement ok
+SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION ALL SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id;
 
-query I
-PRAGMA lpts_check('SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id');
-----
-true
+statement ok
+SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id;
 
-query I
-PRAGMA lpts_check('SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id EXCEPT SELECT y.id, x.id FROM users x JOIN users y ON x.id < y.id');
-----
-true
+statement ok
+SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id EXCEPT SELECT y.id, x.id FROM users x JOIN users y ON x.id < y.id;
 
-query I
-PRAGMA lpts_check('SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id INTERSECT SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id');
-----
-true
+statement ok
+SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id INTERSECT SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id;
 
-query I
-PRAGMA lpts_check('SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.id < b.id JOIN users c ON b.id < c.id UNION ALL SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.id < b.id JOIN users c ON b.id < c.id');
-----
-true
+statement ok
+SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.id < b.id JOIN users c ON b.id < c.id UNION ALL SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.id < b.id JOIN users c ON b.id < c.id;

@@ -5,18 +5,19 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE lateral_wh (w_id INTEGER, w_name VARCHAR);
 
 statement ok
 INSERT INTO lateral_wh VALUES (1, 'w1'), (2, 'w2'), (3, 'w3');
 
-query I
-PRAGMA lpts_check('SELECT w_id, slot FROM lateral_wh w CROSS JOIN LATERAL (SELECT generate_series AS slot FROM generate_series(1, w.w_id)) t(slot)');
-----
-true
+statement ok
+SELECT w_id, slot FROM lateral_wh w CROSS JOIN LATERAL (SELECT generate_series AS slot FROM generate_series(1, w.w_id)) t(slot);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT w_id, slot FROM lateral_wh w CROSS JOIN LATERAL (SELECT generate_series AS slot FROM generate_series(1, w.w_id)) t(slot)');
+SELECT w_id, slot FROM lateral_wh w CROSS JOIN LATERAL (SELECT generate_series AS slot FROM generate_series(1, w.w_id)) t(slot);
 ----
 1	1
 2	1

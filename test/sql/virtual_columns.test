@@ -1,0 +1,68 @@
+# name: test/sql/virtual_columns.test
+# description: path/reader-derived virtual columns (filename / file_row_number / file_index) are refused
+# group: [sql]
+
+require lpts
+
+require parquet
+
+statement ok
+SET lpts_check = true;
+
+statement ok
+COPY (SELECT 1 AS a, 2 AS b UNION ALL SELECT 3, 4) TO '__TEST_DIR__/vc.parquet' (FORMAT parquet);
+
+# The multi-file reader's filename / file_row_number / file_index columns are derived from the file path
+# and scan position, not stored in the file. LPTS reads back the resolved file as a plain scan, so it
+# cannot reproduce them — it must refuse rather than alias a real data column under the virtual name.
+
+statement error
+SELECT sql FROM lpts_query('SELECT filename FROM ''__TEST_DIR__/vc.parquet''');
+----
+LPTS_UNSUPPORTED_VIRTUAL_COLUMN
+
+statement error
+SELECT sql FROM lpts_query('SELECT file_row_number FROM ''__TEST_DIR__/vc.parquet''');
+----
+LPTS_UNSUPPORTED_VIRTUAL_COLUMN
+
+# A normal data-column read from the same file still round-trips fine (lpts_check verifies).
+query II
+SELECT a, b FROM '__TEST_DIR__/vc.parquet' ORDER BY a;
+----
+1	2
+3	4
+
+statement ok
+SELECT a, b FROM '__TEST_DIR__/vc.parquet' ORDER BY a;
+
+# ============================================================
+# Hive-partition filter is reproduced from extra_info.file_filters
+# ============================================================
+# A filter on a hive partition column (`WHERE k='a'`) is consumed by file pruning and dropped from the
+# structured plan — it survives only as the extra_info.file_filters display string. LPTS re-applies that
+# string as a scan filter so the row set matches (it reads all files then filters). Without this the WHERE
+# would vanish and the read would return every partition.
+
+statement ok
+COPY (SELECT 'a' AS k, 1 AS val UNION ALL SELECT 'b', 2 UNION ALL SELECT 'a', 3)
+TO '__TEST_DIR__/hp' (FORMAT parquet, PARTITION_BY (k), OVERWRITE_OR_IGNORE);
+
+query I
+SELECT sql LIKE '%WHERE (k = ''a'')%'
+FROM lpts_query('SELECT k, val FROM read_parquet(''__TEST_DIR__/hp/*/*.parquet'') WHERE k = ''a''');
+----
+true
+
+query II
+SELECT k, val FROM read_parquet('__TEST_DIR__/hp/*/*.parquet') WHERE k = 'a' ORDER BY val;
+----
+a	1
+a	3
+
+statement ok
+SELECT k, val FROM read_parquet('__TEST_DIR__/hp/*/*.parquet') WHERE k = 'a' ORDER BY val;
+
+# a hive read without a partition filter is unaffected (no file_filters to re-apply)
+statement ok
+SELECT k, val FROM read_parquet('__TEST_DIR__/hp/*/*.parquet') ORDER BY val;

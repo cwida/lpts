@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 
 statement ok
@@ -13,7 +16,7 @@ INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35), (4,
 # --- ORDER BY single column DESC ---
 
 query III
-PRAGMA lpts_exec('SELECT id, name, age FROM users ORDER BY age DESC');
+SELECT id, name, age FROM users ORDER BY age DESC;
 ----
 3	Carol	35
 1	Alice	30
@@ -21,15 +24,13 @@ PRAGMA lpts_exec('SELECT id, name, age FROM users ORDER BY age DESC');
 2	Bob	25
 4	Dave	25
 
-query I
-PRAGMA lpts_check('SELECT id, name, age FROM users ORDER BY age DESC');
-----
-true
+statement ok
+SELECT id, name, age FROM users ORDER BY age DESC;
 
 # --- ORDER BY single column ASC (default) ---
 
 query III
-PRAGMA lpts_exec('SELECT id, name, age FROM users ORDER BY age ASC');
+SELECT id, name, age FROM users ORDER BY age ASC;
 ----
 2	Bob	25
 4	Dave	25
@@ -37,15 +38,13 @@ PRAGMA lpts_exec('SELECT id, name, age FROM users ORDER BY age ASC');
 5	Eve	30
 3	Carol	35
 
-query I
-PRAGMA lpts_check('SELECT id, name, age FROM users ORDER BY age ASC');
-----
-true
+statement ok
+SELECT id, name, age FROM users ORDER BY age ASC;
 
 # --- ORDER BY multiple columns: primary sort age DESC, secondary name ASC for ties ---
 
 query III
-PRAGMA lpts_exec('SELECT id, name, age FROM users ORDER BY age DESC, name ASC');
+SELECT id, name, age FROM users ORDER BY age DESC, name ASC;
 ----
 3	Carol	35
 1	Alice	30
@@ -53,15 +52,13 @@ PRAGMA lpts_exec('SELECT id, name, age FROM users ORDER BY age DESC, name ASC');
 2	Bob	25
 4	Dave	25
 
-query I
-PRAGMA lpts_check('SELECT id, name, age FROM users ORDER BY age DESC, name ASC');
-----
-true
+statement ok
+SELECT id, name, age FROM users ORDER BY age DESC, name ASC;
 
 # --- ORDER BY: sort on a column not in SELECT ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY age DESC, name ASC');
+SELECT id, name FROM users ORDER BY age DESC, name ASC;
 ----
 3	Carol
 1	Alice
@@ -69,15 +66,13 @@ PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY age DESC, name ASC');
 2	Bob
 4	Dave
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY age DESC, name ASC');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY age DESC, name ASC;
 
 # --- ORDER BY string column ---
 
 query I
-PRAGMA lpts_exec('SELECT name FROM users ORDER BY name ASC');
+SELECT name FROM users ORDER BY name ASC;
 ----
 Alice
 Bob
@@ -85,41 +80,35 @@ Carol
 Dave
 Eve
 
-query I
-PRAGMA lpts_check('SELECT name FROM users ORDER BY name ASC');
-----
-true
+statement ok
+SELECT name FROM users ORDER BY name ASC;
 
 # --- LIMIT only: return first N rows ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 3');
+SELECT id, name FROM users ORDER BY id LIMIT 3;
 ----
 1	Alice
 2	Bob
 3	Carol
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 3');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 3;
 
 # --- LIMIT 1: single row result ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 1');
+SELECT id, name FROM users ORDER BY id LIMIT 1;
 ----
 1	Alice
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 1');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 1;
 
 # --- LIMIT larger than row count: returns all rows ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 100');
+SELECT id, name FROM users ORDER BY id LIMIT 100;
 ----
 1	Alice
 2	Bob
@@ -127,85 +116,71 @@ PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 100');
 4	Dave
 5	Eve
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 100');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 100;
 
 # --- LIMIT 0: empty result ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 0');
+SELECT id, name FROM users ORDER BY id LIMIT 0;
 ----
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 0');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 0;
 
 # --- LIMIT with OFFSET: skip first N rows ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 2 OFFSET 2');
+SELECT id, name FROM users ORDER BY id LIMIT 2 OFFSET 2;
 ----
 3	Carol
 4	Dave
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 2 OFFSET 2');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 2 OFFSET 2;
 
 # --- OFFSET only (LIMIT larger than count): skip first row ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 100 OFFSET 4');
+SELECT id, name FROM users ORDER BY id LIMIT 100 OFFSET 4;
 ----
 5	Eve
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 100 OFFSET 4');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 100 OFFSET 4;
 
 # --- OFFSET past end of result: empty ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 10');
+SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 10;
 ----
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 10');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY id LIMIT 10 OFFSET 10;
 
 # --- ORDER BY + LIMIT combined: top-N pattern ---
 
 query II
-PRAGMA lpts_exec('SELECT id, name FROM users ORDER BY age DESC, name ASC LIMIT 3');
+SELECT id, name FROM users ORDER BY age DESC, name ASC LIMIT 3;
 ----
 3	Carol
 1	Alice
 5	Eve
 
-query I
-PRAGMA lpts_check('SELECT id, name FROM users ORDER BY age DESC, name ASC LIMIT 3');
-----
-true
+statement ok
+SELECT id, name FROM users ORDER BY age DESC, name ASC LIMIT 3;
 
 # --- ORDER BY after GROUP BY: sort aggregate results ---
 
 query II
-PRAGMA lpts_exec('SELECT age, count(*) FROM users GROUP BY age ORDER BY age ASC');
+SELECT age, count(*) FROM users GROUP BY age ORDER BY age ASC;
 ----
 25	2
 30	2
 35	1
 
-query I
-PRAGMA lpts_check('SELECT age, count(*) FROM users GROUP BY age ORDER BY age ASC');
-----
-true
+statement ok
+SELECT age, count(*) FROM users GROUP BY age ORDER BY age ASC;
 
 # --- ORDER BY on empty table: no rows ---
 
@@ -213,13 +188,11 @@ statement ok
 CREATE TABLE empty_tbl (x INTEGER, y VARCHAR);
 
 query II
-PRAGMA lpts_exec('SELECT x, y FROM empty_tbl ORDER BY x DESC');
+SELECT x, y FROM empty_tbl ORDER BY x DESC;
 ----
 
-query I
-PRAGMA lpts_check('SELECT x, y FROM empty_tbl ORDER BY x DESC');
-----
-true
+statement ok
+SELECT x, y FROM empty_tbl ORDER BY x DESC;
 
 # --- Expression OFFSET may be bound as a scalar column carried through the child CTE ---
 
@@ -229,10 +202,8 @@ CREATE TABLE offset_orders (id INTEGER, price INTEGER);
 statement ok
 INSERT INTO offset_orders VALUES (1, 100), (2, 90), (3, 80), (4, 70), (5, 60);
 
-query I
-PRAGMA lpts_check('SELECT id, price FROM offset_orders ORDER BY price DESC LIMIT 2 OFFSET (SELECT COUNT(*) FROM offset_orders) / 5');
-----
-true
+statement ok
+SELECT id, price FROM offset_orders ORDER BY price DESC LIMIT 2 OFFSET (SELECT COUNT(*) FROM offset_orders) / 5;
 
 # --- LIMIT can prune child output while its child filter still reads other columns ---
 
@@ -248,7 +219,13 @@ CREATE TABLE customer_stats (nationkey INTEGER, total_orders INTEGER);
 statement ok
 INSERT INTO customer_stats VALUES (1, 10), (2, 20), (3, 30);
 
-query I
-PRAGMA lpts_check('SELECT total_orders FROM customer_stats WHERE nationkey = (SELECT nationkey FROM scalar_nation WHERE name IN (''USA'', ''CANADA'') LIMIT 1)');
+statement ok
+SELECT total_orders FROM customer_stats WHERE nationkey = (SELECT nationkey FROM scalar_nation WHERE name IN ('USA', 'CANADA') LIMIT 1);
+
+# --- WITH ORDINALITY is refused: it compiles to row_number() over an unspecified row order (a distinctive
+# ROWS-framed row_number with no PARTITION/ORDER), which the rewrite cannot reproduce. A plain
+# row_number() OVER () (RANGE frame) is unaffected. ---
+statement error
+SELECT sql FROM lpts_query('SELECT r, o FROM range(10) WITH ORDINALITY AS _(r, o)');
 ----
-true
+LPTS_UNSUPPORTED_WINDOW

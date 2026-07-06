@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE rendering_edges (grp VARCHAR, item VARCHAR, amount INTEGER, amount2 INTEGER);
 
 statement ok
@@ -16,40 +19,28 @@ INSERT INTO rendering_edges VALUES
 	('b', 'y', 15, 5);
 
 # string_agg bind data supplies the separator; ORDER BY keeps the aggregate deterministic.
-query I
-PRAGMA lpts_check('SELECT grp, string_agg(item, '':'' ORDER BY item) FROM rendering_edges GROUP BY grp ORDER BY grp');
-----
-true
+statement ok
+SELECT grp, string_agg(item, ':' ORDER BY item) FROM rendering_edges GROUP BY grp ORDER BY grp;
 
 # quantile_cont bind data supplies the quantile argument.
-query I
-PRAGMA lpts_check('SELECT grp, quantile_cont(amount, 0.5) FROM rendering_edges GROUP BY grp ORDER BY grp');
-----
-true
+statement ok
+SELECT grp, quantile_cont(amount, 0.5) FROM rendering_edges GROUP BY grp ORDER BY grp;
 
 # Multiple quantiles render as a list argument.
-query I
-PRAGMA lpts_check('SELECT grp, quantile_cont(amount, [0.25, 0.75]) FROM rendering_edges GROUP BY grp ORDER BY grp');
-----
-true
+statement ok
+SELECT grp, quantile_cont(amount, [0.25, 0.75]) FROM rendering_edges GROUP BY grp ORDER BY grp;
 
 # approx_quantile stores the quantile argument in aggregate bind data too.
-query I
-PRAGMA lpts_check('SELECT grp, approx_quantile(amount, 0.5) FROM rendering_edges GROUP BY grp ORDER BY grp');
-----
-true
+statement ok
+SELECT grp, approx_quantile(amount, 0.5) FROM rendering_edges GROUP BY grp ORDER BY grp;
 
 # Two-argument aggregates must serialize both arguments through the aggregate child scope.
-query I
-PRAGMA lpts_check('SELECT grp, corr(amount, amount2) FROM rendering_edges GROUP BY grp ORDER BY grp');
-----
-true
+statement ok
+SELECT grp, corr(amount, amount2) FROM rendering_edges GROUP BY grp ORDER BY grp;
 
 # GROUPING() over grouping sets exercises aggregate output remapping.
-query I
-PRAGMA lpts_check('SELECT grp, item, GROUPING(grp), GROUPING(item), sum(amount) FROM rendering_edges GROUP BY ROLLUP (grp, item) ORDER BY grp NULLS LAST, item NULLS LAST');
-----
-true
+statement ok
+SELECT grp, item, GROUPING(grp), GROUPING(item), sum(amount) FROM rendering_edges GROUP BY ROLLUP (grp, item) ORDER BY grp NULLS LAST, item NULLS LAST;
 
 statement ok
 CREATE TABLE rendering_customers (c_w_id INTEGER, c_id INTEGER, c_balance BIGINT);
@@ -65,10 +56,8 @@ INSERT INTO rendering_orders VALUES (1, 1), (1, 1), (2, 1);
 
 # Regression shape from OpenIVM q1888: nested CTEs, LEFT JOIN, AVG decomposition candidates,
 # and a two-argument aggregate above the join.
-query I
-PRAGMA lpts_check('WITH cust AS (SELECT c_w_id, c_id, c_balance FROM rendering_customers), orders AS (SELECT o_w_id, o_c_id, COUNT(*) AS n FROM rendering_orders GROUP BY o_w_id, o_c_id), joined AS (SELECT c.c_w_id, c.c_id, c.c_balance, COALESCE(o.n, 0) AS orders FROM cust c LEFT JOIN orders o ON c.c_w_id = o.o_w_id AND c.c_id = o.o_c_id) SELECT c_w_id, AVG(c_balance) AS avg_bal, AVG(orders) AS avg_ord, CORR(c_balance, orders) AS corr FROM joined GROUP BY c_w_id');
-----
-true
+statement ok
+WITH cust AS (SELECT c_w_id, c_id, c_balance FROM rendering_customers), orders AS (SELECT o_w_id, o_c_id, COUNT(*) AS n FROM rendering_orders GROUP BY o_w_id, o_c_id), joined AS (SELECT c.c_w_id, c.c_id, c.c_balance, COALESCE(o.n, 0) AS orders FROM cust c LEFT JOIN orders o ON c.c_w_id = o.o_w_id AND c.c_id = o.o_c_id) SELECT c_w_id, AVG(c_balance) AS avg_bal, AVG(orders) AS avg_ord, CORR(c_balance, orders) AS corr FROM joined GROUP BY c_w_id;
 
 statement ok
 CREATE TABLE rendering_reserved ("group" INTEGER, "select" INTEGER);
@@ -77,7 +66,5 @@ statement ok
 INSERT INTO rendering_reserved VALUES (1, 10), (1, 20), (2, 30);
 
 # Base scan columns and pushed-down table filters must quote reserved identifiers.
-query I
-PRAGMA lpts_check('SELECT "group", SUM("select") FROM rendering_reserved WHERE "group" >= 1 GROUP BY "group" ORDER BY "group"');
-----
-true
+statement ok
+SELECT "group", SUM("select") FROM rendering_reserved WHERE "group" >= 1 GROUP BY "group" ORDER BY "group";

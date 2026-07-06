@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE t (id INTEGER, val INTEGER, label VARCHAR);
 
 statement ok
@@ -25,25 +28,17 @@ INSERT INTO t2 VALUES (1, 100), (2, 200), (3, 300);
 statement ok
 SET disabled_optimizers = 'FILTER_PUSHDOWN';
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 20');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val > 20;
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 10 AND label = ''x''');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val > 10 AND label = 'x';
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300;
 
-query I
-PRAGMA lpts_check('SELECT label, sum(val) FROM t GROUP BY label HAVING sum(val) > 30');
-----
-true
+statement ok
+SELECT label, sum(val) FROM t GROUP BY label HAVING sum(val) > 30;
 
 statement ok
 SET disabled_optimizers = '';
@@ -57,15 +52,11 @@ SET disabled_optimizers = '';
 statement ok
 SET disabled_optimizers = 'JOIN_ORDER';
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id;
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 20');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 20;
 
 statement ok
 SET disabled_optimizers = '';
@@ -77,15 +68,11 @@ SET disabled_optimizers = '';
 statement ok
 SET disabled_optimizers = 'FILTER_PUSHDOWN,JOIN_ORDER';
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10;
 
-query I
-PRAGMA lpts_check('SELECT label, sum(val) FROM t GROUP BY label HAVING sum(val) > 30');
-----
-true
+statement ok
+SELECT label, sum(val) FROM t GROUP BY label HAVING sum(val) > 30;
 
 statement ok
 SET disabled_optimizers = '';
@@ -97,28 +84,20 @@ SET disabled_optimizers = '';
 # correctness must be unaffected.
 # ============================================================
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 10 AND label = ''x'' AND id < 5');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val > 10 AND label = 'x' AND id < 5;
 
-query I
-PRAGMA lpts_check('SELECT label, sum(val) FROM t WHERE val > 10 AND label <> ''z'' GROUP BY label HAVING sum(val) > 20');
-----
-true
+statement ok
+SELECT label, sum(val) FROM t WHERE val > 10 AND label <> 'z' GROUP BY label HAVING sum(val) > 20;
 
 statement ok
 SET disabled_optimizers = 'REORDER_FILTER';
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 10 AND label = ''x'' AND id < 5');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val > 10 AND label = 'x' AND id < 5;
 
-query I
-PRAGMA lpts_check('SELECT label, sum(val) FROM t WHERE val > 10 AND label <> ''z'' GROUP BY label HAVING sum(val) > 20');
-----
-true
+statement ok
+SELECT label, sum(val) FROM t WHERE val > 10 AND label <> 'z' GROUP BY label HAVING sum(val) > 20;
 
 statement ok
 SET disabled_optimizers = '';
@@ -130,28 +109,20 @@ SET disabled_optimizers = '';
 # either field, so the logical plan conversion is unaffected.
 # ============================================================
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id;
 
-query I
-PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300');
-----
-true
+statement ok
+SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300;
 
-query I
-PRAGMA lpts_check('SELECT t.label, sum(t.val), max(t2.score) FROM t JOIN t2 ON t.id = t2.id GROUP BY t.label');
-----
-true
+statement ok
+SELECT t.label, sum(t.val), max(t2.score) FROM t JOIN t2 ON t.id = t2.id GROUP BY t.label;
 
 statement ok
 SET disabled_optimizers = 'JOIN_FILTER_PUSHDOWN';
 
-query I
-PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300');
-----
-true
+statement ok
+SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10 AND t2.score < 300;
 
 statement ok
 SET disabled_optimizers = '';
@@ -162,39 +133,27 @@ SET disabled_optimizers = '';
 # LPTS serializes it as ORDER BY ... LIMIT in the CTE body.
 # ============================================================
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t ORDER BY val DESC LIMIT 3');
-----
-true
+statement ok
+SELECT id, val FROM t ORDER BY val DESC LIMIT 3;
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t ORDER BY val LIMIT 2 OFFSET 1');
-----
-true
+statement ok
+SELECT id, val FROM t ORDER BY val LIMIT 2 OFFSET 1;
 
-query I
-PRAGMA lpts_check('SELECT label, sum(val) AS s FROM t GROUP BY label ORDER BY s DESC LIMIT 2');
-----
-true
+statement ok
+SELECT label, sum(val) AS s FROM t GROUP BY label ORDER BY s DESC LIMIT 2;
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score LIMIT 2');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score LIMIT 2;
 
 # ============================================================
 # Optimizer re-enabled: same queries must still pass
 # ============================================================
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 20');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val > 20;
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10;
 
 # ============================================================
 # STATISTICS_PROPAGATION enabled (default)
@@ -206,43 +165,35 @@ true
 # ============================================================
 
 # Constant-false predicate: WHERE 1 = 0
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE 1 = 0');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE 1 = 0;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 0');
+SELECT id, val FROM t WHERE 1 = 0;
 ----
 
 # Column out-of-range: val ∈ [10, 50], so val < 0 is impossible
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 0');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val < 0;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 0');
+SELECT id, val FROM t WHERE val < 0;
 ----
 
 # Boundary: val > 50 is impossible (max = 50)
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val > 50');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val > 50;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val > 50');
+SELECT id, val FROM t WHERE val > 50;
 ----
 
 # Impossible range: val < 10 AND val > 50 — contradictory, pruned to EMPTY_RESULT
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 10 AND val > 50');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val < 10 AND val > 50;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 10 AND val > 50');
+SELECT id, val FROM t WHERE val < 10 AND val > 50;
 ----
 
 # ============================================================
@@ -254,13 +205,11 @@ PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 10 AND val > 50');
 # ============================================================
 
 # Constant-true predicate: WHERE 1 = 1
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE 1 = 1');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE 1 = 1;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 1');
+SELECT id, val FROM t WHERE 1 = 1;
 ----
 1	10
 2	20
@@ -269,13 +218,11 @@ PRAGMA lpts_exec('SELECT id, val FROM t WHERE 1 = 1');
 5	50
 
 # Column always in range: val ∈ [10, 50], so val >= 10 is always true
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val >= 10');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val >= 10;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val >= 10');
+SELECT id, val FROM t WHERE val >= 10;
 ----
 1	10
 2	20
@@ -287,47 +234,39 @@ PRAGMA lpts_exec('SELECT id, val FROM t WHERE val >= 10');
 # Join stats: scan filter added from join partner statistics
 # ============================================================
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id;
 
 query II
-PRAGMA lpts_exec('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id;
 ----
 1	100
 2	200
 3	300
 
-query I
-PRAGMA lpts_check('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
-----
-true
+statement ok
+SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10;
 
 query III
-PRAGMA lpts_exec('SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10');
+SELECT t.id, t.val, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.val > 10;
 ----
 2	20	200
 3	30	300
 
 # Impossible predicate on a join — EMPTY_RESULT propagates up
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100;
 
 query II
-PRAGMA lpts_exec('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100');
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id WHERE t.id > 100;
 ----
 
 # Aggregate on pruned input → zero-row aggregate result
-query I
-PRAGMA lpts_check('SELECT count(*), sum(val) FROM t WHERE val > 50');
-----
-true
+statement ok
+SELECT count(*), sum(val) FROM t WHERE val > 50;
 
 query II
-PRAGMA lpts_exec('SELECT count(*), sum(val) FROM t WHERE val > 50');
+SELECT count(*), sum(val) FROM t WHERE val > 50;
 ----
 0	NULL
 
@@ -340,19 +279,15 @@ PRAGMA lpts_exec('SELECT count(*), sum(val) FROM t WHERE val > 50');
 statement ok
 SET disabled_optimizers = 'STATISTICS_PROPAGATION';
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val < 0');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val < 0;
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val < 0');
+SELECT id, val FROM t WHERE val < 0;
 ----
 
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id;
 
 statement ok
 SET disabled_optimizers = '';
@@ -368,54 +303,38 @@ SET disabled_optimizers = '';
 
 # ORDER BY on a column that is NOT in the SELECT list.
 # COLUMN_LIFETIME prunes the sort key (val) from the ORDER CTE output.
-query I
-PRAGMA lpts_check('SELECT id FROM t ORDER BY val');
-----
-true
+statement ok
+SELECT id FROM t ORDER BY val;
 
-query I
-PRAGMA lpts_check('SELECT id FROM t ORDER BY val DESC');
-----
-true
+statement ok
+SELECT id FROM t ORDER BY val DESC;
 
 # ORDER BY on multiple non-selected columns.
-query I
-PRAGMA lpts_check('SELECT id FROM t ORDER BY val DESC, label ASC');
-----
-true
+statement ok
+SELECT id FROM t ORDER BY val DESC, label ASC;
 
 # Filter where the condition column is not in the SELECT list.
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val > 20');
-----
-true
+statement ok
+SELECT id FROM t WHERE val > 20;
 
 # Join: sort key from the right side pruned from ORDER CTE output.
-query I
-PRAGMA lpts_check('SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
-----
-true
+statement ok
+SELECT t.id, t2.score FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score;
 
-query I
-PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
-----
-true
+statement ok
+SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score;
 
 # Regression: a FILTER above a barrier (aggregate / unnest) where COLUMN_LIFETIME prunes a
 # column at the filter via projection_map (the group key / list passthrough is only needed
 # below the filter). FilterNode must emit only the kept columns; emitting the pruned column
 # leaves the CTE body wider than its header, which breaks the moment the filter output feeds
 # an arity-sensitive parent — here a UNION ALL with a 1-column branch.
-query I
-PRAGMA lpts_check('SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25 UNION ALL SELECT 99');
-----
-true
+statement ok
+SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25 UNION ALL SELECT 99;
 
 # Same filter-prunes-group-key shape without the set-op.
-query I
-PRAGMA lpts_check('SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25');
-----
-true
+statement ok
+SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25;
 
 # FILTER above UNNEST: the list passthrough column is pruned at the filter.
 statement ok
@@ -424,34 +343,24 @@ CREATE TABLE arr_t (id INTEGER, arr INTEGER[]);
 statement ok
 INSERT INTO arr_t VALUES (1, [5, 15, 20]), (2, [3, 30]);
 
-query I
-PRAGMA lpts_check('SELECT elem FROM (SELECT unnest(arr) AS elem FROM arr_t) u WHERE elem > 10 UNION ALL SELECT 99');
-----
-true
+statement ok
+SELECT elem FROM (SELECT unnest(arr) AS elem FROM arr_t) u WHERE elem > 10 UNION ALL SELECT 99;
 
 # COLUMN_LIFETIME disabled: same queries must still round-trip correctly.
 statement ok
 SET disabled_optimizers = 'COLUMN_LIFETIME';
 
-query I
-PRAGMA lpts_check('SELECT id FROM t ORDER BY val');
-----
-true
+statement ok
+SELECT id FROM t ORDER BY val;
 
-query I
-PRAGMA lpts_check('SELECT id FROM t WHERE val > 20');
-----
-true
+statement ok
+SELECT id FROM t WHERE val > 20;
 
-query I
-PRAGMA lpts_check('SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score');
-----
-true
+statement ok
+SELECT t.id FROM t JOIN t2 ON t.id = t2.id ORDER BY t2.score;
 
-query I
-PRAGMA lpts_check('SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25 UNION ALL SELECT 99');
-----
-true
+statement ok
+SELECT total FROM (SELECT label, SUM(val) AS total FROM t GROUP BY label) s WHERE total > 25 UNION ALL SELECT 99;
 
 statement ok
 SET disabled_optimizers = '';

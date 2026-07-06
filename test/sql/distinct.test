@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 
 statement ok
@@ -15,68 +18,58 @@ INSERT INTO users VALUES
 # --- DISTINCT on a single column: duplicates removed ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT DISTINCT name FROM users');
+SELECT DISTINCT name FROM users;
 ----
 Alice
 Bob
 Carol
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT name FROM users');
-----
-true
+statement ok
+SELECT DISTINCT name FROM users;
 
 # --- DISTINCT on a different single column ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT DISTINCT age FROM users');
+SELECT DISTINCT age FROM users;
 ----
 25
 30
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT age FROM users');
-----
-true
+statement ok
+SELECT DISTINCT age FROM users;
 
 # --- DISTINCT on multiple columns: (name, age) pair is the unit of uniqueness ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT DISTINCT name, age FROM users');
+SELECT DISTINCT name, age FROM users;
 ----
 Alice	30
 Bob	25
 Carol	30
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT name, age FROM users');
-----
-true
+statement ok
+SELECT DISTINCT name, age FROM users;
 
 # --- DISTINCT with WHERE filter applied before de-duplication ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT DISTINCT name FROM users WHERE age > 25');
+SELECT DISTINCT name FROM users WHERE age > 25;
 ----
 Alice
 Carol
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT name FROM users WHERE age > 25');
-----
-true
+statement ok
+SELECT DISTINCT name FROM users WHERE age > 25;
 
 # --- DISTINCT where filter produces a single unique row ---
 
 query I
-PRAGMA lpts_exec('SELECT DISTINCT name FROM users WHERE name = ''Carol''');
+SELECT DISTINCT name FROM users WHERE name = 'Carol';
 ----
 Carol
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT name FROM users WHERE name = ''Carol''');
-----
-true
+statement ok
+SELECT DISTINCT name FROM users WHERE name = 'Carol';
 
 # --- DISTINCT on empty table: no rows ---
 
@@ -84,13 +77,11 @@ statement ok
 CREATE TABLE empty_tbl (x INTEGER);
 
 query I
-PRAGMA lpts_exec('SELECT DISTINCT x FROM empty_tbl');
+SELECT DISTINCT x FROM empty_tbl;
 ----
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT x FROM empty_tbl');
-----
-true
+statement ok
+SELECT DISTINCT x FROM empty_tbl;
 
 # --- DISTINCT on single row: result is that one row ---
 
@@ -101,14 +92,12 @@ statement ok
 INSERT INTO single_row VALUES (42, 'only');
 
 query II
-PRAGMA lpts_exec('SELECT DISTINCT x, y FROM single_row');
+SELECT DISTINCT x, y FROM single_row;
 ----
 42	only
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT x, y FROM single_row');
-----
-true
+statement ok
+SELECT DISTINCT x, y FROM single_row;
 
 # --- DISTINCT where all rows are identical duplicates ---
 
@@ -119,14 +108,12 @@ statement ok
 INSERT INTO all_dupes VALUES (7), (7), (7);
 
 query I
-PRAGMA lpts_exec('SELECT DISTINCT val FROM all_dupes');
+SELECT DISTINCT val FROM all_dupes;
 ----
 7
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT val FROM all_dupes');
-----
-true
+statement ok
+SELECT DISTINCT val FROM all_dupes;
 
 # --- DISTINCT with NULL values: NULL is treated as a distinct value ---
 
@@ -137,20 +124,44 @@ statement ok
 INSERT INTO nullable_distinct VALUES ('A'), (NULL), ('A'), (NULL), ('B');
 
 query I rowsort
-PRAGMA lpts_exec('SELECT DISTINCT cat FROM nullable_distinct');
+SELECT DISTINCT cat FROM nullable_distinct;
 ----
 A
 B
 NULL
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT cat FROM nullable_distinct');
-----
-true
+statement ok
+SELECT DISTINCT cat FROM nullable_distinct;
 
 # --- DISTINCT combined with integer column ---
 
-query I
-PRAGMA lpts_check('SELECT DISTINCT age FROM users WHERE age >= 25');
+statement ok
+SELECT DISTINCT age FROM users WHERE age >= 25;
+
+# --- DISTINCT ON: keep one row per target group, chosen by ORDER BY (must NOT collapse to SELECT DISTINCT) ---
+
+statement ok
+CREATE TABLE don (g INTEGER, k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO don VALUES (1,10,'a'),(1,20,'b'),(1,5,'c'),(2,7,'d'),(2,9,'e'),(3,1,'f');
+
+# one row per g, the one with the smallest k (total order via k) — round-trips exactly.
+query IIT
+SELECT DISTINCT ON (g) g, k, v FROM don ORDER BY g, k;
 ----
-true
+1	5	c
+2	7	d
+3	1	f
+
+# multi-key DISTINCT ON with a total-order tiebreak.
+query III
+SELECT DISTINCT ON (g) g, k, k * 2 AS k2 FROM don ORDER BY g, k DESC, v;
+----
+1	20	40
+2	9	18
+3	1	2
+
+# DISTINCT ON over a join, ordered by a total key — exercises the rewrite below a join/order.
+statement ok
+SELECT DISTINCT ON (u.id) u.id, d.v FROM users u JOIN don d ON u.age = d.k * 3 ORDER BY u.id, d.g;

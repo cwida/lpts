@@ -30,6 +30,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
@@ -98,8 +99,21 @@ private:
 		}
 	};
 
+	// A set of emitted CTE column names with case-insensitive membership. DuckDB resolves identifiers
+	// case-insensitively, so two generated names differing only in case (t1_hello vs t1_HeLlO) would
+	// collide when referenced. Deduping against this set treats them as equal, so the second gets a suffix.
+	struct CaseInsensitiveNameSet {
+		unordered_set<string> names;
+		bool count(const string &name) const {
+			return names.count(StringUtil::Lower(name)) > 0;
+		}
+		void insert(const string &name) {
+			names.insert(StringUtil::Lower(name));
+		}
+	};
+
 	static unique_ptr<ColStruct> MakeDedupedColumn(idx_t table_index, string column_name, string alias,
-	                                               unordered_set<string> &seen_names, idx_t suffix_seed) {
+	                                               CaseInsensitiveNameSet &seen_names, idx_t suffix_seed) {
 		string base_column_name = column_name;
 		string base_alias = alias;
 		idx_t suffix = suffix_seed;
@@ -256,7 +270,7 @@ private:
 		case SampleMethod::RESERVOIR_SAMPLE:
 			return "reservoir";
 		default:
-			throw NotImplementedException("LPTS SAMPLE: sample method %s is not implemented",
+			throw NotImplementedException("LPTS_UNSUPPORTED_SAMPLE: sample method %s is not implemented",
 			                              EnumUtil::ToString(method));
 		}
 	}
@@ -312,10 +326,10 @@ private:
 		if (it != column_map.end()) {
 			return it->second;
 		}
-		throw NotImplementedException("LPTS: %s column ref (%llu,%llu) is not implemented because it is not in "
-		                              "column_map",
-		                              context, (unsigned long long)binding.table_index,
-		                              (unsigned long long)binding.column_index);
+		throw NotImplementedException(
+		    "LPTS_UNSUPPORTED_COLUMN_REF: %s column ref (%llu,%llu) is not implemented because it is not in "
+		    "column_map",
+		    context, (unsigned long long)binding.table_index, (unsigned long long)binding.column_index);
 	}
 
 	void RegisterChildBindingFallbacks(Expression &expr, const vector<ColumnBinding> &child_bindings) {
@@ -425,6 +439,112 @@ private:
 		return expression_renderer.ExpressionToAliasedString(expression);
 	}
 
+	// Partition a MARK join's conditions into the single NULL-propagating membership comparison and the
+	// null-safe correlation links, so the renderer can build a 3-valued mark. A decorrelated IN/ANY/ALL
+	// mark join's conditions split into null-safe correlation keys (`IS NOT DISTINCT FROM`, the
+	// outer↔subquery link) and the NULL-propagating membership comparison (`=`, `<`, ...). When there is
+	// exactly one such comparison, this captures its operand expressions (lhs_key/rhs_key) plus the
+	// rendered correlation conditions. EXISTS subqueries are 2-valued (no NULL-propagating comparison) and
+	// leave the keys empty. Used by both LOGICAL_COMPARISON_JOIN and the DELIM/DEPENDENT join path.
+	void ExtractMarkComparison(const vector<JoinCondition> &conditions, string &lhs_key, string &rhs_key,
+	                           vector<string> &correlation_conditions, vector<string> &membership_conditions,
+	                           vector<string> &membership_comparisons, vector<string> &membership_lhs,
+	                           vector<string> &membership_rhs, bool &has_equality) {
+		has_equality = false;
+		for (const auto &cc : conditions) {
+			const ExpressionType cmp = cc.comparison;
+			const string l = ExpressionToAliasedString(cc.left);
+			const string r = ExpressionToAliasedString(cc.right);
+			const string rendered = "(" + l + " " + ExpressionTypeToOperator(cmp) + " " + r + ")";
+			if (cmp == ExpressionType::COMPARE_EQUAL || cmp == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+				// Mirrors LogicalComparisonJoin::HasEquality — decides hash join (per-row AND) vs nested-loop
+				// (per-condition independent OR) execution, and hence which SQL rendering is faithful.
+				has_equality = true;
+			}
+			if (cmp == ExpressionType::COMPARE_NOT_DISTINCT_FROM || cmp == ExpressionType::COMPARE_DISTINCT_FROM) {
+				// Null-safe correlation link (the decorrelated outer↔subquery key).
+				correlation_conditions.push_back(rendered);
+			} else {
+				// A NULL-propagating membership comparison (`=`, `<`, ...). For the 3-valued mark, a row is
+				// "indeterminate" (its per-row membership predicate is NULL, contributing NULL to the OR over
+				// rows) when this comparison is not definitely false — i.e. it holds, or an operand is NULL.
+				// AND-ing one such clause per comparison generalizes single- and multi-column IN alike; for a
+				// single `=` it reduces to the plain `(lhs IS NULL OR rhs IS NULL)` null-check on non-matching
+				// rows (a TRUE comparison is caught by the `matched` branch first).
+				membership_conditions.push_back("(" + rendered + " OR (" + l + ") IS NULL OR (" + r + ") IS NULL)");
+				membership_comparisons.push_back(rendered);
+				membership_lhs.push_back(l);
+				membership_rhs.push_back(r);
+				lhs_key = l;
+				rhs_key = r;
+			}
+		}
+	}
+
+	// Render a struct field-extraction pushdown. When DuckDB pushes `col.field[.subfield...]` into the
+	// scan, the projected ColumnIndex keeps the base column as its primary index and carries a single-path
+	// child chain naming the field path. Build a nested `struct_extract(...)` expression and report the
+	// leaf field name (used as the column alias). Field positions are resolved to names via the column's
+	// STRUCT LogicalType (walking down one level per child). Returns false if the path can't be resolved
+	// (e.g. a non-STRUCT level), so the caller can fall back to the base column.
+	bool RenderStructExtractPath(const string &base_col, const LogicalType &base_type, const ColumnIndex &ci,
+	                             string &out_expr, string &out_leaf) {
+		if (!ci.HasChildren()) {
+			return false;
+		}
+		string expr = DialectQuoteIdent(base_col, dialect);
+		string leaf = base_col;
+		LogicalType cur_type = base_type;
+		const ColumnIndex *node = &ci;
+		while (node->HasChildren()) {
+			const ColumnIndex &child = node->GetChildIndex(0);
+			string field_name;
+			if (child.HasPrimaryIndex()) {
+				if (cur_type.id() != LogicalTypeId::STRUCT) {
+					// A field path through a non-STRUCT level (list/map element) — not reproducible as a
+					// plain struct_extract. Refuse rather than emit the wrong column.
+					ThrowLptsNotImplemented("LPTS_STRUCT_EXTRACT_PUSHDOWN", dialect, "expression",
+					                        "struct field extraction", "LOGICAL_GET",
+					                        "field-extraction pushdown through a non-STRUCT type is not "
+					                        "implemented");
+				}
+				const auto &child_types = StructType::GetChildTypes(cur_type);
+				const idx_t field_pos = child.GetPrimaryIndex();
+				if (field_pos >= child_types.size()) {
+					ThrowLptsNotImplemented("LPTS_STRUCT_EXTRACT_PUSHDOWN", dialect, "expression",
+					                        "struct field extraction", "LOGICAL_GET",
+					                        "field-extraction pushdown references an out-of-range struct field");
+				}
+				field_name = StructType::GetChildName(cur_type, field_pos);
+				cur_type = child_types[field_pos].second;
+				expr = "struct_extract(" + expr + ", '" + EscapeSingleQuotes(field_name) + "')";
+			} else {
+				// Field referenced by name — VARIANT navigation. struct_extract would walk the VARIANT's
+				// physical layout (keys/children/values) and fail; SQL bracket access `v['field']` performs
+				// the logical navigation and yields VARIANT, matching the scan's output.
+				field_name = child.GetFieldName();
+				expr = expr + "['" + EscapeSingleQuotes(field_name) + "']";
+				cur_type = LogicalType(LogicalTypeId::INVALID);
+			}
+			leaf = field_name;
+			node = &child;
+		}
+		// A pushdown extract can carry a cast/restructure on the extracted value (e.g.
+		// `s.nested_struct.a::BIGINT`, or `s.nested_struct::STRUCT(b BOOL, a INTEGER)` which reorders the
+		// fields). The plain struct_extract above reproduces neither, so when the scan's emitted type differs
+		// from the natural extracted type, wrap it in an explicit CAST to the emitted type. (For VARIANT
+		// navigation — cur_type INVALID — the natural result is VARIANT; cast only when the scan emits a
+		// shredded typed value instead.)
+		if (ci.IsPushdownExtract() && ci.HasType() &&
+		    ((cur_type.id() != LogicalTypeId::INVALID && ci.GetScanType() != cur_type) ||
+		     (cur_type.id() == LogicalTypeId::INVALID && ci.GetScanType().id() != LogicalTypeId::VARIANT))) {
+			expr = "CAST(" + expr + " AS " + ci.GetScanType().ToString() + ")";
+		}
+		out_expr = std::move(expr);
+		out_leaf = std::move(leaf);
+		return true;
+	}
+
 	string OrderByToAliasedString(const BoundOrderByNode &order) const {
 		return expression_renderer.OrderByToAliasedString(order);
 	}
@@ -443,6 +563,18 @@ private:
 
 	static string QuantileArgument(const BoundAggregateExpression &aggregate) {
 		return LptsExpressionRenderer::QuantileArgument(aggregate);
+	}
+
+	// Render a table-function parameter Value as a re-parseable, type-faithful SQL literal by routing it
+	// through the constant renderer (so a typed NULL like `NULL::INT[]` becomes `CAST(NULL AS INTEGER[])`
+	// rather than a bare `NULL` that changes what the function does — e.g. test_vector_types(NULL::INT[])).
+	string RenderParameterValue(const Value &value) {
+		unique_ptr<Expression> constant = make_uniq<BoundConstantExpression>(value);
+		return ExpressionToAliasedString(constant);
+	}
+
+	static bool QuantileDesc(const BoundAggregateExpression &aggregate) {
+		return LptsExpressionRenderer::QuantileDesc(aggregate);
 	}
 
 	static string ApproxQuantileArgument(const BoundAggregateExpression &aggregate) {
@@ -646,6 +778,11 @@ private:
 			const LogicalDelimGet &dg = subtree->Cast<LogicalDelimGet>();
 			const idx_t dg_ti = dg.table_index;
 			vector<string> source_names;
+			// Two duplicate-eliminated correlation columns can share a source column name (e.g. a LATERAL
+			// referencing both x.q1 and y.q1), which would give the delim-get output header two columns
+			// both named t{dg_ti}_q1 — DuckDB then resolves join-condition references to the first, silently
+			// collapsing the correlation key. Dedup so each delim-get output column gets a distinct name.
+			CaseInsensitiveNameSet seen_delim_names;
 
 			for (size_t i = 0; i < dg.chunk_types.size(); i++) {
 				string col_name = "c" + std::to_string(i);
@@ -661,7 +798,8 @@ private:
 				}
 
 				source_names.push_back(source_col_name);
-				column_map[MappableColumnBinding(ColumnBinding(dg_ti, i))] = make_uniq<ColStruct>(dg_ti, col_name, "");
+				column_map[MappableColumnBinding(ColumnBinding(dg_ti, i))] =
+				    MakeDedupedColumn(dg_ti, col_name, "", seen_delim_names, i);
 			}
 
 			delim_get_source_col_names[dg_ti] = std::move(source_names);
@@ -703,6 +841,19 @@ private:
 			string catalog_name;
 			string schema_name;
 			string table_name;
+
+			// Meta/dynamic table functions cannot be faithfully reproduced as static SQL: `query()` /
+			// `query_table()` run a SQL string assembled at runtime, and `sniff_csv()` returns the result of
+			// CSV auto-detection. Fail explicitly (NotImplemented) rather than emit a query that silently
+			// reads/produces something different.
+			{
+				static const std::set<string> untranslatable_table_functions = {"query", "query_table", "sniff_csv"};
+				if (untranslatable_table_functions.count(StringUtil::Lower(get.function.name))) {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "table_function", get.function.name,
+					                        "LOGICAL_GET",
+					                        "meta/dynamic table function cannot be reproduced as static SQL");
+				}
+			}
 
 			LPTS_DEBUG_PRINT("[LPTS-AST] GET: function.name='" + get.function.name +
 			                 "' params=" + std::to_string(get.parameters.size()) +
@@ -760,7 +911,7 @@ private:
 						if (i > 0) {
 							func_str << ", ";
 						}
-						func_str << get.parameters[i].ToSQLString();
+						func_str << RenderParameterValue(get.parameters[i]);
 					}
 					func_str << ")";
 					table_name = func_str.str();
@@ -780,28 +931,93 @@ private:
 					// Table function without catalog entry (e.g. range(), read_csv())
 					std::ostringstream func_str;
 					func_str << get.function.name << "(";
-					if (!op->children.empty() && get.parameters.empty()) {
+					bool first_arg = true;
+					bool takes_table_argument = false;
+					for (const auto &arg_type : get.function.arguments) {
+						if (arg_type.id() == LogicalTypeId::TABLE) {
+							takes_table_argument = true;
+							break;
+						}
+					}
+					if (takes_table_argument && !op->children.empty()) {
+						// A TABLE-argument function (`summary((SELECT ...))`): the child subtree IS the
+						// argument. Emit a placeholder; GetNode::ToQuery substitutes the child CTE
+						// (`(SELECT * FROM <child>)`) instead of the comma-lateral form.
+						func_str << "%LPTS_TABLE_ARG%";
+						first_arg = false;
+					} else if (!op->children.empty() && get.parameters.empty()) {
 						const auto child_bindings = op->children[0]->GetColumnBindings();
 						idx_t arg_count = get.function.arguments.size();
 						if (arg_count > child_bindings.size()) {
 							arg_count = child_bindings.size();
 						}
 						for (idx_t i = 0; i < arg_count; i++) {
-							if (i > 0) {
+							if (!first_arg) {
 								func_str << ", ";
 							}
+							first_arg = false;
 							func_str
 							    << FindColumnBinding(child_bindings[i], "table function input")->ToUniqueColumnName();
 						}
 					} else {
 						for (size_t i = 0; i < get.parameters.size(); i++) {
-							if (i > 0) {
+							if (!first_arg) {
 								func_str << ", ";
 							}
-							func_str << get.parameters[i].ToSQLString();
+							first_arg = false;
+							func_str << RenderParameterValue(get.parameters[i]);
 						}
 					}
+					// hive_partitioning / filename add columns derived from the file *path* (partition keys,
+					// the source filename). LPTS reads back specific resolved files, so it cannot reproduce
+					// those path-derived columns — fail explicitly rather than emit a query that reads
+					// different columns.
+					for (const auto &named_param : get.named_parameters) {
+						const string lower_name = StringUtil::Lower(named_param.first);
+						if ((lower_name == "hive_partitioning" || lower_name == "filename") &&
+						    !named_param.second.IsNull() && named_param.second.GetValue<bool>()) {
+							ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "table_function_option",
+							                        named_param.first, "LOGICAL_GET",
+							                        "path-derived columns (hive partitioning / filename) cannot be "
+							                        "reproduced as static SQL");
+						}
+					}
+					// Named parameters (read_csv header=, types=, delim=, columns=, ...). Dropping these
+					// changes what the function reads (e.g. without header=0 the first row is treated as a
+					// header), so reproduce each as `name = <literal>` to round-trip faithfully.
+					//
+					// union_by_name MUST be preserved: it unifies differing per-file schemas into a superset
+					// (missing columns → NULL, structs widened), so the bound column TYPES depend on it.
+					// Dropping it makes read_parquet use only the first file's schema and coerce the rest,
+					// changing types/values. The positional `_tf(...)` alias below is built from the bound
+					// (union) output positions, so re-emitting union_by_name round-trips correctly.
+					//
+					// hive_partitioning must be preserved when explicitly FALSE: read_parquet auto-detects
+					// hive partitioning by default, so dropping `hive_partitioning=0` lets a path like
+					// `.../x=1/...` silently turn `x` into a path-derived column (different values). An
+					// explicit TRUE already failed above (path-derived columns are unreproducible), so only a
+					// FALSE reaches here and re-emitting it disables the auto-detection. filename / hive_types
+					// are path-derived (filename=TRUE failed above; a stray FALSE / hive_types alongside
+					// hive_partitioning=FALSE is inert) — keep skipping them.
+					static const std::set<string> structural_table_function_params = {"filename", "hive_types",
+					                                                                  "hive_types_autocast"};
+					for (const auto &named_param : get.named_parameters) {
+						if (structural_table_function_params.count(StringUtil::Lower(named_param.first))) {
+							continue;
+						}
+						if (!first_arg) {
+							func_str << ", ";
+						}
+						first_arg = false;
+						func_str << named_param.first << " = " << named_param.second.ToSQLString();
+					}
 					func_str << ")";
+					// `range(x) WITH ORDINALITY AS t(v, o)`: the ordinality column is part of the scan's
+					// output (get.ordinality_idx) but not of the function's own schema — the modifier must
+					// be re-emitted or the `_tf(...)` alias has one name too many.
+					if (get.ordinality_idx.IsValid()) {
+						func_str << " WITH ORDINALITY";
+					}
 					table_name = func_str.str();
 				}
 			}
@@ -809,11 +1025,17 @@ private:
 			vector<string> column_names;
 			vector<string> cte_column_names;
 			vector<string> table_filters;
+			// Parallel to column_names: true where the entry is a struct field-extraction expression.
+			vector<bool> column_is_expr;
 
 			const vector<ColumnBinding> col_binds = op->GetColumnBindings();
 			const auto col_ids = get.GetColumnIds();
-			const idx_t table_function_output_count =
-			    (!op->children.empty() && catalog_entry == nullptr) ? col_ids.size() : DConstants::INVALID_INDEX;
+			// For an in-out (lateral) scan, only the function's OWN outputs (get.names, incl. a WITH
+			// ORDINALITY column) belong in the `_tf(...)` alias — col_ids can additionally carry
+			// passthrough entries for the correlated child columns.
+			const idx_t table_function_output_count = (!op->children.empty() && catalog_entry == nullptr)
+			                                              ? std::min<idx_t>(col_ids.size(), get.names.size())
+			                                              : DConstants::INVALID_INDEX;
 
 			LPTS_DEBUG_PRINT("[LPTS-AST] GET: col_binds=" + std::to_string(col_binds.size()) + " col_ids=" +
 			                 std::to_string(col_ids.size()) + " names=" + std::to_string(get.names.size()));
@@ -824,14 +1046,39 @@ private:
 			}
 
 			idx_t table_function_passthrough_idx = 0;
+			// True while every projected column is a real, named output column of the source (no virtual
+			// or passthrough/rowid columns). When true we can build a correct output-ordered `_tf(...)`
+			// alias for a table function. native_out_positions[i] is the function-output (file) position of
+			// the i-th projected column.
+			bool all_columns_native = true;
+			vector<idx_t> native_out_positions;
+			// Unique CTE column names already emitted by this scan, so struct field-extraction columns
+			// (which alias to the leaf field name) don't collide — e.g. SELECT s.x.a, s.x.a, or two fields
+			// whose leaf names match a plain column.
+			CaseInsensitiveNameSet seen_cte_names;
 			for (size_t i = 0; i < col_binds.size(); ++i) {
 				const ColumnBinding &cb = col_binds[i];
+				// An in-out (lateral) scan's PASSTHROUGH columns (`projected_input`) are the CHILD's own
+				// bindings, appended verbatim after the function's outputs (LogicalGet::GetColumnBindings)
+				// — recognizable by their foreign table_index. They are already registered in column_map by
+				// the child; just select them under their existing name.
+				if (cb.table_index != get.table_index) {
+					all_columns_native = false;
+					auto &src = FindColumnBinding(cb, "table function passthrough");
+					const string passthrough_name = src->ToUniqueColumnName();
+					column_names.push_back(passthrough_name);
+					column_is_expr.push_back(false);
+					cte_column_names.push_back(passthrough_name);
+					table_function_passthrough_idx++;
+					continue;
+				}
 				// The binding's column_index tells us which entry in col_ids
 				// this output column corresponds to. When projection_ids is set
 				// (optimizer removed unused columns), the binding index may
 				// differ from the loop index.
 				const idx_t col_id_idx = cb.column_index;
 				if (col_id_idx >= col_ids.size()) {
+					all_columns_native = false;
 					string col_name = "rowid";
 					string cte_col_name = "rowid";
 					if (!op->children.empty() && get.parameters.empty()) {
@@ -846,12 +1093,30 @@ private:
 					table_function_passthrough_idx++;
 					auto col_struct = make_uniq<ColStruct>(table_index, cte_col_name, "");
 					column_names.push_back(col_name);
+					column_is_expr.push_back(false);
 					cte_column_names.push_back(col_struct->ToUniqueColumnName());
 					column_map[MappableColumnBinding(cb)] = std::move(col_struct);
 					continue;
 				}
 				string col_name;
+				string col_alias; // non-empty only for struct field-extraction columns (the leaf field name)
 				if (col_ids[col_id_idx].IsVirtualColumn()) {
+					all_columns_native = false;
+					const idx_t virtual_id = col_ids[col_id_idx].GetPrimaryIndex();
+					// The multi-file reader's path/reader-derived virtual columns (filename, file_row_number,
+					// file_index) are materialized from the file path / scan position. LPTS reads back specific
+					// resolved files as a plain scan, so it cannot reproduce them (it would alias a real data
+					// column under the virtual name and read the wrong values) — refuse rather than emit WRONG.
+					if (virtual_id == MultiFileReader::COLUMN_IDENTIFIER_FILENAME ||
+					    virtual_id == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER ||
+					    virtual_id == MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
+						auto vit = get.virtual_columns.find(virtual_id);
+						ThrowLptsNotImplemented(
+						    "LPTS_UNSUPPORTED_VIRTUAL_COLUMN", dialect, "virtual_column",
+						    vit != get.virtual_columns.end() ? vit->second.name : "filename", "LOGICAL_GET",
+						    "path/reader-derived virtual columns (filename / file_row_number / file_index) "
+						    "cannot be reproduced as static SQL");
+					}
 					// Virtual columns (snapshot_id, rowid, etc.) — look up in virtual_columns map
 					auto vit = get.virtual_columns.find(col_ids[col_id_idx].GetPrimaryIndex());
 					col_name = (vit != get.virtual_columns.end()) ? vit->second.name : "";
@@ -860,10 +1125,57 @@ private:
 					}
 				} else {
 					const idx_t idx = col_ids[col_id_idx].GetPrimaryIndex();
-					col_name = get.names[idx];
+					const ColumnIndex &ci = col_ids[col_id_idx];
+					string extract_expr;
+					string extract_leaf;
+					const LogicalType &base_type = (idx < get.returned_types.size())
+					                                   ? get.returned_types[idx]
+					                                   : LogicalType(LogicalTypeId::INVALID);
+					// Only when the extraction REPLACES the scan output (IsPushdownExtract). A ColumnIndex can
+					// also carry children as struct-field PRUNING info while the scan still emits the whole
+					// struct — the expressions above then re-extract, so the scan must render the base column.
+					if (ci.HasChildren() && ci.IsPushdownExtract() &&
+					    RenderStructExtractPath(get.names[idx], base_type, ci, extract_expr, extract_leaf)) {
+						// DuckDB pushed a struct field access into the scan: emit struct_extract(...) and alias
+						// to the leaf field name. Not a plain native column, so it can't feed the `_tf` alias.
+						// A table function (read_parquet/read_csv/...) exposes its columns only through that
+						// `_tf(...)` alias, so the base column referenced inside struct_extract would be
+						// unresolved — refuse rather than emit a query that reads the wrong column.
+						if (catalog_entry == nullptr) {
+							ThrowLptsNotImplemented(
+							    "LPTS_STRUCT_EXTRACT_PUSHDOWN", dialect, "expression", "struct field extraction",
+							    "LOGICAL_GET",
+							    "struct field-extraction pushdown over a table function is not implemented "
+							    "(the base column is only reachable via the _tf(...) alias)");
+						}
+						all_columns_native = false;
+						col_name = std::move(extract_expr);
+						col_alias = std::move(extract_leaf);
+					} else {
+						col_name = get.names[idx];
+						native_out_positions.push_back(idx);
+					}
 				}
-				auto col_struct = make_uniq<ColStruct>(table_index, col_name, "");
+				unique_ptr<ColStruct> col_struct;
+				if (!col_alias.empty()) {
+					col_struct = MakeDedupedColumn(table_index, col_name, col_alias, seen_cte_names, 1);
+				} else {
+					// Plain native column. Distinct source columns can still collide as CTE identifiers when
+					// their names sanitize to the same fragment (e.g. different unicode column names all
+					// reduce to "_____"). Keep the real name in the SELECT body (column_name) but give a
+					// colliding column a distinct alias so the CTE column list stays unambiguous.
+					col_struct = make_uniq<ColStruct>(table_index, col_name, "");
+					if (seen_cte_names.count(col_struct->ToUniqueColumnName())) {
+						idx_t suffix = i;
+						do {
+							col_struct =
+							    make_uniq<ColStruct>(table_index, col_name, col_name + "_" + std::to_string(suffix++));
+						} while (seen_cte_names.count(col_struct->ToUniqueColumnName()));
+					}
+					seen_cte_names.insert(col_struct->ToUniqueColumnName());
+				}
 				column_names.push_back(col_name);
+				column_is_expr.push_back(!col_alias.empty());
 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
 				column_map[MappableColumnBinding(cb)] = std::move(col_struct);
 			}
@@ -874,25 +1186,91 @@ private:
 			if (column_names.empty()) {
 				column_names.clear();
 				cte_column_names.clear();
+				column_is_expr.clear();
 				column_names.push_back("1");
+				column_is_expr.push_back(false);
 				cte_column_names.push_back("t" + std::to_string(table_index) + "_dummy");
 			}
 
 			// Pushdown table filters (rare, but present in some plans).
 			if (!get.table_filters.filters.empty()) {
 				for (auto &entry : get.table_filters.filters) {
+					// A filter can target a VIRTUAL column (e.g. `WHERE rowid = 0`): its key is the virtual
+					// column id, not an index into get.names. Resolve via virtual_columns — `rowid` in a WHERE
+					// over the same base table is faithful.
+					string filter_col_name;
+					if (entry.first < get.names.size()) {
+						filter_col_name = get.names[entry.first];
+					} else {
+						auto vit = get.virtual_columns.find(entry.first);
+						filter_col_name = (vit != get.virtual_columns.end()) ? vit->second.name : "rowid";
+					}
 					string filter_str;
-					if (!TableFilterToSql(*entry.second, DialectQuoteIdent(get.names[entry.first], dialect),
-					                      filter_str)) {
+					if (!TableFilterToSql(*entry.second, DialectQuoteIdent(filter_col_name, dialect), filter_str)) {
 						continue;
 					}
 					table_filters.push_back(std::move(filter_str));
 				}
 			}
 
-			return make_uniq<AstGetNode>(catalog_name, schema_name, table_name, table_index, std::move(column_names),
-			                             std::move(cte_column_names), std::move(table_filters),
-			                             table_function_output_count);
+			// Hive-partition / complex file-pruning filters (e.g. `WHERE key='a'` on a partition column) are
+			// consumed during scanning and dropped from the structured plan — the predicate survives only as
+			// a display string in extra_info.file_filters, built from the filter's ToString(). Re-apply it as
+			// a scan filter so the pruning is reproduced (LPTS reads all files then filters — same result set;
+			// the partition column is re-exposed by auto-detected hive partitioning). Multiple pruned filters
+			// are concatenated with no separator (see HivePartitioning::ApplyFiltersToFileList), so only
+			// re-apply a single, well-formed parenthesized predicate — otherwise leave it (round-trip check
+			// will surface the drop). NULL-value partitions render as the string 'NULL'; equality still holds.
+			const string &file_filters = get.extra_info.file_filters;
+			if (!file_filters.empty() && file_filters.front() == '(') {
+				int depth = 0;
+				size_t first_group_end = string::npos;
+				for (size_t i = 0; i < file_filters.size(); i++) {
+					if (file_filters[i] == '(') {
+						depth++;
+					} else if (file_filters[i] == ')' && --depth == 0) {
+						first_group_end = i;
+						break;
+					}
+				}
+				if (first_group_end == file_filters.size() - 1) {
+					table_filters.push_back(file_filters);
+				}
+			}
+
+			// For a catalog-less table function whose columns are all real outputs, build the `_tf(...)`
+			// alias in the function's OUTPUT order: alias[out_pos] = the projected column's name. The SELECT
+			// references the names (projected order); placing each at its output position makes the
+			// positional alias correct even when projection pushdown reordered or subset the columns
+			// (otherwise a `WHERE` on a non-first column scrambles which name maps to which physical column).
+			vector<string> table_function_alias;
+			if (catalog_entry == nullptr && op->children.empty() && all_columns_native &&
+			    table_name.find('(') != string::npos && native_out_positions.size() == column_names.size()) {
+				// Name EVERY output position with its real bound name (an identity rename): positions and
+				// names then stay correct for projected columns, filter-only columns, and columns the
+				// re-executed function derives itself (e.g. auto-detected hive partition keys — a partial
+				// alias with placeholders can collide with those or scramble their positions). Projected
+				// positions keep the (possibly aliased) projected name.
+				table_function_alias = get.names;
+				for (size_t i = 0; i < column_names.size(); i++) {
+					if (native_out_positions[i] < table_function_alias.size()) {
+						table_function_alias[native_out_positions[i]] = column_names[i];
+					}
+				}
+			}
+			auto get_node = make_uniq<AstGetNode>(catalog_name, schema_name, table_name, table_index,
+			                                      std::move(column_names), std::move(cte_column_names),
+			                                      std::move(table_filters), table_function_output_count);
+			get_node->table_function_alias = std::move(table_function_alias);
+			// Only carry the flags when at least one column is a struct-extract expression; an all-false
+			// vector is equivalent to "empty" and the renderers treat empty as all plain identifiers.
+			for (auto is_expr : column_is_expr) {
+				if (is_expr) {
+					get_node->column_is_expression = std::move(column_is_expr);
+					break;
+				}
+			}
+			return get_node;
 		}
 
 		//----------------------------------------------------------------------
@@ -914,7 +1292,7 @@ private:
 
 			vector<string> expressions;
 			vector<string> cte_column_names;
-			unordered_set<string> seen_names;
+			CaseInsensitiveNameSet seen_names;
 
 			for (const ColumnBinding &binding : window.children[0]->GetColumnBindings()) {
 				const unique_ptr<ColStruct> &src = FindColumnBinding(binding, "window child output");
@@ -1010,7 +1388,7 @@ private:
 
 			vector<string> expressions;
 			vector<string> cte_column_names;
-			unordered_set<string> seen_names;
+			CaseInsensitiveNameSet seen_names;
 
 			for (size_t i = 0; i < proj.expressions.size(); ++i) {
 				const unique_ptr<Expression> &expr = proj.expressions[i];
@@ -1095,7 +1473,11 @@ private:
 			vector<string> expressions;
 			vector<string> cte_column_names;
 
-			if (unnest.children[0]->type != LogicalOperatorType::LOGICAL_DUMMY_SCAN) {
+			// Pass the child's columns through unconditionally: a recursive-UNNEST chain stacks one
+			// LOGICAL_UNNEST per level (each its own CTE — see the fusion boundary below), and the next
+			// level's passthrough references THIS level's passthrough columns — including the dummy-scan
+			// column for an UNNEST over a constant.
+			{
 				auto child_bindings = unnest.children[0]->GetColumnBindings();
 				for (auto &binding : child_bindings) {
 					auto &src = FindColumnBinding(binding, "unnest");
@@ -1112,7 +1494,11 @@ private:
 				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
 			}
 
-			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index);
+			// Mark as a fusion boundary (like window projections): recursive UNNEST plans stack one
+			// LOGICAL_UNNEST per level, and fusing two levels into one SELECT would substitute one
+			// UNNEST(...) inside another — "Nested UNNEST calls are not supported".
+			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index,
+			                                 /*is_window=*/true);
 		}
 
 		//----------------------------------------------------------------------
@@ -1123,7 +1509,7 @@ private:
 			vector<string> group_names;
 			vector<string> agg_expressions;
 			vector<string> cte_column_names;
-			unordered_set<string> seen_names;
+			CaseInsensitiveNameSet seen_names;
 
 			// GROUP BY columns
 			for (size_t i = 0; i < agg.groups.size(); ++i) {
@@ -1131,15 +1517,36 @@ private:
 				if (!op->children.empty()) {
 					RegisterChildBindingFallbacks(*g, op->children[0]->GetColumnBindings());
 				}
+				// Grouping by a bare constant is a decorrelation artifact (e.g. lateral GROUPING SETS over a
+				// correlated `SELECT 1, 2 ...`, where the projected constants become group keys). It renders
+				// as `GROUP BY 2`, which SQL re-reads as an ordinal (2nd select column) — a different grouping.
+				// Refuse rather than emit that.
+				if (g->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_GROUP_BY", dialect, "group_by", "constant",
+					                        "LOGICAL_AGGREGATE_AND_GROUP_BY",
+					                        "grouping by a constant (a correlated/lateral grouping-sets "
+					                        "decorrelation artifact) cannot be reproduced as static SQL");
+				}
 				if (g->type == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
 					auto it = column_map.find(MappableColumnBinding(bcr.binding));
 					if (it == column_map.end()) {
-						throw NotImplementedException(
-						    "LPTS: GROUP BY column ref (%llu,%llu) is not implemented because it is not in column_map",
-						    (unsigned long long)bcr.binding.table_index, (unsigned long long)bcr.binding.column_index);
+						throw NotImplementedException("LPTS_UNSUPPORTED_GROUP_BY: column ref (%llu,%llu) is not "
+						                              "implemented because it is not in column_map",
+						                              (unsigned long long)bcr.binding.table_index,
+						                              (unsigned long long)bcr.binding.column_index);
 					}
 					const unique_ptr<ColStruct> &desc = it->second;
+					// A group key whose underlying column is an inlined constant (rendered as a bare integer,
+					// e.g. a lateral grouping-sets artifact) would, after CTE de-prefixing, appear as a bare
+					// integer in GROUP BY and be re-read as an ordinal. Refuse.
+					if (agg.grouping_sets.size() > 1 && !desc->column_name.empty() &&
+					    desc->column_name.find_first_not_of("0123456789") == string::npos) {
+						ThrowLptsNotImplemented("LPTS_UNSUPPORTED_GROUP_BY", dialect, "grouping_sets",
+						                        desc->column_name, "LOGICAL_AGGREGATE_AND_GROUP_BY",
+						                        "a grouping-set key over an inlined constant would be misread as "
+						                        "an ordinal position and cannot be reproduced");
+					}
 					group_names.push_back(desc->ToUniqueColumnName());
 					auto new_col = MakeDedupedColumn(group_table_index, desc->column_name, desc->alias, seen_names, i);
 					cte_column_names.push_back(new_col->ToUniqueColumnName());
@@ -1171,6 +1578,17 @@ private:
 				if (agg_name == "sum_no_overflow") {
 					agg_name = "sum";
 				}
+				// `SUM(x) EXPORT_STATE` binds to an internal "aggregate_state_export_sum" — the internal name
+				// is not callable; re-emit the base aggregate with the EXPORT_STATE modifier.
+				static const string kExportStatePrefix = "aggregate_state_export_";
+				const bool is_export_state = agg_name.rfind(kExportStatePrefix, 0) == 0;
+				if (is_export_state) {
+					agg_name = agg_name.substr(kExportStatePrefix.size());
+					// Parenthesized so the modifier survives any surrounding context (function argument
+					// lists, casts): `combine(sum(d) EXPORT_STATE, ...)` does not parse, `(sum(d)
+					// EXPORT_STATE)` does.
+					agg_str << "(";
+				}
 				agg_str << agg_name << "(";
 				if (ba.IsDistinct()) {
 					agg_str << "DISTINCT ";
@@ -1198,6 +1616,13 @@ private:
 					}
 				} else if (IsQuantileAggregate(agg_name) && child_exprs.size() == 1 && ba.bind_info) {
 					agg_str << ", " << QuantileArgument(ba);
+					// A descending quantile (`WITHIN GROUP (ORDER BY x DESC)`, or a negative quantile which
+					// DuckDB normalizes to abs(p) + desc) must keep its direction, else the bare
+					// quantile_cont(x, p) computes from the wrong end. DuckDB accepts the in-aggregate
+					// `ORDER BY` form: quantile_cont(x, p ORDER BY x DESC).
+					if (QuantileDesc(ba)) {
+						agg_str << " ORDER BY " << child_exprs[0] << " DESC";
+					}
 				} else if (agg_name == "approx_quantile" && child_exprs.size() == 1 && ba.bind_info) {
 					agg_str << ", " << ApproxQuantileArgument(ba);
 				} else if (agg_name == "reservoir_quantile" && child_exprs.size() == 1 && ba.bind_info) {
@@ -1232,6 +1657,9 @@ private:
 					}
 				}
 				agg_str << ")";
+				if (is_export_state) {
+					agg_str << " EXPORT_STATE)";
+				}
 				// Preserve FILTER (WHERE predicate) clause. Without this, a view query
 				// with `COUNT(*) FILTER (WHERE x > 0)` round-trips to `count_star()`,
 				// silently producing a total row count instead of a conditional count.
@@ -1268,7 +1696,7 @@ private:
 				vector<string> grouping_args;
 				for (idx_t group_idx : agg.grouping_functions[i]) {
 					if (group_idx >= group_names.size()) {
-						throw NotImplementedException("LPTS: GROUPING argument index %llu is out of range",
+						throw NotImplementedException("LPTS_UNSUPPORTED_GROUPING: argument index %llu is out of range",
 						                              (unsigned long long)group_idx);
 					}
 					grouping_args.push_back(group_names[group_idx]);
@@ -1303,6 +1731,36 @@ private:
 				const auto &new_col = FindColumnBinding(new_cb, "aggregate remap");
 				column_map[MappableColumnBinding(bcr.binding)] =
 				    make_uniq<ColStruct>(new_col->table_index, new_col->column_name, new_col->alias);
+			}
+
+			// Duplicate grouping columns + multiple grouping sets (CUBE/ROLLUP/GROUPING SETS) are not
+			// faithfully reproducible. DuckDB's duplicate-group optimizer collapses equal group keys (e.g.
+			// `col3` = `col1` from a join condition) to the same expression, so two grouping *dimensions*
+			// render to the same column name. SQL grouping sets reference columns by name, so the two
+			// collapsed dimensions become indistinguishable — a set that includes one but not the other can
+			// no longer be expressed, and the super-aggregate NULLs land on the wrong column. Refuse rather
+			// than emit a plausible-but-wrong result. (A single grouping set — plain GROUP BY — is fine:
+			// every dimension is always present, so a duplicate column just groups redundantly.)
+			if (agg.grouping_sets.size() > 1) {
+				std::set<string> seen_group_names;
+				for (const string &gn : group_names) {
+					if (!seen_group_names.insert(gn).second) {
+						ThrowLptsNotImplemented(
+						    "LPTS_DUPLICATE_GROUPING_SET_COLUMN", dialect, "grouping_sets", gn,
+						    "LOGICAL_AGGREGATE_AND_GROUP_BY",
+						    "duplicate grouping columns across multiple grouping sets (from the duplicate-group "
+						    "optimizer collapsing equal join keys) cannot be reproduced as static SQL");
+					}
+					// A group key that renders as a bare integer (e.g. a correlated/lateral grouping-sets
+					// artifact where a projected constant became a group key) is re-read by SQL as an ordinal
+					// (`GROUP BY 2` = 2nd select column), a different grouping. Refuse.
+					if (!gn.empty() && gn.find_first_not_of("0123456789") == string::npos) {
+						ThrowLptsNotImplemented("LPTS_UNSUPPORTED_GROUP_BY", dialect, "grouping_sets", gn,
+						                        "LOGICAL_AGGREGATE_AND_GROUP_BY",
+						                        "a grouping-set key that renders as a bare integer would be "
+						                        "misread as an ordinal position and cannot be reproduced");
+					}
+				}
 			}
 
 			string group_by_clause = GroupingSetsToClause(group_names, agg.grouping_sets);
@@ -1368,8 +1826,22 @@ private:
 				}
 				LPTS_DEBUG_PRINT("[LPTS-AST] MARK join: converting to LEFT join, mark_expr='" + mark_expr + "'");
 			}
-			return make_uniq<AstJoinNode>(sql_join_type, std::move(conditions), std::move(cte_column_names),
-			                              std::move(mark_expr), is_asof);
+			auto join_node = make_uniq<AstJoinNode>(sql_join_type, std::move(conditions), std::move(cte_column_names),
+			                                        std::move(mark_expr), is_asof);
+			// IN/ANY/ALL mark joins need a 3-valued mark (NULL when the membership comparison is
+			// indeterminate). A mark join's conditions split into null-safe correlation keys
+			// (`IS NOT DISTINCT FROM`, the decorrelated outer↔subquery link) and the NULL-propagating
+			// membership comparison (`=`, `<`, ...). When there is exactly one comparison condition, capture
+			// its key expressions plus the rendered correlation conditions so the renderer can build the
+			// 3-valued mark: indeterminate iff a correlated row exists where a comparison operand is NULL.
+			// (EXISTS subqueries are 2-valued and have no NULL-propagating comparison → keys left empty.)
+			if (join_op.join_type == JoinType::MARK) {
+				ExtractMarkComparison(join_op.conditions, join_node->mark_lhs_key, join_node->mark_rhs_key,
+				                      join_node->mark_correlation_conditions, join_node->mark_membership_conditions,
+				                      join_node->mark_membership_comparisons, join_node->mark_membership_lhs,
+				                      join_node->mark_membership_rhs, join_node->mark_join_has_equality);
+			}
+			return join_node;
 		}
 
 		//----------------------------------------------------------------------
@@ -1428,12 +1900,16 @@ private:
 			const LogicalSetOperation &set_op = op->Cast<LogicalSetOperation>();
 			const idx_t table_index = set_op.table_index;
 			vector<string> cte_column_names;
-			unordered_set<string> seen_names;
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &union_bindings = op->GetColumnBindings();
+			// Two union output columns can derive from source columns with the same name (e.g.
+			// SELECT t1.a, t2.a ... UNION ...), which would emit a header like (t7_a, t7_a) — DuckDB
+			// resolves later references to the first, silently dropping the second column. Dedup so each
+			// output column gets a distinct generated name.
+			CaseInsensitiveNameSet seen_names;
 			for (size_t i = 0; i < lhs_bindings.size(); ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "union lhs");
-				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, i);
+				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, 1);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());
 				column_map[MappableColumnBinding(union_bindings[i])] = std::move(new_col);
 			}
@@ -1445,16 +1921,18 @@ private:
 			const LogicalSetOperation &set_op = op->Cast<LogicalSetOperation>();
 			const idx_t table_index = set_op.table_index;
 			vector<string> cte_column_names;
-			unordered_set<string> seen_names;
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &setop_bindings = op->GetColumnBindings();
 			if (lhs_bindings.size() < setop_bindings.size()) {
 				throw InternalException(
 				    "LPTS set operation: left child exposes fewer columns than set operation output");
 			}
+			// Dedup output column names (see LOGICAL_UNION): a header like (t6_c0, t6_c0) makes the second
+			// column unreferenceable, so EXCEPT/INTERSECT would silently drop it.
+			CaseInsensitiveNameSet seen_names;
 			for (size_t i = 0; i < setop_bindings.size(); ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "setop lhs");
-				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, i);
+				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, 1);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());
 				column_map[MappableColumnBinding(setop_bindings[i])] = std::move(new_col);
 			}
@@ -1522,8 +2000,27 @@ private:
 		//----------------------------------------------------------------------
 		case LogicalOperatorType::LOGICAL_DISTINCT: {
 			// LogicalDistinct passes bindings unchanged from child.
+			const LogicalDistinct &distinct_op = op->Cast<LogicalDistinct>();
 			vector<string> cte_column_names = OutputColumnNames(*op, "distinct output");
-			return make_uniq<AstDistinctNode>(std::move(cte_column_names));
+			const idx_t output_column_count = cte_column_names.size();
+			auto distinct_node = make_uniq<AstDistinctNode>(std::move(cte_column_names));
+			// When the dedup key (distinct_targets) is a PROPER SUBSET of the output columns, plain
+			// SELECT DISTINCT would dedup on too many columns. This covers `DISTINCT ON (targets)` and
+			// `SELECT DISTINCT a ... ORDER BY b` (DuckDB dedups on `a` but carries `b` for the ORDER BY).
+			// Render it as a row_number() filter partitioned by the targets. When targets are empty or
+			// cover all output columns, a plain SELECT DISTINCT is correct (and more readable).
+			if (!distinct_op.distinct_targets.empty() && distinct_op.distinct_targets.size() < output_column_count) {
+				distinct_node->is_distinct_on = true;
+				for (const unique_ptr<Expression> &target : distinct_op.distinct_targets) {
+					distinct_node->distinct_on_targets.push_back(ExpressionToAliasedString(target));
+				}
+				if (distinct_op.order_by) {
+					for (const BoundOrderByNode &order : distinct_op.order_by->orders) {
+						distinct_node->distinct_on_orders.push_back(OrderByToAliasedString(order));
+					}
+				}
+			}
+			return distinct_node;
 		}
 
 		//----------------------------------------------------------------------
@@ -1541,8 +2038,11 @@ private:
 			const idx_t table_index = dummy.table_index;
 			vector<string> column_names = {"1"};
 			vector<string> cte_column_names = {"t" + std::to_string(table_index) + "_dummy"};
+			// The registered name must match the CTE header ("t{ti}_dummy"), or any operator that passes the
+			// dummy binding through (e.g. an uncorrelated mark join's output list) renders "t{ti}_1" — a
+			// column the CTE never defines.
 			column_map[MappableColumnBinding(ColumnBinding(table_index, 0))] =
-			    make_uniq<ColStruct>(table_index, "1", "");
+			    make_uniq<ColStruct>(table_index, "dummy", "");
 			return make_uniq<AstGetNode>("", "", "(SELECT 1)", table_index, std::move(column_names),
 			                             std::move(cte_column_names), vector<string>());
 		}
@@ -1661,6 +2161,14 @@ private:
 			// CTE_REF is a scan of a materialized CTE body (used when a WITH clause CTE
 			// is referenced more than once). The actual body CTE name is resolved in Phase 2.
 			const LogicalCTERef &cte_ref = op->Cast<LogicalCTERef>();
+			// A reference to the *recurring* table of a USING KEY recursive CTE (e.g. `recurring.fail`) reads
+			// the iteration's latest-row-per-key snapshot — LPTS has no CTE it can point that at. Refuse.
+			if (cte_ref.is_recurring) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_RECURSIVE_CTE", dialect, "recursive_cte",
+				                        "recurring table reference", "LOGICAL_CTE_REF",
+				                        "a reference to a USING KEY recursive CTE's recurring table cannot be "
+				                        "reproduced as static SQL");
+			}
 			const idx_t table_index = cte_ref.table_index;
 			const idx_t cte_index = cte_ref.cte_index;
 
@@ -1670,12 +2178,15 @@ private:
 			// Register output columns using the materialized body's actual output names when available.
 			// DuckDB can prune the body to the columns referenced by the outer query, while bound_columns
 			// still lists the original CTE aliases. Parent bindings are reindexed to the pruned body order.
+			// Dedup either way: a CTE can expose the same column name twice (e.g. a recursive CTE whose
+			// anchor projects one source column into two outputs) — distinct outputs need distinct names.
 			vector<string> cte_column_names;
+			CaseInsensitiveNameSet seen_ref_names;
 			auto body_cols_it = materialized_cte_body_column_names.find(cte_index);
 			if (body_cols_it != materialized_cte_body_column_names.end()) {
 				for (idx_t i = 0; i < body_cols_it->second.size(); i++) {
 					string col_name = StripTablePrefix(body_cols_it->second[i]);
-					auto col_struct = make_uniq<ColStruct>(table_index, std::move(col_name), "");
+					auto col_struct = MakeDedupedColumn(table_index, std::move(col_name), "", seen_ref_names, i);
 					cte_column_names.push_back(col_struct->ToUniqueColumnName());
 					column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
 				}
@@ -1684,7 +2195,7 @@ private:
 
 			for (idx_t i = 0; i < cte_ref.bound_columns.size(); ++i) {
 				const string &col_name = cte_ref.bound_columns[i];
-				auto col_struct = make_uniq<ColStruct>(table_index, col_name, "");
+				auto col_struct = MakeDedupedColumn(table_index, col_name, "", seen_ref_names, i);
 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
 				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
 			}
@@ -1720,9 +2231,10 @@ private:
 				if (it != column_map.end()) {
 					cte_column_names.push_back(it->second->ToUniqueColumnName());
 				} else {
-					throw NotImplementedException("LPTS: DELIM_GET column (%llu,%llu) is not implemented because "
-					                              "it was not pre-registered by its parent DELIM_JOIN",
-					                              (unsigned long long)table_index, (unsigned long long)i);
+					throw NotImplementedException(
+					    "LPTS_UNSUPPORTED_DELIM_GET: column (%llu,%llu) is not implemented because "
+					    "it was not pre-registered by its parent DELIM_JOIN",
+					    (unsigned long long)table_index, (unsigned long long)i);
 				}
 			}
 
@@ -1731,9 +2243,10 @@ private:
 			if (src_it != delim_get_source_col_names.end()) {
 				source_col_names = src_it->second;
 			} else {
-				throw NotImplementedException("LPTS: DELIM_GET table_index %llu is not implemented because its "
-				                              "source columns were not registered by its parent DELIM_JOIN",
-				                              (unsigned long long)table_index);
+				throw NotImplementedException(
+				    "LPTS_UNSUPPORTED_DELIM_GET: table_index %llu is not implemented because its "
+				    "source columns were not registered by its parent DELIM_JOIN",
+				    (unsigned long long)table_index);
 			}
 
 			return make_uniq<AstDelimGetNode>(table_index, std::move(cte_column_names), std::move(source_col_names));
@@ -1767,6 +2280,23 @@ private:
 			// Use "true" as the mark expression — the right CTE already contains only
 			// matching rows (via SELECT DISTINCT from the outer CTE), so any left row
 			// that appears in the RIGHT CTE is a match, and IS NOT NULL holds.
+			// For a decorrelated IN/ANY/ALL mark, capture the membership comparison's operands and the
+			// null-safe correlation keys so the JoinNode renderer can emit a 3-valued mark (NULL when the
+			// comparison is indeterminate). Empty for a 2-valued (EXISTS) mark.
+			string mark_lhs_key;
+			string mark_rhs_key;
+			vector<string> mark_correlation_conditions;
+			vector<string> mark_membership_conditions;
+			vector<string> mark_membership_comparisons;
+			vector<string> mark_membership_lhs;
+			vector<string> mark_membership_rhs;
+			bool mark_join_has_equality = false;
+			if (dj.join_type == JoinType::MARK) {
+				ExtractMarkComparison(dj.conditions, mark_lhs_key, mark_rhs_key, mark_correlation_conditions,
+				                      mark_membership_conditions, mark_membership_comparisons, mark_membership_lhs,
+				                      mark_membership_rhs, mark_join_has_equality);
+			}
+
 			if (dj.join_type == JoinType::MARK) {
 				ColumnBinding mark_cb(dj.mark_index, 0);
 				string mark_expr = "true";
@@ -1846,7 +2376,10 @@ private:
 					mark_col_expr = it->second->column_name; // the IS NOT NULL expression
 				}
 			} else if (sql_join_type == JoinType::SINGLE) {
-				sql_join_type = JoinType::LEFT;
+				// Keep SINGLE (do not flatten to LEFT here): a scalar subquery must yield at most one row
+				// per outer row, but the decorrelated RHS can carry duplicate rows per correlation key
+				// (a non-aggregated subquery over a multi-row table). JoinNode renders SINGLE as a LEFT join
+				// but deduplicates the RHS, so the outer row is not multiplied.
 			} else if (sql_join_type == JoinType::RIGHT_SEMI) {
 				// delim_flipped=1: outer was physical-right, now normalized to SQL-left.
 				sql_join_type = JoinType::SEMI;
@@ -1863,8 +2396,18 @@ private:
 				}
 			}
 
-			return make_uniq<AstDelimJoinNode>(sql_join_type, std::move(conditions), std::move(cte_column_names),
-			                                   std::move(delim_tis), std::move(mark_col_expr));
+			auto delim_join_node =
+			    make_uniq<AstDelimJoinNode>(sql_join_type, std::move(conditions), std::move(cte_column_names),
+			                                std::move(delim_tis), std::move(mark_col_expr));
+			delim_join_node->mark_lhs_key = std::move(mark_lhs_key);
+			delim_join_node->mark_rhs_key = std::move(mark_rhs_key);
+			delim_join_node->mark_correlation_conditions = std::move(mark_correlation_conditions);
+			delim_join_node->mark_membership_conditions = std::move(mark_membership_conditions);
+			delim_join_node->mark_membership_comparisons = std::move(mark_membership_comparisons);
+			delim_join_node->mark_membership_lhs = std::move(mark_membership_lhs);
+			delim_join_node->mark_membership_rhs = std::move(mark_membership_rhs);
+			delim_join_node->mark_join_has_equality = mark_join_has_equality;
+			return delim_join_node;
 		}
 
 		case LogicalOperatorType::LOGICAL_PIVOT:
@@ -1929,6 +2472,14 @@ private:
 			child_nodes[1] = RecursiveTraversal(op->children[1]);
 		} else if (op->type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
 			const LogicalRecursiveCTE &rec_cte = op->Cast<LogicalRecursiveCTE>();
+			// `WITH RECURSIVE cte(...) USING KEY (...)` keeps only the latest row per key across iterations —
+			// distinct from the plain UNION [ALL] recursion LPTS emits, so the row set diverges. Refuse.
+			if (!rec_cte.key_targets.empty()) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_RECURSIVE_CTE", dialect, "recursive_cte", "USING KEY",
+				                        "LOGICAL_RECURSIVE_CTE",
+				                        "recursive CTE USING KEY (latest-row-per-key semantics) cannot be "
+				                        "reproduced as a plain recursive CTE");
+			}
 			LPTS_DEBUG_PRINT("[LPTS-AST] RECURSIVE_CTE: table_index=" + std::to_string(rec_cte.table_index) +
 			                 " ctename='" + rec_cte.ctename + "' union_all=" + std::to_string(rec_cte.union_all));
 			child_nodes.resize(2);
@@ -1942,9 +2493,12 @@ private:
 			// Also pre-register them in materialized_cte_body_column_names so that
 			// self-referencing LogicalCTERef nodes in the recursive step resolve correctly.
 			vector<string> output_col_names;
+			// Dedup: two anchor outputs can strip to the same bare name (e.g. an anchor projecting one
+			// source column twice) — the recursive CTE header must not declare duplicate columns.
+			CaseInsensitiveNameSet seen_rec_names;
 			for (idx_t i = 0; i < anchor_cols.size(); i++) {
 				string col_name = StripTablePrefix(anchor_cols[i]);
-				auto col_struct = make_uniq<ColStruct>(rec_cte.table_index, col_name, "");
+				auto col_struct = MakeDedupedColumn(rec_cte.table_index, col_name, "", seen_rec_names, i);
 				output_col_names.push_back(col_struct->ToUniqueColumnName());
 				column_map[MappableColumnBinding(ColumnBinding(rec_cte.table_index, i))] = std::move(col_struct);
 			}

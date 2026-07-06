@@ -1,0 +1,107 @@
+# name: test/sql/dup_column_names.test
+# description: CTE column-name collisions — two output columns that share a source name must get
+# group: [sql]
+
+#   distinct generated aliases (t7_i, t7_i) or downstream references bind to the first and silently
+#   drop the second. Covers UNION, EXCEPT ALL, correlated scalar subquery with UNION ALL, correlated
+#   subquery with a window, and LATERAL projecting two same-named bindings.
+
+require lpts
+
+statement ok
+SET lpts_check = true;
+
+statement ok
+CREATE TABLE test(a INTEGER);
+
+statement ok
+INSERT INTO test VALUES (1),(2),(3);
+
+statement ok
+CREATE TABLE test2(b INTEGER);
+
+statement ok
+INSERT INTO test2 VALUES (1),(2),(3),(4);
+
+statement ok
+CREATE TABLE integers(i INTEGER);
+
+statement ok
+INSERT INTO integers VALUES (1),(2),(3),(NULL);
+
+# UNION whose two output columns (t1.a, t2.a) share the source name `a`, plus an ORDER BY that
+# references the pre-union input column names.
+query II
+SELECT t1.a, t2.a FROM test t1, test t2 WHERE t1.a=t2.a UNION SELECT b, b - 1 FROM test2 ORDER BY t1.a, t2.a, test2.b;
+----
+1	0
+1	1
+2	1
+2	2
+3	2
+3	3
+4	3
+
+# EXCEPT ALL where both set-op output columns map to the same source binding name (t0.c0 / t86.c0).
+statement ok
+CREATE TABLE t0(c0 VARCHAR);
+
+statement ok
+INSERT INTO t0 VALUES ('cOB4'), ('');
+
+statement ok
+CREATE TABLE t86(c0 INTEGER);
+
+statement ok
+INSERT INTO t86 VALUES (1);
+
+query IT
+SELECT * FROM ((SELECT t86.c0, t0.c0 FROM t0, t86) EXCEPT ALL (SELECT i,i FROM range(0, 4) r(i))) ORDER BY 1, 2;
+----
+1	(empty)
+1	cOB4
+
+# Correlated scalar subquery whose inner UNION ALL merges two columns that both carry the correlation
+# name `i` — the decorrelated union CTE must not collapse them.
+query II
+SELECT i, (SELECT SUM(x) FROM (SELECT i1.i UNION ALL SELECT 2 UNION ALL SELECT 1) t(x)) FROM integers i1 ORDER BY i;
+----
+1	4
+2	5
+3	6
+NULL	3
+
+# Correlated subquery with a window over a nested correlated scalar subquery: the two operands of
+# (i1.i + integers.i) must stay distinct columns (a collision collapses it to i1.i + i1.i).
+query II
+SELECT i, (SELECT SUM(win) FROM (SELECT SUM((SELECT i1.i + integers.i)) OVER () AS win FROM integers i1) t) FROM integers ORDER BY i;
+----
+1	36
+2	48
+3	60
+NULL	NULL
+
+# LATERAL projecting two distinct bindings (x.q1 and y.q1) that render to the same alias; the
+# duplicate-eliminated correlation columns must get distinct names so the join key does not collapse.
+statement ok
+CREATE TABLE int8_tbl(q1 BIGINT, q2 BIGINT);
+
+statement ok
+INSERT INTO int8_tbl VALUES (123,456),(123,4567890123456789),(4567890123456789,123),(4567890123456789,4567890123456789),(4567890123456789,-4567890123456789);
+
+query II
+select x.* from int8_tbl x left join (select q1,coalesce(q2,0) q2 from int8_tbl) y on x.q2 = y.q1, lateral (select x.q1,y.q1,y.q2) v(xq1,yq1,yq2) order by 1, 2;
+----
+123	456
+123	4567890123456789
+123	4567890123456789
+123	4567890123456789
+4567890123456789	-4567890123456789
+4567890123456789	123
+4567890123456789	123
+4567890123456789	4567890123456789
+4567890123456789	4567890123456789
+4567890123456789	4567890123456789
+
+statement ok
+SET lpts_check = false;

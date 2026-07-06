@@ -1,0 +1,77 @@
+# name: test/sql/pretty_print.test
+# description: pretty-printed SQL output (clause-per-line, alignment, wrapping, WITH layout)
+# group: [sql]
+
+require lpts
+
+statement ok
+SET lpts_check=true;
+
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER, d INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 2, 5), (3, 4, 5), (8, 1, 7);
+
+# --- single block, no WITH: each clause on its own line, expression area at pos+8 ---
+# "SELECT" + 2 spaces and "FROM" + 4 spaces align the expression at column 8.
+query I
+SELECT sql LIKE 'SELECT  a, b
+FROM    memory.main.t;'
+FROM lpts_query('SELECT a, b FROM t');
+----
+true
+
+# --- WITH on its own line; CTE at column 0; body indented 4; group/order expr area at pos+10 ---
+query I
+SELECT sql LIKE 'WITH
+t0_scan (a, d) AS (
+    SELECT  a, d
+    FROM    memory.main.t
+    WHERE   (a>0)
+)
+SELECT    d, sum(a) AS sum_a
+FROM      t0_scan
+GROUP BY  d
+HAVING    ((sum(a)) > (CAST(''1'' AS HUGEINT)))
+ORDER BY  sum(a) ASC NULLS LAST
+LIMIT     5;'
+FROM lpts_query('SELECT d, sum(a) AS total FROM t WHERE a > 0 GROUP BY d HAVING sum(a) > 1 ORDER BY total LIMIT 5');
+----
+true
+
+statement ok
+SELECT d, sum(a) AS total FROM t WHERE a > 0 GROUP BY d HAVING sum(a) > 1 ORDER BY total;
+
+# --- expression area wraps near width 100; non-FROM lines stay within budget ---
+statement ok
+CREATE TABLE wide (c00 INT, c01 INT, c02 INT, c03 INT, c04 INT, c05 INT, c06 INT, c07 INT, c08 INT, c09 INT, c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT, c16 INT, c17 INT, c18 INT, c19 INT);
+
+query I
+SELECT max(length(line)) <= 100 FROM (
+  SELECT unnest(string_split(sql, chr(10))) AS line
+  FROM lpts_query('SELECT * FROM wide WHERE c00 > 0')
+) WHERE line NOT LIKE '%memory.main.wide%';
+----
+true
+
+# a wrapped continuation line is aligned at the expression column (col 8 here, under the first column)
+query I
+SELECT sql LIKE '%
+        c18, c19%' FROM lpts_query('SELECT * FROM wide WHERE c00 > 0');
+----
+true
+
+statement ok
+SELECT * FROM wide WHERE c00 > 0;
+
+# --- DML: CTEs pretty-printed, INSERT source on its own line ---
+statement ok
+CREATE TABLE dst (a INTEGER, b INTEGER);
+
+query I
+SELECT sql LIKE '%)
+INSERT INTO dst
+SELECT * FROM t0_scan;' FROM lpts_query('INSERT INTO dst SELECT a, b FROM t WHERE a > 5');
+----
+true

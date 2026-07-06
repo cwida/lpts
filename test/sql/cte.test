@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE t (id INTEGER, val INTEGER, label VARCHAR);
 
 statement ok
@@ -15,7 +18,7 @@ INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd'), (5,
 # ============================================================
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50)');
+SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50);
 ----
 1	10
 2	20
@@ -23,35 +26,29 @@ PRAGMA lpts_exec('SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50)');
 4	40
 5	50
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50)');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50);
 
 # --- partial match ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val IN (10, 30, 50)');
+SELECT id, val FROM t WHERE val IN (10, 30, 50);
 ----
 1	10
 3	30
 5	50
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val IN (10, 30, 50)');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val IN (10, 30, 50);
 
 # --- NOT IN: produces an ANTI join; no rows match when all values are listed ---
 
 query II
-PRAGMA lpts_exec('SELECT id, val FROM t WHERE val NOT IN (10, 20, 30, 40, 50)');
+SELECT id, val FROM t WHERE val NOT IN (10, 20, 30, 40, 50);
 ----
 
-query I
-PRAGMA lpts_check('SELECT id, val FROM t WHERE val NOT IN (10, 20, 30, 40, 50)');
-----
-true
+statement ok
+SELECT id, val FROM t WHERE val NOT IN (10, 20, 30, 40, 50);
 
 # ============================================================
 # MATERIALIZED_CTE + CTE_REF x2: WITH clause used twice
@@ -60,47 +57,39 @@ true
 
 # CTE appears in both the outer SELECT and a correlated subquery
 query II
-PRAGMA lpts_exec('WITH high AS (SELECT id, val FROM t WHERE val >= 30) SELECT h1.id, h1.val FROM high h1 WHERE h1.val = (SELECT max(val) FROM high)');
+WITH high AS (SELECT id, val FROM t WHERE val >= 30) SELECT h1.id, h1.val FROM high h1 WHERE h1.val = (SELECT max(val) FROM high);
 ----
 5	50
 
-query I
-PRAGMA lpts_check('WITH high AS (SELECT id, val FROM t WHERE val >= 30) SELECT h1.id, h1.val FROM high h1 WHERE h1.val = (SELECT max(val) FROM high)');
-----
-true
+statement ok
+WITH high AS (SELECT id, val FROM t WHERE val >= 30) SELECT h1.id, h1.val FROM high h1 WHERE h1.val = (SELECT max(val) FROM high);
 
 # CTE self-joined
 query I rowsort
-PRAGMA lpts_exec('WITH numbered AS (SELECT id, val FROM t) SELECT a.id FROM numbered a JOIN numbered b ON a.id = b.id WHERE a.val > 20');
+WITH numbered AS (SELECT id, val FROM t) SELECT a.id FROM numbered a JOIN numbered b ON a.id = b.id WHERE a.val > 20;
 ----
 3
 4
 5
 
-query I
-PRAGMA lpts_check('WITH numbered AS (SELECT id, val FROM t) SELECT a.id FROM numbered a JOIN numbered b ON a.id = b.id WHERE a.val > 20');
-----
-true
+statement ok
+WITH numbered AS (SELECT id, val FROM t) SELECT a.id FROM numbered a JOIN numbered b ON a.id = b.id WHERE a.val > 20;
 
 # Chained CTEs (base → derived): each CTE used once, no materialization
 query II
-PRAGMA lpts_exec('WITH base AS (SELECT id, val FROM t WHERE val > 10), doubled AS (SELECT id, val * 2 AS val FROM base) SELECT id, val FROM doubled ORDER BY id');
+WITH base AS (SELECT id, val FROM t WHERE val > 10), doubled AS (SELECT id, val * 2 AS val FROM base) SELECT id, val FROM doubled ORDER BY id;
 ----
 2	40
 3	60
 4	80
 5	100
 
-query I
-PRAGMA lpts_check('WITH base AS (SELECT id, val FROM t WHERE val > 10), doubled AS (SELECT id, val * 2 AS val FROM base) SELECT id, val FROM doubled ORDER BY id');
-----
-true
+statement ok
+WITH base AS (SELECT id, val FROM t WHERE val > 10), doubled AS (SELECT id, val * 2 AS val FROM base) SELECT id, val FROM doubled ORDER BY id;
 
 # CTE with aggregation used twice
-query I
-PRAGMA lpts_check('WITH agg AS (SELECT label, count(*) AS cnt FROM t GROUP BY label) SELECT a1.label FROM agg a1 JOIN agg a2 ON a1.label = a2.label ORDER BY a1.label');
-----
-true
+statement ok
+WITH agg AS (SELECT label, count(*) AS cnt FROM t GROUP BY label) SELECT a1.label FROM agg a1 JOIN agg a2 ON a1.label = a2.label ORDER BY a1.label;
 
 # ============================================================
 # CTE_INLINING: single-reference CTE is inlined by the optimizer
@@ -108,31 +97,27 @@ true
 # ============================================================
 
 query II
-PRAGMA lpts_exec('WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id');
+WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id;
 ----
 3	30
 4	40
 5	50
 
-query I
-PRAGMA lpts_check('WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id');
-----
-true
+statement ok
+WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id;
 
 # ============================================================
 # WITH NOT MATERIALIZED: explicitly prevents materialization, always inlined
 # ============================================================
 
 query II
-PRAGMA lpts_exec('WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id');
+WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id;
 ----
 1	10
 2	20
 
-query I
-PRAGMA lpts_check('WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id');
-----
-true
+statement ok
+WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id;
 
 # ============================================================
 # WITH MATERIALIZED: explicitly forces materialization
@@ -140,59 +125,47 @@ true
 # ============================================================
 
 query II
-PRAGMA lpts_exec('WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id');
+WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id;
 ----
 1	10
 2	20
 
-query I
-PRAGMA lpts_check('WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id');
-----
-true
+statement ok
+WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id;
 
 # MATERIALIZED CTE referenced twice (the typical reason to force materialization)
-query I
-PRAGMA lpts_check('WITH m AS MATERIALIZED (SELECT id, val FROM t) SELECT m1.id, m2.val FROM m m1 JOIN m m2 ON m1.id = m2.id WHERE m1.val > 10 ORDER BY m1.id');
-----
-true
+statement ok
+WITH m AS MATERIALIZED (SELECT id, val FROM t) SELECT m1.id, m2.val FROM m m1 JOIN m m2 ON m1.id = m2.id WHERE m1.val > 10 ORDER BY m1.id;
 
 # ============================================================
 # Nested CTEs: a CTE that itself references another CTE
 # ============================================================
 
 query II
-PRAGMA lpts_exec('WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id');
+WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id;
 ----
 2	60
 3	90
 4	120
 
-query I
-PRAGMA lpts_check('WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id');
-----
-true
+statement ok
+WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id;
 
 # ============================================================
 # WITH RECURSIVE
 # ============================================================
 
 # Simple counter: 1 to 5
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cnt WHERE n<5) SELECT n FROM cnt');
-----
-true
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cnt WHERE n<5) SELECT n FROM cnt;
 
 # Counter with outer filter
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cnt WHERE n<10) SELECT n FROM cnt WHERE n % 2 = 0');
-----
-true
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cnt WHERE n<10) SELECT n FROM cnt WHERE n % 2 = 0;
 
 # Fibonacci sequence
-query I
-PRAGMA lpts_check('WITH RECURSIVE fib(a,b) AS (SELECT 0,1 UNION ALL SELECT b, a+b FROM fib WHERE a<100) SELECT a FROM fib');
-----
-true
+statement ok
+WITH RECURSIVE fib(a,b) AS (SELECT 0,1 UNION ALL SELECT b, a+b FROM fib WHERE a<100) SELECT a FROM fib;
 
 # Tree traversal with JOIN
 statement ok
@@ -201,16 +174,12 @@ CREATE TABLE nodes (id INT, parent INT);
 statement ok
 INSERT INTO nodes VALUES (1,NULL),(2,1),(3,1),(4,2);
 
-query I
-PRAGMA lpts_check('WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM nodes WHERE parent IS NULL UNION ALL SELECT n.id, t.depth+1 FROM nodes n JOIN tree t ON n.parent=t.id) SELECT id,depth FROM tree ORDER BY id');
-----
-true
+statement ok
+WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM nodes WHERE parent IS NULL UNION ALL SELECT n.id, t.depth+1 FROM nodes n JOIN tree t ON n.parent=t.id) SELECT id,depth FROM tree ORDER BY id;
 
 # Recursive step with ORDER BY + LIMIT, which DuckDB plans as TopN.
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT n FROM cnt ORDER BY n DESC LIMIT 1) s WHERE n < 5) SELECT n FROM cnt ORDER BY n');
-----
-true
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT n FROM cnt ORDER BY n DESC LIMIT 1) s WHERE n < 5) SELECT n FROM cnt ORDER BY n;
 
 # Recursive step with SEMI JOIN.
 statement ok
@@ -219,25 +188,24 @@ CREATE TABLE recursive_allowed (n INT);
 statement ok
 INSERT INTO recursive_allowed VALUES (1), (2), (3);
 
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT cnt.n + 1 FROM cnt SEMI JOIN recursive_allowed a ON cnt.n = a.n WHERE cnt.n < 5) SELECT n FROM cnt ORDER BY n');
-----
-true
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT cnt.n + 1 FROM cnt SEMI JOIN recursive_allowed a ON cnt.n = a.n WHERE cnt.n < 5) SELECT n FROM cnt ORDER BY n;
 
 # Recursive step with a correlated scalar subquery, which can introduce DelimJoin/SINGLE nodes.
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT cnt.n + 1 FROM cnt JOIN recursive_allowed a ON a.n = (SELECT max(r.n) FROM recursive_allowed r WHERE r.n = cnt.n) WHERE cnt.n < 3) SELECT n FROM cnt ORDER BY n');
-----
-true
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT cnt.n + 1 FROM cnt JOIN recursive_allowed a ON a.n = (SELECT max(r.n) FROM recursive_allowed r WHERE r.n = cnt.n) WHERE cnt.n < 3) SELECT n FROM cnt ORDER BY n;
 
 # Recursive step with IN subquery, which can introduce MARK joins.
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 4 AND n IN (SELECT n FROM recursive_allowed)) SELECT n FROM cnt ORDER BY n');
-----
-true
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 4 AND n IN (SELECT n FROM recursive_allowed)) SELECT n FROM cnt ORDER BY n;
 
 # Recursive inline VALUES scans need the same table-function column alias as flat CTE scans.
-query I
-PRAGMA lpts_check('WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < (SELECT max(c0) FROM (VALUES (3)) v(c0))) SELECT n FROM cnt ORDER BY n');
+statement ok
+WITH RECURSIVE cnt(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < (SELECT max(c0) FROM (VALUES (3)) v(c0))) SELECT n FROM cnt ORDER BY n;
+
+# --- WITH RECURSIVE ... USING KEY is refused: it keeps only the latest row per key across iterations,
+# which a plain recursive CTE does not reproduce. ---
+statement error
+SELECT sql FROM lpts_query('WITH RECURSIVE cte(x,y) USING KEY (x) AS (SELECT 1, 0 UNION ALL SELECT x, y+1 FROM cte WHERE y < 10) TABLE cte');
 ----
-true
+LPTS_UNSUPPORTED_RECURSIVE_CTE

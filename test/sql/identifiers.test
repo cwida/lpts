@@ -1,0 +1,111 @@
+# name: test/sql/identifiers.test
+# description: generated column identifier naming (aliases, pass-through, aggregates)
+# group: [sql]
+
+require lpts
+
+statement ok
+SET lpts_check=true;
+
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER, d INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 2, 5), (3, 4, 5), (8, 1, 7);
+
+# Run on the unmerged path so each operator's CTE (and its names) is visible.
+statement ok
+SET lpts_merge_pipeline=false;
+
+# --- user alias on a column ref reaches the final SELECT (terminal projection is inlined) ---
+query I
+SELECT sql LIKE '%a AS foo%' AND sql LIKE '%FROM%t0_scan%'
+FROM lpts_query('SELECT a AS foo FROM t WHERE b > 1');
+----
+true
+
+statement ok
+SELECT a AS foo FROM t WHERE b > 1;
+
+# --- pure pass-through keeps the source names (which then collapse to bare, being unique) ---
+query I
+SELECT sql LIKE '%t0_scan (b, a)%' AND sql LIKE '%SELECT%b, a%' FROM lpts_query('SELECT b, a FROM t WHERE d > 0');
+----
+true
+
+# --- aggregates: <func>_<col>, count(*) → count_star, distinct → _distinct_ ---
+query I
+SELECT sql LIKE '%count_star%' AND sql LIKE '%count_distinct_b%' AND sql LIKE '%sum_a%'
+FROM lpts_query('SELECT sum(a), count(*), count(DISTINCT b) FROM t');
+----
+true
+
+# a user alias on an aggregate reaches the output (previously it was lost as "aggregate_0")
+query I
+SELECT sql LIKE '%total%' AND sql NOT LIKE '%aggregate_0%'
+FROM lpts_query('SELECT sum(a) AS total FROM t');
+----
+true
+
+# --- computed expression without an alias stays scalar_Y ---
+query I
+SELECT sql LIKE '%scalar_0%' FROM lpts_query('SELECT a + b FROM t');
+----
+true
+
+# --- keyword alias is quoted in the final result ---
+query I
+SELECT sql LIKE '%AS "order"%' FROM lpts_query('SELECT a AS "order" FROM t');
+----
+true
+
+statement ok
+SELECT a AS "order" FROM t;
+
+# --- same source column projected twice dedups without breaking round-trip ---
+statement ok
+SELECT a, a AS a2 FROM t;
+
+# Round-trip correctness for the merged-path equivalents.
+statement ok
+SET lpts_merge_pipeline=true;
+
+# 'x AS x' is swallowed inside a merged block (no "tN_x AS tN_x").
+query I
+SELECT sql NOT LIKE '%t0_a AS t0_a%' FROM lpts_query('SELECT a FROM t WHERE a > 1 ORDER BY a');
+----
+true
+
+statement ok
+SELECT d, sum(a) AS total, count(*), count(DISTINCT b) FROM t GROUP BY d ORDER BY total;
+
+# --- Case-insensitive column names must stay distinct (DuckDB resolves identifiers case-insensitively) ---
+# Two columns differing only in case ("hello" vs "HeLlO") would collapse to the same generated name and
+# resolve to the first; the dedup must treat them as colliding and give the second a distinct suffix.
+query II
+SELECT * FROM (SELECT 1 "hello", 2 "HeLlO") NATURAL JOIN (SELECT 1 "hello", 2 "HeLlO");
+----
+1	2
+
+statement ok
+SELECT * FROM (SELECT 1 "hello", 2 "HeLlO") NATURAL JOIN (SELECT 1 "hello", 2 "HeLlO");
+
+statement ok
+SELECT * FROM (SELECT 1 "hello", 2 "HeLlO") t1 JOIN (SELECT 1 "hello", 2 "HeLlO") t2 USING (hello);
+
+# --- Unicode column names that sanitize to the same ASCII fragment must stay distinct ---
+statement ok
+CREATE TABLE 📚 ("📕" INTEGER, "👤" INTEGER, "⭐" TEXT);
+
+statement ok
+INSERT INTO 📚 VALUES (1, 10, 'a'), (2, 20, 'b');
+
+# "📕" and "👤" both sanitize to "_____"; they must not collide in the generated CTE column list.
+query III
+SELECT "📕", "👤", "⭐" FROM 📚 ORDER BY "📕";
+----
+1	10	a
+2	20	b
+
+statement ok
+SELECT "📕", "👤", "⭐" FROM 📚 ORDER BY "📕";

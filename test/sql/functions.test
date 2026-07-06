@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, age INTEGER);
 
 statement ok
@@ -13,117 +16,99 @@ INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35), (4,
 # --- length() in projection ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT name, length(name) FROM users');
+SELECT name, length(name) FROM users;
 ----
 Alice	5
 Bob	3
 Carol	5
 dave	4
 
-query I
-PRAGMA lpts_check('SELECT name, length(name) FROM users');
-----
-true
+statement ok
+SELECT name, length(name) FROM users;
 
 # --- upper() in projection: string to uppercase ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT upper(name) FROM users');
+SELECT upper(name) FROM users;
 ----
 ALICE
 BOB
 CAROL
 DAVE
 
-query I
-PRAGMA lpts_check('SELECT upper(name) FROM users');
-----
-true
+statement ok
+SELECT upper(name) FROM users;
 
 # --- lower() in projection ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT lower(name) FROM users');
+SELECT lower(name) FROM users;
 ----
 alice
 bob
 carol
 dave
 
-query I
-PRAGMA lpts_check('SELECT lower(name) FROM users');
-----
-true
+statement ok
+SELECT lower(name) FROM users;
 
 # --- length() in WHERE filter ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT name, age FROM users WHERE length(name) > 3');
+SELECT name, age FROM users WHERE length(name) > 3;
 ----
 Alice	30
 Carol	35
 dave	22
 
-query I
-PRAGMA lpts_check('SELECT name, age FROM users WHERE length(name) > 3');
-----
-true
+statement ok
+SELECT name, age FROM users WHERE length(name) > 3;
 
 # --- upper() in projection + length() in WHERE filter combined ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT upper(name), age FROM users WHERE length(name) > 3');
+SELECT upper(name), age FROM users WHERE length(name) > 3;
 ----
 ALICE	30
 CAROL	35
 DAVE	22
 
-query I
-PRAGMA lpts_check('SELECT upper(name), age FROM users WHERE length(name) > 3');
-----
-true
+statement ok
+SELECT upper(name), age FROM users WHERE length(name) > 3;
 
 # --- Arithmetic operator (+) as a scalar function in projection ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT id, age + 1 FROM users');
+SELECT id, age + 1 FROM users;
 ----
 1	31
 2	26
 3	36
 4	23
 
-query I
-PRAGMA lpts_check('SELECT id, age + 1 FROM users');
-----
-true
+statement ok
+SELECT id, age + 1 FROM users;
 
 # --- Arithmetic in filter: age - 5 > 20 ---
 
 query I rowsort
-PRAGMA lpts_exec('SELECT name FROM users WHERE age - 5 > 20');
+SELECT name FROM users WHERE age - 5 > 20;
 ----
 Alice
 Carol
 
-query I
-PRAGMA lpts_check('SELECT name FROM users WHERE age - 5 > 20');
-----
-true
+statement ok
+SELECT name FROM users WHERE age - 5 > 20;
 
 # --- Nested scalar function: upper(lower(name)) ---
 
-query I
-PRAGMA lpts_check('SELECT upper(lower(name)) FROM users');
-----
-true
+statement ok
+SELECT upper(lower(name)) FROM users;
 
 # --- Scalar function on a constant: length(''hello'') ---
 
-query I
-PRAGMA lpts_check('SELECT length(''hello'') FROM users');
-----
-true
+statement ok
+SELECT length('hello') FROM users;
 
 # --- Function applied to integer arithmetic: abs(age - 30) ---
 
@@ -134,30 +119,26 @@ statement ok
 INSERT INTO scores VALUES ('P1', 100), ('P2', -50), ('P3', 0), ('P4', 75);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT player, abs(score) FROM scores');
+SELECT player, abs(score) FROM scores;
 ----
 P1	100
 P2	50
 P3	0
 P4	75
 
-query I
-PRAGMA lpts_check('SELECT player, abs(score) FROM scores');
-----
-true
+statement ok
+SELECT player, abs(score) FROM scores;
 
 # --- Function in both projection and filter ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT player, abs(score) FROM scores WHERE abs(score) > 60');
+SELECT player, abs(score) FROM scores WHERE abs(score) > 60;
 ----
 P1	100
 P4	75
 
-query I
-PRAGMA lpts_check('SELECT player, abs(score) FROM scores WHERE abs(score) > 60');
-----
-true
+statement ok
+SELECT player, abs(score) FROM scores WHERE abs(score) > 60;
 
 # --- Function on NULL input: length(NULL) → NULL ---
 
@@ -168,48 +149,61 @@ statement ok
 INSERT INTO nullnames VALUES ('hello'), (NULL);
 
 query I rowsort
-PRAGMA lpts_exec('SELECT length(name) FROM nullnames');
+SELECT length(name) FROM nullnames;
 ----
 5
 NULL
 
-query I
-PRAGMA lpts_check('SELECT length(name) FROM nullnames');
-----
-true
+statement ok
+SELECT length(name) FROM nullnames;
 
 # ==========================================
 # Table functions (range, generate_series)
 # ==========================================
 
-query I
-PRAGMA lpts_check('SELECT * FROM range(1, 5)');
-----
-true
+statement ok
+SELECT * FROM range(1, 5);
 
-query I
-PRAGMA lpts_check('SELECT * FROM generate_series(1, 3)');
-----
-true
+statement ok
+SELECT * FROM generate_series(1, 3);
 
-query I
-PRAGMA lpts_check('SELECT i FROM range(10) t(i) WHERE i > 5');
-----
-true
+statement ok
+SELECT i FROM range(10) t(i) WHERE i > 5;
 
-query I
-PRAGMA lpts_check('SELECT a, b FROM range(1, 4) t1(a), range(10, 13) t2(b)');
-----
-true
+statement ok
+SELECT a, b FROM range(1, 4) t1(a), range(10, 13) t2(b);
 
 # --- struct_pack preserves named field names across round-trip ---
 
-query I
-PRAGMA lpts_check('SELECT struct_pack(name := name, n := age) FROM users');
-----
-true
+statement ok
+SELECT struct_pack(name := name, n := age) FROM users;
 
+statement ok
+SELECT struct_pack(a := id, b := name, c := age) FROM users;
+
+# --- array_to_string separator is preserved (it compiles to list_aggr(list, 'string_agg') and the
+# separator lives in the nested string_agg's bind data, not as a child) ---
 query I
-PRAGMA lpts_check('SELECT struct_pack(a := id, b := name, c := age) FROM users');
+SELECT array_to_string([i, i + 1], '-') FROM range(3) t(i) ORDER BY 1;
+----
+0-1
+1-2
+2-3
+
+statement ok
+SELECT array_to_string([i, i + 1], '-') FROM range(3) t(i) ORDER BY 1;
+
+# non-default multi-char separator
+query I
+SELECT array_to_string([10, 20, 30], ' <> ');
+----
+10 <> 20 <> 30
+
+statement ok
+SELECT array_to_string([10, 20, 30], ' <> ');
+
+# the generated SQL carries the separator as a string_agg argument
+query I
+SELECT sql LIKE '%''string_agg'', ''-''%' FROM lpts_query('SELECT array_to_string([i, i+1], ''-'') FROM range(3) t(i)');
 ----
 true

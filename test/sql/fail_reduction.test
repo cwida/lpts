@@ -1,0 +1,319 @@
+# name: test/sql/fail_reduction.test
+# description: Regression tests for rendering bugs that made LPTS emit invalid SQL (queries that FAILed
+# group: [sql]
+
+#   the round-trip check with Binder/Parser errors instead of translating). Each section names its bug.
+
+require lpts
+
+require parquet
+
+statement ok
+SET lpts_check = true;
+
+# --- Dummy-scan column naming: an uncorrelated IN/ANY/ALL over constants passes the dummy binding
+# through the mark join; its registered name must match the CTE header (t0_dummy, not t0_1). ---
+query I
+SELECT (1 = ANY(SELECT 1));
+----
+true
+
+statement ok
+CREATE TABLE strings(v VARCHAR);
+
+statement ok
+INSERT INTO strings VALUES ('hello'), (NULL);
+
+query I
+SELECT 'bla' IN (SELECT * FROM strings);
+----
+NULL
+
+# --- Multi-condition mark join without equality (row != / = ALL): executes as a nested-loop join whose
+# conditions match INDEPENDENTLY (per-condition OR) — not the hash join's per-row AND. ---
+query I
+SELECT (1, 2) = ALL(SELECT * FROM (VALUES (1, 2), (1, 3)));
+----
+false
+
+query I
+SELECT (1, 2) != ANY(SELECT * FROM (VALUES (1, 2), (1, 3)));
+----
+true
+
+# --- Unnamed-struct (ROW) constants: STRUCT(INTEGER, INTEGER) has no SQL syntax; the value is rebuilt
+# as row(...) / nested constructors (also covers list_zip's STRUCT(<type>)[] entries). ---
+query I
+SELECT (0, 0) < ANY(SELECT 1, 0);
+----
+true
+
+query I
+SELECT list_zip(['2021-08-20'::DATE]);
+----
+[(2021-08-20)]
+
+# --- date_part struct variant: the constant part-list argument is erased at bind time and must be
+# rebuilt from the STRUCT return type's field names. ---
+query I
+SELECT DATE_PART(['year','month','day'], DATE '2020-03-04');
+----
+{'year': 2020, 'month': 3, 'day': 4}
+
+# --- MAP constants have no bare literal (display form {k=v}); rendered as CAST('<text>' AS MAP(...)). ---
+query I
+SELECT MAP{'k': 'v'};
+----
+{k=v}
+
+# --- Slice bounds: an omitted bound is a sentinel constant of the list's own type; only the bracket
+# syntax (with the `-` end marker when a step is present) can express it. list_reverse compiles to a
+# full-range step -1 slice. ---
+statement ok
+CREATE TABLE lists(s INT[]);
+
+statement ok
+INSERT INTO lists VALUES ([1,2,3,4,5]);
+
+query II
+SELECT s[:2], s[2:] FROM lists;
+----
+[1, 2]	[2, 3, 4, 5]
+
+query I
+SELECT s[2:-:2] FROM lists;
+----
+[2, 4]
+
+query II
+SELECT array_pop_back(s), list_reverse(s) FROM lists;
+----
+[1, 2, 3, 4]	[5, 4, 3, 2, 1]
+
+# --- Quantile arguments live in bind data, both for window functions and list_aggr sub-aggregates. ---
+statement ok
+CREATE TABLE t1(id INT, ch VARCHAR);
+
+statement ok
+INSERT INTO t1 VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b');
+
+query II
+SELECT id, quantile_cont(id, 0.5) OVER (PARTITION BY ch ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM t1 ORDER BY 1;
+----
+1	2.0
+2	NULL
+3	4.0
+4	NULL
+
+query I
+SELECT list_aggr(list(i ORDER BY i), 'quantile', 0.5) FROM range(1, 11) tbl(i);
+----
+5
+
+# --- Named-argument functions re-emit each child's alias as `name := expr`. ---
+statement ok
+CREATE TABLE stbl(col STRUCT(i INT));
+
+statement ok
+INSERT INTO stbl VALUES ({'i': 1});
+
+query I
+SELECT struct_insert(col, a := col.i + 1, b := NULL::VARCHAR) FROM stbl;
+----
+{'i': 1, 'a': 2, 'b': NULL}
+
+query I
+SELECT struct_update(col, i := 99) FROM stbl;
+----
+{'i': 99}
+
+# --- EXPORT_STATE aggregates: the internal aggregate_state_export_<f> name is re-emitted as
+# `(<f>(args) EXPORT_STATE)` — parenthesized so it survives inside function argument lists. ---
+query I
+SELECT (SUM(42) EXPORT_STATE)::BLOB IS NOT NULL;
+----
+true
+
+statement ok
+CREATE TABLE dummy AS SELECT 42::DOUBLE d;
+
+query I
+SELECT FINALIZE(COMBINE(SUM(d) EXPORT_STATE, SUM(d) EXPORT_STATE)) FROM dummy;
+----
+84.0
+
+# --- rowid: a filter on the virtual rowid column is keyed by the virtual column id (not an index into
+# the scan's names) and round-trips faithfully over the same base table. ---
+statement ok
+CREATE TABLE rid(x INT);
+
+statement ok
+INSERT INTO rid VALUES (7),(8);
+
+query I
+SELECT * FROM rid WHERE rowid = 0;
+----
+7
+
+# --- list_reduce: the lambda is inserted at its declared argument position (before a trailing initial
+# value), and body references render under the canonical parameter name. ---
+query I
+SELECT list_reduce([1,2,3], lambda x, y: x + y, 100);
+----
+106
+
+statement ok
+CREATE TABLE fruit_tbl(fruits VARCHAR[]);
+
+statement ok
+INSERT INTO fruit_tbl VALUES (['apple','banana','cherry']);
+
+query I
+SELECT [fruit for fruit in fruits if contains(fruit, 'an')] FROM fruit_tbl;
+----
+[banana]
+
+# --- Recursive-CTE column dedup: an anchor projecting one source column into two outputs must not
+# declare duplicate CTE header columns. ---
+query II
+SELECT x, y FROM generate_series(1,2) AS _(x), LATERAL (WITH RECURSIVE t(y) AS MATERIALIZED (SELECT _.x UNION SELECT y + 1 FROM t WHERE y < 3) SELECT * FROM t) AS t ORDER BY x, y;
+----
+1	1
+1	2
+1	3
+2	2
+2	3
+
+# --- Deep recursive UNNEST: one UNNEST level per CTE (fusing two levels would nest UNNEST calls). ---
+query I
+SELECT UNNEST([[[1, 2], [3]], [[4]]], recursive := true) ORDER BY 1;
+----
+1
+2
+3
+4
+
+# --- NUL bytes: representable in string values via chr(0) concatenation. ---
+statement ok
+CREATE TABLE varchars(v VARCHAR);
+
+statement ok
+INSERT INTO varchars VALUES ('hello' || chr(0)), ('x');
+
+query I
+SELECT count(*) FROM varchars WHERE v = 'hello' || chr(0);
+----
+1
+
+# --- Constant ORDER BY keys (a folded alias like `10 AS j` in ORDER BY) are dropped: DuckDB re-reads a
+# bare (even parenthesized) integer as an ordinal, and ordering by a constant is a no-op. ---
+statement ok
+CREATE TABLE oint(i INT);
+
+statement ok
+INSERT INTO oint VALUES (3),(1),(2);
+
+query II
+SELECT 10 AS j, i FROM oint ORDER BY j, i NULLS LAST;
+----
+10	1
+10	2
+10	3
+
+# --- UNION-typed constants rebuild via union_value(tag := v) cast to the full union type. ---
+query I
+SELECT [true::UNION(a integer, c bool)] AS u FROM range(2);
+----
+[true]
+[true]
+
+# --- TYPE-typed constants (get_type/make_type) reconstruct as get_type(CAST(NULL AS <type>)). ---
+query II
+SELECT get_type(1), get_type('x');
+----
+INTEGER	VARCHAR
+
+# --- Set operation whose branch keeps an inner ORDER BY key as an extra projected column: the branch
+# must select only the union's arity, not `*`. ---
+statement ok
+CREATE TABLE sotest(a INT);
+
+statement ok
+INSERT INTO sotest VALUES (2),(1);
+
+statement ok
+CREATE TABLE sotest2(b INT);
+
+statement ok
+INSERT INTO sotest2 VALUES (3);
+
+query I
+(SELECT a FROM sotest ORDER BY a+1) UNION SELECT b FROM sotest2 ORDER BY 1;
+----
+1
+2
+3
+
+# --- A pushed-down filter on a column that is NOT projected (filter-only) must still resolve through
+# the table-function alias. ---
+query I
+SELECT last_name FROM parquet_scan('duckdb/data/parquet-testing/userdata1.parquet') WHERE first_name='Amanda' ORDER BY last_name LIMIT 3;
+----
+Clark
+Coleman
+Franklin
+
+# --- LATERAL <table function> WITH ORDINALITY: the ordinality column is part of the scan output, and
+# the correlated passthrough columns are the child's own bindings. ---
+statement ok
+CREATE TABLE lat_t(a INT);
+
+statement ok
+INSERT INTO lat_t VALUES (2),(3);
+
+query III
+SELECT a, my_range, my_ordinality FROM lat_t AS t(a), LATERAL range(t.a) WITH ORDINALITY AS _(my_range, my_ordinality) ORDER BY 1,2,3;
+----
+2	0	1
+2	1	2
+3	0	1
+3	1	2
+3	2	3
+
+# --- ... also inside a recursive CTE step (rendered as inline SQL with the delim source inlined). ---
+query I
+WITH RECURSIVE ordinalityCTE AS (SELECT 1 AS ordinality UNION SELECT oCTE.ordinality + r.ordinality AS ordinality FROM ordinalityCTE AS oCTE, LATERAL range(oCTE.ordinality) WITH ORDINALITY AS r(range,ordinality) WHERE oCTE.ordinality < 3) SELECT ordinality FROM ordinalityCTE ORDER BY ordinality;
+----
+1
+2
+3
+4
+
+# --- TABLE-argument functions (`summary((SELECT ...))`) embed the child as the argument. ---
+statement ok
+CREATE TABLE sumtbl(x INT, j INT);
+
+statement ok
+INSERT INTO sumtbl VALUES (1, 2);
+
+query III
+SELECT * FROM summary((SELECT * FROM sumtbl));
+----
+[1, 2]	1	2
+
+# --- RANGE frames with INTERVAL offsets: the plan stores `<order key> - <offset>` with casts that can
+# differ between ORDER BY and frame expression; the offset is recovered modulo casts. ---
+statement ok
+CREATE TABLE power(plant VARCHAR, date DATE, mwh INT);
+
+statement ok
+INSERT INTO power VALUES ('a','2020-01-01',10),('a','2020-01-03',20),('a','2020-01-08',30),('b','2020-01-01',5);
+
+query III
+SELECT * FROM (SELECT plant, date, avg(mwh) OVER (PARTITION BY plant ORDER BY date ASC RANGE BETWEEN INTERVAL 3 DAYS PRECEDING AND INTERVAL 3 DAYS FOLLOWING) AS avgmwh FROM power ORDER BY plant, avgmwh DESC) QUALIFY row_number() OVER (PARTITION BY plant ORDER BY avgmwh DESC) = 1 ORDER BY plant;
+----
+a	2020-01-08	30.0
+b	2020-01-01	5.0
+
+statement ok
+SET lpts_check = false;

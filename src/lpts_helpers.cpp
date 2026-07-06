@@ -2,6 +2,8 @@
 
 #include "duckdb/parser/keyword_helper.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <regex>
 
 namespace duckdb {
@@ -15,6 +17,21 @@ string VecToSeparatedList(const vector<string> &input_list, const string &separa
 		}
 	}
 	return ret_str.str();
+}
+
+string BuildDistinctOnQuery(const vector<string> &cols, const vector<string> &targets, const vector<string> &orders,
+                            const string &from_clause) {
+	std::ostringstream window;
+	window << "row_number() OVER (PARTITION BY " << VecToSeparatedList(targets);
+	if (!orders.empty()) {
+		window << " ORDER BY " << VecToSeparatedList(orders);
+	}
+	window << ")";
+	const string col_list = VecToSeparatedList(cols);
+	std::ostringstream s;
+	s << "SELECT " << col_list << " FROM (SELECT " << col_list << ", " << window.str()
+	  << " AS _lpts_distinct_on_rn FROM " << from_clause << ") AS _lpts_distinct_on WHERE _lpts_distinct_on_rn = 1";
+	return s.str();
 }
 
 string JoinConditionsToSQL(const vector<string> &conditions) {
@@ -289,6 +306,193 @@ string SubstituteColumnTokens(const string &sql, const std::unordered_map<string
 		i++;
 	}
 	return out;
+}
+
+//===--------------------------------------------------------------------===//
+// Nondeterminism heuristic (shared by the lpts_check mode and the SQLStorm benchmark).
+//===--------------------------------------------------------------------===//
+
+static string LowerASCII(string input) {
+	std::transform(input.begin(), input.end(), input.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return input;
+}
+
+static string NormalizeWhitespaceASCII(const string &input) {
+	string result;
+	bool last_was_space = true;
+	for (char c : input) {
+		if (std::isspace(static_cast<unsigned char>(c))) {
+			if (!last_was_space) {
+				result += ' ';
+				last_was_space = true;
+			}
+			continue;
+		}
+		result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		last_was_space = false;
+	}
+	if (!result.empty() && result.back() != ' ') {
+		result += ' ';
+	}
+	return " " + result;
+}
+
+static bool ContainsNormalizedPhrase(const string &sql, const string &phrase) {
+	return NormalizeWhitespaceASCII(sql).find(NormalizeWhitespaceASCII(phrase)) != string::npos;
+}
+
+static bool HasFunctionCall(const string &sql, const string &function_name) {
+	string lower_sql = LowerASCII(sql);
+	string needle = LowerASCII(function_name) + "(";
+	// Require a word boundary before the name so a function whose name merely ENDS with `function_name`
+	// is not misclassified: an unanchored substring match would treat e.g. `moving_avg(` as `avg(`,
+	// `watchlist(` as `list(`, `mystats(` as `stats(`, `know(` as `now(`. A false "nondeterministic"
+	// verdict would silently pass a genuinely wrong rewrite in STRICT mode, eroding the wrong=0 invariant.
+	size_t pos = lower_sql.find(needle);
+	while (pos != string::npos) {
+		const char prev = pos == 0 ? '\0' : lower_sql[pos - 1];
+		const bool ident_char = (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_';
+		if (!ident_char) {
+			return true;
+		}
+		pos = lower_sql.find(needle, pos + 1);
+	}
+	return false;
+}
+
+static bool HasWindowFunctionCall(const string &sql, const string &function_name) {
+	return HasFunctionCall(sql, function_name) && ContainsNormalizedPhrase(sql, "over");
+}
+
+bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
+	// Order-sensitive aggregates (string_agg, group_concat, listagg, list, array_agg) concatenate/collect
+	// their inputs in an order that is only fully defined when an in-aggregate ORDER BY names a UNIQUE key.
+	// We cannot prove uniqueness from the SQL text, and a non-total ORDER BY (or none at all) leaves the
+	// result order input-dependent — so the original and LPTS-rewritten plans may legitimately disagree on
+	// the concatenation order. Treat any use as potentially nondeterministic, ordered or not.
+	if (HasFunctionCall(sql, "string_agg") || HasFunctionCall(sql, "group_concat")) {
+		reason = "order-sensitive aggregate (string_agg/group_concat) may have a non-total ordering";
+		return true;
+	}
+	if (HasFunctionCall(sql, "listagg")) {
+		reason = "order-sensitive aggregate (listagg) may have a non-total ordering";
+		return true;
+	}
+	if (HasFunctionCall(sql, "list") || HasFunctionCall(sql, "array_agg")) {
+		reason = "order-sensitive aggregate (list/array_agg) may have a non-total ordering";
+		return true;
+	}
+	if (HasFunctionCall(sql, "random")) {
+		reason = "volatile random() expression";
+		return true;
+	}
+	// Volatile/non-reproducible scalar functions: random UUIDs and the debug stats() summary (depends on
+	// storage layout / cardinality estimates), which differ between the original and rewritten plans.
+	if (HasFunctionCall(sql, "uuid") || HasFunctionCall(sql, "uuidv4") || HasFunctionCall(sql, "uuidv7") ||
+	    HasFunctionCall(sql, "gen_random_uuid")) {
+		reason = "volatile UUID generator";
+		return true;
+	}
+	if (HasFunctionCall(sql, "stats")) {
+		reason = "stats() depends on storage layout / statistics";
+		return true;
+	}
+	// Stateful sequence access: nextval advances the sequence, so the original and the rewritten plan
+	// (which may reference it a different number of times) observe different values.
+	if (HasFunctionCall(sql, "nextval") || HasFunctionCall(sql, "currval")) {
+		reason = "sequence access (nextval/currval) is stateful";
+		return true;
+	}
+	// Wall-clock / transaction-time functions return a value that depends on when they run.
+	if (HasFunctionCall(sql, "now") || ContainsNormalizedPhrase(sql, "current_timestamp") ||
+	    ContainsNormalizedPhrase(sql, "current_date") || ContainsNormalizedPhrase(sql, "current_time") ||
+	    HasFunctionCall(sql, "get_current_timestamp") || HasFunctionCall(sql, "transaction_timestamp") ||
+	    HasFunctionCall(sql, "current_localtimestamp") || HasFunctionCall(sql, "current_localtime")) {
+		reason = "wall-clock/transaction time function";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "row_number")) {
+		reason = "row_number over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "rank")) {
+		reason = "rank over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "dense_rank")) {
+		reason = "dense_rank over potentially tied ordering keys";
+		return true;
+	}
+	if (HasWindowFunctionCall(sql, "lag") || HasWindowFunctionCall(sql, "lead") ||
+	    HasWindowFunctionCall(sql, "first_value") || HasWindowFunctionCall(sql, "last_value") ||
+	    HasWindowFunctionCall(sql, "nth_value")) {
+		reason = "window function over potentially tied ordering keys";
+		return true;
+	}
+	if (ContainsNormalizedPhrase(sql, "using sample") || ContainsNormalizedPhrase(sql, "tablesample")) {
+		reason = "row sampling (USING SAMPLE/TABLESAMPLE) returns a nondeterministic subset";
+		return true;
+	}
+	// Row-count limiting (LIMIT/OFFSET/FETCH) selects an unspecified subset unless the input has a total
+	// order: with no ORDER BY the chosen rows are arbitrary, and with a non-total ORDER BY the boundary
+	// rows can tie. Either way the result bag is not guaranteed, so treat any such query as nondeterministic.
+	if (ContainsNormalizedPhrase(sql, "limit") || ContainsNormalizedPhrase(sql, "offset") ||
+	    ContainsNormalizedPhrase(sql, "fetch first") || ContainsNormalizedPhrase(sql, "fetch next")) {
+		reason = "LIMIT/OFFSET/FETCH selects an unspecified subset of rows";
+		return true;
+	}
+	// Floating aggregates whose exact (bit-for-bit) result depends on the summation/evaluation order, which
+	// the original and LPTS-rewritten plans need not share. Includes the fast variants (favg/fsum), the
+	// covariance/correlation family (corr/covar_*), the regression family (regr_*), and higher moments
+	// (skewness/kurtosis/sem). NOTE: several of these were previously matched only by accident by the
+	// unanchored substring matcher (favg via "avg", covar_pop/covar_samp via "var_pop"/"var_samp"); now that
+	// HasFunctionCall is word-boundary anchored, they must be listed explicitly.
+	if (HasFunctionCall(sql, "avg") || HasFunctionCall(sql, "favg") || HasFunctionCall(sql, "mean") ||
+	    HasFunctionCall(sql, "fsum") || HasFunctionCall(sql, "kahan_sum") || HasFunctionCall(sql, "sumkahan") ||
+	    HasFunctionCall(sql, "geomean") || HasFunctionCall(sql, "stddev") || HasFunctionCall(sql, "stddev_pop") ||
+	    HasFunctionCall(sql, "stddev_samp") || HasFunctionCall(sql, "variance") || HasFunctionCall(sql, "var_pop") ||
+	    HasFunctionCall(sql, "var_samp") || HasFunctionCall(sql, "corr") || HasFunctionCall(sql, "covar_pop") ||
+	    HasFunctionCall(sql, "covar_samp") || HasFunctionCall(sql, "sem") || HasFunctionCall(sql, "skewness") ||
+	    HasFunctionCall(sql, "kurtosis") || HasFunctionCall(sql, "kurtosis_pop") || HasFunctionCall(sql, "entropy") ||
+	    HasFunctionCall(sql, "regr_avgx") || HasFunctionCall(sql, "regr_avgy") ||
+	    HasFunctionCall(sql, "regr_intercept") || HasFunctionCall(sql, "regr_r2") ||
+	    HasFunctionCall(sql, "regr_slope") || HasFunctionCall(sql, "regr_sxx") || HasFunctionCall(sql, "regr_sxy") ||
+	    HasFunctionCall(sql, "regr_syy")) {
+		reason = "strict floating aggregate equality may depend on evaluation order";
+		return true;
+	}
+	// An aggregate with an in-argument ORDER BY (e.g. `sum(x ORDER BY y)`) sorts its inputs before
+	// combining; for floating-point sums/products that makes the exact result depend on the ordering,
+	// which the original and rewritten plans need not share.
+	{
+		static const std::regex ordered_float_agg(R"(\b(sum|product|geomean|fsum|kahan_sum)\s*\([^()]*\border\s+by\b)",
+		                                          std::regex::icase);
+		if (std::regex_search(sql, ordered_float_agg)) {
+			reason = "ordered floating aggregate result may depend on summation order";
+			return true;
+		}
+	}
+	// Approximate aggregates (sketch/sample based) are not guaranteed to return the same value twice, so the
+	// original and LPTS-rewritten plans may legitimately disagree.
+	if (HasFunctionCall(sql, "approx_quantile") || HasFunctionCall(sql, "approx_count_distinct") ||
+	    HasFunctionCall(sql, "reservoir_quantile") || HasFunctionCall(sql, "approx_top_k")) {
+		reason = "approximate aggregate result is not exactly reproducible";
+		return true;
+	}
+	// A raw exported aggregate STATE materialized as bytes — e.g. `(sum(x) EXPORT_STATE)::BLOB` — serializes
+	// implementation-defined state memory (which can include uninitialized padding), so its exact bytes are
+	// not reproducible between two executions of the same query. A finalize()/combine() over the state IS
+	// deterministic and is not flagged (those queries pass the round-trip check). The translation itself is
+	// faithful; only the serialized-state bytes are non-reproducible.
+	{
+		const string lower = LowerASCII(sql);
+		if (lower.find("export_state") != string::npos && lower.find("blob") != string::npos) {
+			reason = "raw exported aggregate state materialized as BLOB is not byte-reproducible";
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace duckdb

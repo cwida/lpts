@@ -5,6 +5,9 @@
 require lpts
 
 statement ok
+SET lpts_check=true;
+
+statement ok
 CREATE TABLE sales (product VARCHAR, region VARCHAR, amount INTEGER);
 
 statement ok
@@ -15,126 +18,102 @@ INSERT INTO sales VALUES
 # --- Scalar aggregate: COUNT(*) with no GROUP BY ---
 
 query I
-PRAGMA lpts_exec('SELECT count(*) FROM sales');
+SELECT count(*) FROM sales;
 ----
 6
 
-query I
-PRAGMA lpts_check('SELECT count(*) FROM sales');
-----
-true
+statement ok
+SELECT count(*) FROM sales;
 
 # --- Scalar aggregate: SUM over entire table ---
 
 query I
-PRAGMA lpts_exec('SELECT sum(amount) FROM sales');
+SELECT sum(amount) FROM sales;
 ----
 1200
 
-query I
-PRAGMA lpts_check('SELECT sum(amount) FROM sales');
-----
-true
+statement ok
+SELECT sum(amount) FROM sales;
 
 # --- Scalar aggregate: MIN and MAX ---
 
-query I
-PRAGMA lpts_check('SELECT min(amount) FROM sales');
-----
-true
+statement ok
+SELECT min(amount) FROM sales;
 
-query I
-PRAGMA lpts_check('SELECT max(amount) FROM sales');
-----
-true
+statement ok
+SELECT max(amount) FROM sales;
 
 # --- GROUP BY single column with COUNT ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales GROUP BY product');
+SELECT product, count(*) FROM sales GROUP BY product;
 ----
 A	3
 B	3
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales GROUP BY product');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales GROUP BY product;
 
 # --- GROUP BY single column with SUM ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT region, sum(amount) FROM sales GROUP BY region');
+SELECT region, sum(amount) FROM sales GROUP BY region;
 ----
 EU	350
 US	850
 
-query I
-PRAGMA lpts_check('SELECT region, sum(amount) FROM sales GROUP BY region');
-----
-true
+statement ok
+SELECT region, sum(amount) FROM sales GROUP BY region;
 
 # --- GROUP BY single column with AVG ---
 
-query I
-PRAGMA lpts_check('SELECT product, avg(amount) FROM sales GROUP BY product');
-----
-true
+statement ok
+SELECT product, avg(amount) FROM sales GROUP BY product;
 
 # --- GROUP BY single column with MIN / MAX ---
 
-query I
-PRAGMA lpts_check('SELECT region, min(amount), max(amount) FROM sales GROUP BY region');
-----
-true
+statement ok
+SELECT region, min(amount), max(amount) FROM sales GROUP BY region;
 
 # --- GROUP BY multiple columns ---
 
 query III rowsort
-PRAGMA lpts_exec('SELECT product, region, count(*) FROM sales GROUP BY product, region');
+SELECT product, region, count(*) FROM sales GROUP BY product, region;
 ----
 A	EU	2
 A	US	1
 B	EU	1
 B	US	2
 
-query I
-PRAGMA lpts_check('SELECT product, region, count(*) FROM sales GROUP BY product, region');
-----
-true
+statement ok
+SELECT product, region, count(*) FROM sales GROUP BY product, region;
 
 # --- GROUP BY with WHERE: filter applied before aggregation ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product');
+SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product;
 ----
 A	2
 B	2
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product');
-----
-true
+statement ok
+SELECT product, count(*) FROM sales WHERE amount > 100 GROUP BY product;
 
 # --- GROUP BY with multiple aggregates in the same query ---
 
-query I
-PRAGMA lpts_check('SELECT product, count(*), sum(amount), min(amount), max(amount) FROM sales GROUP BY product');
-----
-true
+statement ok
+SELECT product, count(*), sum(amount), min(amount), max(amount) FROM sales GROUP BY product;
 
 # --- COUNT(DISTINCT col): de-duplicates before counting ---
 
 query II rowsort
-PRAGMA lpts_exec('SELECT region, count(DISTINCT product) FROM sales GROUP BY region');
+SELECT region, count(DISTINCT product) FROM sales GROUP BY region;
 ----
 EU	2
 US	2
 
-query I
-PRAGMA lpts_check('SELECT region, count(DISTINCT product) FROM sales GROUP BY region');
-----
-true
+statement ok
+SELECT region, count(DISTINCT product) FROM sales GROUP BY region;
 
 # --- GROUP BY on a table with a single group (all rows same key) ---
 
@@ -145,14 +124,12 @@ statement ok
 INSERT INTO uniform VALUES ('X', 1), ('X', 2), ('X', 3);
 
 query II
-PRAGMA lpts_exec('SELECT grp, sum(val) FROM uniform GROUP BY grp');
+SELECT grp, sum(val) FROM uniform GROUP BY grp;
 ----
 X	6
 
-query I
-PRAGMA lpts_check('SELECT grp, sum(val) FROM uniform GROUP BY grp');
-----
-true
+statement ok
+SELECT grp, sum(val) FROM uniform GROUP BY grp;
 
 # --- GROUP BY on empty table: no groups, no rows ---
 
@@ -160,25 +137,21 @@ statement ok
 CREATE TABLE empty_sales (product VARCHAR, amount INTEGER);
 
 query II
-PRAGMA lpts_exec('SELECT product, count(*) FROM empty_sales GROUP BY product');
+SELECT product, count(*) FROM empty_sales GROUP BY product;
 ----
 
-query I
-PRAGMA lpts_check('SELECT product, count(*) FROM empty_sales GROUP BY product');
-----
-true
+statement ok
+SELECT product, count(*) FROM empty_sales GROUP BY product;
 
 # --- COUNT(*) on empty table returns 0 ---
 
 query I
-PRAGMA lpts_exec('SELECT count(*) FROM empty_sales');
+SELECT count(*) FROM empty_sales;
 ----
 0
 
-query I
-PRAGMA lpts_check('SELECT count(*) FROM empty_sales');
-----
-true
+statement ok
+SELECT count(*) FROM empty_sales;
 
 # --- GROUP BY with NULL values: NULLs form their own group ---
 
@@ -188,10 +161,8 @@ CREATE TABLE nullable_grp (cat VARCHAR, val INTEGER);
 statement ok
 INSERT INTO nullable_grp VALUES ('A', 10), (NULL, 20), (NULL, 30), ('A', 5);
 
-query I
-PRAGMA lpts_check('SELECT cat, sum(val) FROM nullable_grp GROUP BY cat');
-----
-true
+statement ok
+SELECT cat, sum(val) FROM nullable_grp GROUP BY cat;
 
 # --- Aggregate ignores NULLs: SUM(NULL-containing col) ---
 
@@ -202,15 +173,13 @@ statement ok
 INSERT INTO with_nulls VALUES ('A', 10), ('A', NULL), ('B', NULL), ('B', NULL);
 
 query II rowsort
-PRAGMA lpts_exec('SELECT grp, sum(val) FROM with_nulls GROUP BY grp');
+SELECT grp, sum(val) FROM with_nulls GROUP BY grp;
 ----
 A	10
 B	NULL
 
-query I
-PRAGMA lpts_check('SELECT grp, sum(val) FROM with_nulls GROUP BY grp');
-----
-true
+statement ok
+SELECT grp, sum(val) FROM with_nulls GROUP BY grp;
 
 # --- COALESCE / CASE in GROUP BY (non-BOUND_COLUMN_REF group expressions) ---
 
@@ -220,43 +189,31 @@ CREATE TABLE coalesce_grp (a INTEGER, b INTEGER, val INTEGER);
 statement ok
 INSERT INTO coalesce_grp VALUES (1, NULL, 10), (NULL, 1, 20), (1, NULL, 30), (2, 3, 5);
 
-query I
-PRAGMA lpts_check('SELECT COALESCE(a, b) AS key, SUM(val) FROM coalesce_grp GROUP BY COALESCE(a, b)');
-----
-true
+statement ok
+SELECT COALESCE(a, b) AS key, SUM(val) FROM coalesce_grp GROUP BY COALESCE(a, b);
 
-query I
-PRAGMA lpts_check('SELECT COALESCE(a, b) AS key, a, COUNT(*) FROM coalesce_grp GROUP BY COALESCE(a, b), a');
-----
-true
+statement ok
+SELECT COALESCE(a, b) AS key, a, COUNT(*) FROM coalesce_grp GROUP BY COALESCE(a, b), a;
 
 # --- GROUP BY ROLLUP preserves grouping sets ---
 
-query I
-PRAGMA lpts_check('SELECT product, region, SUM(amount) FROM sales GROUP BY ROLLUP(product, region) ORDER BY product, region');
-----
-true
+statement ok
+SELECT product, region, SUM(amount) FROM sales GROUP BY ROLLUP(product, region) ORDER BY product, region;
 
 # --- GROUP BY CUBE preserves grouping sets ---
 
-query I
-PRAGMA lpts_check('SELECT product, region, SUM(amount) FROM sales GROUP BY CUBE(product, region) ORDER BY product, region');
-----
-true
+statement ok
+SELECT product, region, SUM(amount) FROM sales GROUP BY CUBE(product, region) ORDER BY product, region;
 
 # --- Explicit GROUPING SETS preserve grouped outputs ---
 
-query I
-PRAGMA lpts_check('SELECT product, region, SUM(amount) FROM sales GROUP BY GROUPING SETS ((product), (region), ()) ORDER BY product, region');
-----
-true
+statement ok
+SELECT product, region, SUM(amount) FROM sales GROUP BY GROUPING SETS ((product), (region), ()) ORDER BY product, region;
 
 # --- GROUPING() function output from aggregate ---
 
-query I
-PRAGMA lpts_check('SELECT product, GROUPING(product) AS product_grouping, SUM(amount) FROM sales GROUP BY product ORDER BY product');
-----
-true
+statement ok
+SELECT product, GROUPING(product) AS product_grouping, SUM(amount) FROM sales GROUP BY product ORDER BY product;
 
 # --- Ordered-set aggregate stores percentile in aggregate bind data ---
 
@@ -266,19 +223,88 @@ CREATE TABLE percentile_items (grp INTEGER, val DECIMAL(10, 2));
 statement ok
 INSERT INTO percentile_items VALUES (1, 10.00), (1, 20.00), (1, 30.00), (2, 5.00), (2, 15.00);
 
-query I
-PRAGMA lpts_check('SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY val) AS p75 FROM percentile_items');
-----
-true
+statement ok
+SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY val) AS p75 FROM percentile_items;
 
-query I
-PRAGMA lpts_check('SELECT product, region, GROUPING(product) AS product_grouping, GROUPING(region) AS region_grouping, SUM(amount) FROM sales GROUP BY ROLLUP(product, region) ORDER BY product, region, product_grouping, region_grouping');
-----
-true
+statement ok
+SELECT product, region, GROUPING(product) AS product_grouping, GROUPING(region) AS region_grouping, SUM(amount) FROM sales GROUP BY ROLLUP(product, region) ORDER BY product, region, product_grouping, region_grouping;
 
 # --- Parent projection/order above ROLLUP aggregate ---
 
+statement ok
+SELECT product, total_amount FROM (SELECT product, region, SUM(amount) AS total_amount FROM sales GROUP BY ROLLUP(product, region)) rollup_sales WHERE total_amount > 100 ORDER BY product, total_amount;
+
+# --- Descending / negative quantiles keep their direction ---
+# percentile_cont/disc WITHIN GROUP (ORDER BY x DESC) computes from the other end; DuckDB also stores a
+# negative quantile (quantile_disc(x, -p)) as abs(p) + a desc flag. The bare quantile_cont(x, p) drops the
+# direction, so LPTS must emit the in-aggregate ORDER BY ... DESC form. lpts_check verifies the round-trip.
+
+statement ok
+CREATE TABLE q_items (val INTEGER);
+
+statement ok
+INSERT INTO q_items VALUES (10), (20), (30), (40), (50), (60);
+
+# scalar percentile, descending
 query I
-PRAGMA lpts_check('SELECT product, total_amount FROM (SELECT product, region, SUM(amount) AS total_amount FROM sales GROUP BY ROLLUP(product, region)) rollup_sales WHERE total_amount > 100 ORDER BY product, total_amount');
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY val DESC) FROM q_items;
 ----
-true
+47.5
+
+statement ok
+SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY val DESC) FROM q_items;
+
+# list percentile, descending
+statement ok
+SELECT percentile_disc([0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY val DESC) FROM q_items;
+
+# negative scalar quantile (stored as abs(p) + desc)
+statement ok
+SELECT quantile_disc(val, -0.5) FROM q_items;
+
+# negative list quantile
+statement ok
+SELECT quantile_disc(val, [-0.25, -0.5, -0.75]) FROM q_items;
+
+# ascending quantile still round-trips (regression guard)
+query I
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY val) FROM q_items;
+----
+35.0
+
+statement ok
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY val) FROM q_items;
+
+# --- Duplicate grouping columns across multiple grouping sets are refused ---
+# When the grouping keys include equal join keys (col1 = col3), DuckDB's duplicate-group optimizer
+# collapses col3 -> col1, so two CUBE/ROLLUP dimensions render to the same column name. SQL grouping sets
+# reference columns by name and cannot express the two collapsed dimensions independently, so LPTS refuses
+# rather than emit a plausible-but-wrong result.
+
+statement ok
+CREATE TABLE dg1 (col1 INTEGER, col2 INTEGER);
+
+statement ok
+CREATE TABLE dg2 (col3 INTEGER);
+
+statement error
+SELECT sql FROM lpts_query('SELECT col1, col2, col3 FROM dg1 JOIN dg2 ON dg1.col1 = dg2.col3 GROUP BY CUBE(col1, col2, col3)');
+----
+LPTS_DUPLICATE_GROUPING_SET_COLUMN
+
+statement error
+SELECT sql FROM lpts_query('SELECT col1, col2, col3 FROM dg1 JOIN dg2 ON dg1.col1 = dg2.col3 GROUP BY ROLLUP(col1, col2, col3)');
+----
+LPTS_DUPLICATE_GROUPING_SET_COLUMN
+
+# A plain GROUP BY over the same equal keys is fine (single grouping set — every dimension always present).
+statement ok
+SELECT col1, col2, col3 FROM dg1 JOIN dg2 ON dg1.col1 = dg2.col3 GROUP BY col1, col2, col3;
+
+# --- Lateral GROUPING SETS over a correlated constant projection is refused ---
+# The correlated `SELECT 1, 2` projects constants that become grouping-set keys; after decorrelation they
+# render as bare integers in GROUP BY (re-read as ordinals), so LPTS refuses rather than mis-group.
+statement error
+SELECT sql FROM lpts_query('SELECT x, a, b FROM (VALUES (1), (2)) t2(x), LATERAL (SELECT count(*), count(a) FROM (SELECT 1, 2 WHERE 1 = x) t(a, b) GROUP BY GROUPING SETS ((), (b), (a, b))) t3(a, b)');
+----
+LPTS_UNSUPPORTED_GROUP_BY
