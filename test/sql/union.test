@@ -195,3 +195,32 @@ query I
 PRAGMA lpts_check('SELECT id FROM users UNION SELECT id FROM staff UNION SELECT user_id FROM orders');
 ----
 true
+
+# Set-op output columns must be deduped (cwida/lpts#16): a UNION / EXCEPT /
+# INTERSECT over an un-aliased self-join exposes two columns sharing a base
+# name (x.id / y.id); without unique names the downstream projection collapses
+# them to the first occurrence and returns wrong results.
+query I
+PRAGMA lpts_check('SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION ALL SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id UNION SELECT x.id, x.name, y.id, y.name FROM users x JOIN users y ON x.id < y.id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id EXCEPT SELECT y.id, x.id FROM users x JOIN users y ON x.id < y.id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id INTERSECT SELECT x.id, y.id FROM users x JOIN users y ON x.id < y.id');
+----
+true
+
+query I
+PRAGMA lpts_check('SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.id < b.id JOIN users c ON b.id < c.id UNION ALL SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.id < b.id JOIN users c ON b.id < c.id');
+----
+true

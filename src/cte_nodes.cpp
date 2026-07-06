@@ -146,7 +146,7 @@ string RenderSelectPretty(const SelectParts &p, const vector<string> &out_names,
 		}
 	}
 	std::ostringstream s;
-	EmitClauseList(s, pos, expr_col, "SELECT", p.distinct ? "DISTINCT " : "", select_items, ", ");
+	EmitClauseList(s, pos, expr_col, "SELECT", p.select_hint + (p.distinct ? "DISTINCT " : ""), select_items, ", ");
 	s << "\n";
 	EmitClauseValue(s, pos, expr_col, "FROM", p.from);
 	if (!p.where_conds.empty()) {
@@ -206,6 +206,7 @@ void RenameParts(SelectParts &p, const unordered_map<string, string> &m) {
 	for (auto &e : p.select_exprs) {
 		e = SubstituteColumnTokens(e, m);
 	}
+	p.select_hint = SubstituteColumnTokens(p.select_hint, m);
 	p.from = SubstituteColumnTokens(p.from, m);
 	for (auto &c : p.where_conds) {
 		c = SubstituteColumnTokens(c, m);
@@ -433,6 +434,20 @@ string AggregateNode::ToQuery(SqlDialect dialect) {
 	return "SELECT " + VecToSeparatedList(items) + tail;
 }
 
+string JoinNode::SparkBroadcastHint(SqlDialect dialect) const {
+	if (dialect != SqlDialect::SPARK || (!broadcast_left && !broadcast_right)) {
+		return "";
+	}
+	vector<string> hints;
+	if (broadcast_left) {
+		hints.push_back("BROADCAST(" + left_cte_name + ")");
+	}
+	if (broadcast_right) {
+		hints.push_back("BROADCAST(" + right_cte_name + ")");
+	}
+	return "/*+ " + VecToSeparatedList(hints) + " */ ";
+}
+
 string JoinNode::ToQuery(SqlDialect dialect) {
 	if (is_asof) {
 		RequireDuckDBDialect(dialect, "JoinNode", "ASOF JOIN");
@@ -441,6 +456,7 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 			                              EnumUtil::ToString(join_type));
 		}
 	}
+	const string hint = SparkBroadcastHint(dialect);
 	std::ostringstream join_str;
 	// Use explicit column list instead of SELECT * to avoid including
 	// duplicate join key columns from both sides of the join.
@@ -448,30 +464,10 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	if (!mark_expression.empty() && !cte_column_list.empty()) {
 		vector<string> select_cols(cte_column_list.begin(), cte_column_list.end() - 1);
 		select_cols.push_back(mark_expression);
-		join_str << "SELECT ";
-		if (dialect == SqlDialect::SPARK && (broadcast_left || broadcast_right)) {
-			vector<string> hints;
-			if (broadcast_left) {
-				hints.push_back("BROADCAST(" + left_cte_name + ")");
-			}
-			if (broadcast_right) {
-				hints.push_back("BROADCAST(" + right_cte_name + ")");
-			}
-			join_str << "/*+ " << VecToSeparatedList(hints) << " */ ";
-		}
+		join_str << "SELECT " << hint;
 		join_str << VecToSeparatedList(select_cols) << " FROM ";
 	} else {
-		join_str << "SELECT ";
-		if (dialect == SqlDialect::SPARK && (broadcast_left || broadcast_right)) {
-			vector<string> hints;
-			if (broadcast_left) {
-				hints.push_back("BROADCAST(" + left_cte_name + ")");
-			}
-			if (broadcast_right) {
-				hints.push_back("BROADCAST(" + right_cte_name + ")");
-			}
-			join_str << "/*+ " << VecToSeparatedList(hints) << " */ ";
-		}
+		join_str << "SELECT " << hint;
 		join_str << VecToSeparatedList(cte_column_list) << " FROM ";
 	}
 	// RIGHT_SEMI / RIGHT_ANTI: the preserved (output) side is the RIGHT CTE.
@@ -555,6 +551,7 @@ bool JoinNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 		return false;
 	}
 	f << " JOIN " << right_cte_name << " ON " << JoinConditionsToSQL(join_conditions);
+	out.select_hint = SparkBroadcastHint(dialect);
 	out.select_exprs = cte_column_list;
 	out.from = f.str();
 	return true;

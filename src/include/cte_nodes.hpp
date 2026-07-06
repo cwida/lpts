@@ -47,6 +47,7 @@ namespace duckdb {
 /// `select_exprs` is positionally aligned with the node's `cte_column_list` (its output names).
 struct SelectParts {
 	bool distinct = false;
+	string select_hint;          ///< Optional prefix emitted right after SELECT (e.g. Spark "/*+ BROADCAST(x) */ ").
 	vector<string> select_exprs; ///< Raw SELECT expressions (no "AS"), aligned with cte_column_list.
 	string from;                 ///< FROM source (table ref, CTE name, "a JOIN b ON ...", "x USING SAMPLE ...").
 	vector<string> where_conds;  ///< Raw WHERE conditions (parens added by the renderer).
@@ -284,6 +285,10 @@ public:
 	string ToQuery(SqlDialect dialect) override;
 
 private:
+	/// Spark "/*+ BROADCAST(...) */ " prefix for the enclosing SELECT, or "" when not applicable.
+	/// Emitted only for the SPARK dialect on openivm-delta join build sides (broadcast_left/right).
+	string SparkBroadcastHint(SqlDialect dialect) const;
+
 	bool broadcast_left;
 	bool broadcast_right;
 };
