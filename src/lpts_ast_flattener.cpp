@@ -64,6 +64,97 @@ private:
 		return table_name.rfind("openivm_delta_", 0) == 0;
 	}
 
+	// True if `s` is a single unquoted SQL identifier (letters/digits/underscore only).
+	static bool IsSimpleColumnToken(const string &s) {
+		if (s.empty()) {
+			return false;
+		}
+		for (char c : s) {
+			const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+			if (!ok) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	static bool ColumnListContains(const vector<string> &cols, const string &name) {
+		for (const auto &c : cols) {
+			if (StringUtil::CIEquals(c, name)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Qualify a simple "(LHS <op> RHS)" join condition whose operand column name is ambiguous
+	// (i.e. the same bare identifier is exposed by BOTH the left and right child CTEs) with the
+	// owning side's CTE name. This is required after the identity-projection-skip optimization,
+	// which can map a decorrelated subquery's correlated column back to the *outer* column's
+	// unique name — so a self-referential ANTI/SEMI join emits "(x IS NOT DISTINCT FROM x)" that
+	// the binder rejects as ambiguous. DuckDB's comparison-join invariant guarantees the left
+	// operand references the left child and the right operand the right child, so we can qualify
+	// LHS with left_cte and RHS with right_cte. Only ambiguous operands are touched; unambiguous
+	// conditions (the common case) are returned unchanged so no other emission is affected.
+	static string QualifyAmbiguousJoinCondition(const string &cond, const vector<string> &left_cols,
+	                                            const vector<string> &right_cols, const string &left_cte,
+	                                            const string &right_cte) {
+		if (cond.size() < 3 || cond.front() != '(' || cond.back() != ')') {
+			return cond;
+		}
+		const string inner = cond.substr(1, cond.size() - 2);
+		// Only handle a single simple comparison — bail on any nesting/function call.
+		if (inner.find('(') != string::npos || inner.find(')') != string::npos) {
+			return cond;
+		}
+		static const char *const kOps[] = {" IS NOT DISTINCT FROM ",
+		                                   " IS DISTINCT FROM ",
+		                                   " <=> ",
+		                                   " >= ",
+		                                   " <= ",
+		                                   " <> ",
+		                                   " != ",
+		                                   " = ",
+		                                   " > ",
+		                                   " < "};
+		const string inner_lower = StringUtil::Lower(inner);
+		for (const char *op : kOps) {
+			const string op_lower = StringUtil::Lower(op);
+			const auto pos = inner_lower.find(op_lower);
+			if (pos == string::npos) {
+				continue;
+			}
+			string lhs = inner.substr(0, pos);
+			string rhs = inner.substr(pos + op_lower.size());
+			StringUtil::Trim(lhs);
+			StringUtil::Trim(rhs);
+			if (!IsSimpleColumnToken(lhs) || !IsSimpleColumnToken(rhs)) {
+				return cond;
+			}
+			const bool lhs_ambiguous = ColumnListContains(left_cols, lhs) && ColumnListContains(right_cols, lhs);
+			const bool rhs_ambiguous = ColumnListContains(left_cols, rhs) && ColumnListContains(right_cols, rhs);
+			if (!lhs_ambiguous && !rhs_ambiguous) {
+				return cond;
+			}
+			string lhs_out = lhs_ambiguous ? left_cte + "." + lhs : lhs;
+			string rhs_out = rhs_ambiguous ? right_cte + "." + rhs : rhs;
+			return "(" + lhs_out + string(op) + rhs_out + ")";
+		}
+		return cond;
+	}
+
+	static vector<string> QualifyAmbiguousJoinConditions(const vector<string> &conditions,
+	                                                     const vector<string> &left_cols,
+	                                                     const vector<string> &right_cols, const string &left_cte,
+	                                                     const string &right_cte) {
+		vector<string> out;
+		out.reserve(conditions.size());
+		for (const auto &cond : conditions) {
+			out.push_back(QualifyAmbiguousJoinCondition(cond, left_cols, right_cols, left_cte, right_cte));
+		}
+		return out;
+	}
+
 	static string InlineJoinSql(JoinType join_type, vector<string> select_cols, const string &left_sql,
 	                            const string &right_sql, const vector<string> &conditions,
 	                            const string &mark_expression, const string &context) {
@@ -752,6 +843,7 @@ private:
 			// 1. Flatten outer (left) child.
 			unique_ptr<CteNode> left_cte = FlattenNode(*ast_node.children[0]);
 			string left_cte_name = left_cte->cte_name;
+			vector<string> left_cte_cols = left_cte->cte_column_list;
 			LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: left_cte='" + left_cte_name +
 			                 "' n_delim_tis=" + std::to_string(dj.delim_table_indices.size()));
 			cte_nodes.push_back(std::move(left_cte));
@@ -766,15 +858,18 @@ private:
 			// 3. Flatten inner (right) child. AstDelimGetNode will pick up delim_get_source_cte.
 			unique_ptr<CteNode> right_cte = FlattenNode(*ast_node.children[1]);
 			string right_cte_name = right_cte->cte_name;
+			vector<string> right_cte_cols = right_cte->cte_column_list;
 			cte_nodes.push_back(std::move(right_cte));
 
 			// 4. Create the DELIM_JOIN as a regular JOIN CTE.
 			const size_t my_index = node_count++;
 			const string right_name = MarkRightSideMaterialized(right_cte_name);
+			vector<string> conditions =
+			    QualifyAmbiguousJoinConditions(dj.conditions, left_cte_cols, right_cte_cols, left_cte_name, right_name);
 			LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: join_" + std::to_string(my_index) + " LEFT='" + left_cte_name +
 			                 "' RIGHT='" + right_name + "' mark_expr='" + dj.mark_expression + "'");
 			auto join_node = make_uniq<JoinNode>(my_index, dj.cte_column_names, left_cte_name, right_name, dj.join_type,
-			                                     dj.conditions, dj.mark_expression);
+			                                     conditions, dj.mark_expression);
 			join_node->mark_lhs_key = dj.mark_lhs_key;
 			join_node->mark_rhs_key = dj.mark_rhs_key;
 			join_node->mark_correlation_conditions = dj.mark_correlation_conditions;
@@ -945,8 +1040,10 @@ private:
 		if (type == "Join") {
 			const AstJoinNode &join = static_cast<const AstJoinNode &>(ast_node);
 			const string right_name = MarkRightSideMaterialized(children_names[1]);
+			vector<string> conditions = QualifyAmbiguousJoinConditions(
+			    join.conditions, children_column_lists[0], children_column_lists[1], children_names[0], right_name);
 			auto join_node = make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], right_name,
-			                                     join.join_type, join.conditions, join.mark_expression, join.is_asof,
+			                                     join.join_type, conditions, join.mark_expression, join.is_asof,
 			                                     cte_nodes[cte_nodes.size() - 2]->spark_broadcast_hint,
 			                                     cte_nodes[cte_nodes.size() - 1]->spark_broadcast_hint);
 			join_node->mark_lhs_key = join.mark_lhs_key;
@@ -1131,6 +1228,14 @@ public:
 // Phase 2 entry point
 //==============================================================================
 unique_ptr<CteList> AstToCteList(const AstNode &root, SqlDialect dialect, bool emit_spark_hints, bool merge_pipeline) {
+	// openivm-spark's refresh rewriter drives its statement-by-statement rewriting off the
+	// classic per-operator CTE layout (scan_0 / aggregate_1 / …). Pipeline fusion collapses
+	// those into one flat SELECT, which that rewriter mis-handles — the Spark MV ends up with
+	// wrong contents even though the fused SQL is correct in native DuckDB. Fusion is a pure
+	// optimization, so keep it off for the SPARK dialect.
+	if (dialect == SqlDialect::SPARK) {
+		merge_pipeline = false;
+	}
 	AstFlattener flattener(dialect, emit_spark_hints, merge_pipeline);
 	return flattener.Flatten(root);
 }
