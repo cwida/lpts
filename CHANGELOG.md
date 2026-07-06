@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.1.0 - 2026-07-06
+
 ### Removed
 
 - `PRAGMA lpts_exec('query')`, the boolean-returning `PRAGMA lpts_check('query')`, and
@@ -41,6 +43,13 @@
 
 ### Changed
 
+- Hardened non-DuckDB dialect output, chiefly Spark: pipeline fusion is disabled for the SPARK
+  dialect so it keeps the stable per-operator CTE layout downstream consumers parse; `BROADCAST(...)`
+  join hints are emitted (and restored after the corpus-gate refactor); ambiguous set-op / anti-join
+  conditions over un-aliased self-joins are qualified with their owning CTE; an untyped `NULL`
+  (SQLNULL) renders as a bare `NULL` in non-DuckDB dialects; and Spark SQL emission was hardened
+  generally. Set-operation (`UNION`/`EXCEPT`/`INTERSECT`) output columns are now routed through the
+  shared name-deduplication path so a self-join set-op no longer emits duplicate column names.
 - Bumped the DuckDB target from v1.5.3 to **v1.5.4** and regenerated the coverage-gate baseline
   against v1.5.4's sqllogic corpus (`files=3346`, `wrong=0 fail=0`).
 - The `lpts_check` nondeterminism heuristic's function-call matcher is now anchored on a word boundary,
