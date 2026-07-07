@@ -271,6 +271,7 @@ class JoinNode : public CteNode {
 	string left_cte_name, right_cte_name;
 	JoinType join_type;
 	vector<string> join_conditions;
+	vector<string> select_expressions;
 	string mark_expression; ///< For MARK→LEFT conversion: computed boolean column expression.
 	bool is_asof;
 
@@ -292,11 +293,12 @@ public:
 	// Constructor.
 	JoinNode(const size_t index, vector<string> cte_column_names, string _left_cte_name, string _right_cte_name,
 	         JoinType _join_type, vector<string> _join_conditions, string _mark_expression = "", bool _is_asof = false,
-	         bool _broadcast_left = false, bool _broadcast_right = false)
+	         bool _broadcast_left = false, bool _broadcast_right = false, vector<string> _select_expressions = {})
 	    : CteNode(index, "t" + std::to_string(index) + "_join", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)), join_type(_join_type),
-	      join_conditions(std::move(_join_conditions)), mark_expression(std::move(_mark_expression)), is_asof(_is_asof),
-	      broadcast_left(_broadcast_left), broadcast_right(_broadcast_right) {
+	      join_conditions(std::move(_join_conditions)), select_expressions(std::move(_select_expressions)),
+	      mark_expression(std::move(_mark_expression)), is_asof(_is_asof), broadcast_left(_broadcast_left),
+	      broadcast_right(_broadcast_right) {
 	}
 	// Functions.
 	string ToQuery(SqlDialect dialect) override;

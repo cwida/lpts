@@ -101,6 +101,9 @@ SELECT t.symbol, t.ts, p.price FROM trades t ASOF JOIN prices p ON t.symbol = p.
 statement ok
 SELECT t.symbol, t.ts, p.price FROM trades t ASOF LEFT JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts;
 
+statement ok
+SELECT t.symbol FROM trades t ASOF JOIN prices p ON t.symbol = p.symbol AND t.ts >= p.ts ORDER BY t.symbol, t.ts;
+
 # --- POSITIONAL JOIN: row-wise pairing ---
 
 statement ok
@@ -421,3 +424,9 @@ true
 
 statement ok
 SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id;
+
+statement ok
+SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id;
+
+statement ok
+SELECT users.name FROM users JOIN orders ON users.id = orders.user_id ORDER BY orders.amount, users.name;

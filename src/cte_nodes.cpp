@@ -583,6 +583,7 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	}
 	const string hint = SparkBroadcastHint(dialect);
 	std::ostringstream join_str;
+	vector<string> select_cols = select_expressions.empty() ? cte_column_list : select_expressions;
 	// Other MARK joins (EXISTS, correlated/DELIM, multi-condition) render as LEFT JOIN + a 2-valued mark.
 	// The mark must express "did the RHS have a matching row?". A key-based `(rhs_key IS NOT NULL)` is WRONG
 	// when the correlation key can itself be NULL and legitimately matches (`NULL IS NOT DISTINCT FROM NULL`):
@@ -592,13 +593,13 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	// no join condition — needs no sentinel.)
 	const bool use_match_sentinel = !mark_expression.empty() && mark_expression != "true";
 	if (!mark_expression.empty() && !cte_column_list.empty()) {
-		vector<string> select_cols(cte_column_list.begin(), cte_column_list.end() - 1);
+		select_cols.assign(cte_column_list.begin(), cte_column_list.end() - 1);
 		select_cols.push_back(use_match_sentinel ? "(_rhs_dedup._lpts_matched IS NOT NULL)" : mark_expression);
 		join_str << "SELECT " << hint;
 		join_str << VecToSeparatedList(select_cols) << " FROM ";
 	} else {
 		join_str << "SELECT " << hint;
-		join_str << VecToSeparatedList(cte_column_list) << " FROM ";
+		join_str << VecToSeparatedList(select_cols) << " FROM ";
 	}
 	// RIGHT_SEMI / RIGHT_ANTI: the preserved (output) side is the RIGHT CTE.
 	// Emit as "right SEMI/ANTI JOIN left" so the preserved side is on the left in SQL.
@@ -686,7 +687,7 @@ bool JoinNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 	}
 	f << " JOIN " << right_cte_name << " ON " << JoinConditionsToSQL(join_conditions);
 	out.select_hint = SparkBroadcastHint(dialect);
-	out.select_exprs = cte_column_list;
+	out.select_exprs = select_expressions.empty() ? cte_column_list : select_expressions;
 	out.from = f.str();
 	return true;
 }

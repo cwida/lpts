@@ -175,6 +175,22 @@ private:
 		return sql;
 	}
 
+	static vector<string> AliasInlineSelectExpressions(const vector<string> &expressions, const vector<string> &names) {
+		if (expressions.empty()) {
+			return names;
+		}
+		vector<string> result;
+		result.reserve(expressions.size());
+		for (idx_t i = 0; i < expressions.size(); i++) {
+			if (i < names.size() && expressions[i] != names[i]) {
+				result.push_back(expressions[i] + " AS " + names[i]);
+			} else {
+				result.push_back(expressions[i]);
+			}
+		}
+		return result;
+	}
+
 	//--------------------------------------------------------------------------
 	// AstToInlineSQL: generate inline (non-CTE) SQL for a subtree.
 	//
@@ -319,15 +335,17 @@ private:
 					    EnumUtil::ToString(join.join_type));
 				}
 				string join_kw = join.join_type == JoinType::LEFT ? "ASOF LEFT JOIN" : "ASOF JOIN";
-				string sql = "SELECT " + VecToSeparatedList(join.cte_column_names) + " FROM (" + left_sql + ") " +
-				             join_kw + " (" + right_sql + ")";
+				auto select_cols = AliasInlineSelectExpressions(join.select_expressions, join.cte_column_names);
+				string sql = "SELECT " + VecToSeparatedList(select_cols) + " FROM (" + left_sql + ") " + join_kw +
+				             " (" + right_sql + ")";
 				if (!join.conditions.empty()) {
 					sql += " ON " + VecToSeparatedList(join.conditions, " AND ");
 				}
 				return sql;
 			}
-			return InlineJoinSql(join.join_type, join.cte_column_names, left_sql, right_sql, join.conditions,
-			                     join.mark_expression, "JOIN");
+			return InlineJoinSql(join.join_type,
+			                     AliasInlineSelectExpressions(join.select_expressions, join.cte_column_names), left_sql,
+			                     right_sql, join.conditions, join.mark_expression, "JOIN");
 		}
 
 		if (type == "PositionalJoin") {
@@ -741,9 +759,26 @@ private:
 		if (proj_top) {
 			unordered_map<string, string> nm;
 			vector<string> nv;
+			vector<string> project_outputs;
+			project_outputs.reserve(proj_top->cte_column_names.size());
 			for (size_t i = 0; i < proj_top->cte_column_names.size(); i++) {
 				nm[proj_top->cte_column_names[i]] = SubstituteColumnTokens(proj_top->expressions[i], col_map);
-				nv.push_back(proj_top->cte_column_names[i]);
+				project_outputs.push_back(proj_top->cte_column_names[i]);
+				if (i < proj_top->visible_column_count) {
+					nv.push_back(proj_top->cte_column_names[i]);
+				}
+			}
+			if (order_n && !order_n->projection_map.empty()) {
+				nv.clear();
+				nv.reserve(order_n->projection_map.size());
+				for (auto idx : order_n->projection_map) {
+					if (idx >= project_outputs.size()) {
+						throw InternalException(
+						    "LPTS ORDER: projection map index %llu out of bounds for %llu projection columns",
+						    (unsigned long long)idx, (unsigned long long)project_outputs.size());
+					}
+					nv.push_back(project_outputs[idx]);
+				}
 			}
 			col_map = std::move(nm);
 			visible = std::move(nv);
@@ -1042,10 +1077,10 @@ private:
 			const string right_name = MarkRightSideMaterialized(children_names[1]);
 			vector<string> conditions = QualifyAmbiguousJoinConditions(
 			    join.conditions, children_column_lists[0], children_column_lists[1], children_names[0], right_name);
-			auto join_node = make_uniq<JoinNode>(my_index, join.cte_column_names, children_names[0], right_name,
-			                                     join.join_type, conditions, join.mark_expression, join.is_asof,
-			                                     cte_nodes[cte_nodes.size() - 2]->spark_broadcast_hint,
-			                                     cte_nodes[cte_nodes.size() - 1]->spark_broadcast_hint);
+			auto join_node = make_uniq<JoinNode>(
+			    my_index, join.cte_column_names, children_names[0], right_name, join.join_type, conditions,
+			    join.mark_expression, join.is_asof, cte_nodes[cte_nodes.size() - 2]->spark_broadcast_hint,
+			    cte_nodes[cte_nodes.size() - 1]->spark_broadcast_hint, join.select_expressions);
 			join_node->mark_lhs_key = join.mark_lhs_key;
 			join_node->mark_rhs_key = join.mark_rhs_key;
 			join_node->mark_correlation_conditions = join.mark_correlation_conditions;

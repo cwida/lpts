@@ -148,6 +148,17 @@ private:
 		}
 	}
 
+	static void CollectColumnRefs(Expression &expr, vector<ColumnBinding> &bindings) {
+		if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
+			AddUniqueBinding(bindings, expr.Cast<BoundColumnRefExpression>().binding);
+		}
+		ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
+			if (child) {
+				CollectColumnRefs(*child, bindings);
+			}
+		});
+	}
+
 	vector<string> OutputColumnNames(LogicalOperator &op, const char *context) const {
 		vector<string> result;
 		for (const ColumnBinding &cb : op.GetColumnBindings()) {
@@ -163,6 +174,118 @@ private:
 			result.insert(result.end(), bindings.begin(), bindings.end());
 		}
 		return result;
+	}
+
+	static void AppendMappedJoinColumns(const vector<string> &child_cols, const vector<idx_t> &projection_map,
+	                                    vector<string> &result) {
+		if (projection_map.empty()) {
+			result.insert(result.end(), child_cols.begin(), child_cols.end());
+			return;
+		}
+		for (auto idx : projection_map) {
+			if (idx >= child_cols.size()) {
+				throw InternalException("LPTS JOIN: projection map index %llu out of bounds for %llu child columns",
+				                        (unsigned long long)idx, (unsigned long long)child_cols.size());
+			}
+			result.push_back(child_cols[idx]);
+		}
+	}
+
+	vector<string> BuildJoinSelectExpressions(LogicalOperator &op, const vector<unique_ptr<AstNode>> &child_nodes,
+	                                          idx_t expected_count) const {
+		auto *join = dynamic_cast<LogicalJoin *>(&op);
+		if (!join || child_nodes.size() != 2 || (!join->HasProjectionMap() && join->join_type != JoinType::MARK)) {
+			return {};
+		}
+		if (join->join_type == JoinType::MARK) {
+			return {};
+		}
+
+		vector<string> result;
+		auto left_cols = child_nodes[0]->OutputColumnNames();
+		auto right_cols = child_nodes[1]->OutputColumnNames();
+		if (join->join_type == JoinType::RIGHT_SEMI || join->join_type == JoinType::RIGHT_ANTI) {
+			AppendMappedJoinColumns(right_cols, join->right_projection_map, result);
+		} else {
+			AppendMappedJoinColumns(left_cols, join->left_projection_map, result);
+			if (join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI) {
+				AppendMappedJoinColumns(right_cols, join->right_projection_map, result);
+			}
+		}
+		if (result.size() != expected_count) {
+			return {};
+		}
+		return result;
+	}
+
+	void EnsureJoinChildEmitsColumn(AstJoinNode &join_node, const string &column_name) const {
+		if (std::find(join_node.cte_column_names.begin(), join_node.cte_column_names.end(), column_name) !=
+		    join_node.cte_column_names.end()) {
+			return;
+		}
+		if (join_node.select_expressions.empty()) {
+			join_node.select_expressions = join_node.cte_column_names;
+		}
+		join_node.cte_column_names.push_back(column_name);
+		join_node.select_expressions.push_back(column_name);
+	}
+
+	bool TryResolveChildBindingName(const ColumnBinding &binding, string &column_name) const {
+		auto it = column_map.find(MappableColumnBinding(binding));
+		if (it != column_map.end()) {
+			column_name = it->second->ToUniqueColumnName();
+			return true;
+		}
+		return false;
+	}
+
+	void EnsureJoinChildReferencedBindings(const vector<unique_ptr<AstNode>> &child_nodes,
+	                                       const vector<ColumnBinding> &refs) const {
+		if (child_nodes.size() != 1 || child_nodes[0]->NodeType() != "Join") {
+			return;
+		}
+		auto &join_node = static_cast<AstJoinNode &>(*child_nodes[0]);
+		auto child_outputs = join_node.OutputColumnNames();
+		for (auto &binding : refs) {
+			string column_name;
+			if (!TryResolveChildBindingName(binding, column_name)) {
+				continue;
+			}
+			if (std::find(child_outputs.begin(), child_outputs.end(), column_name) != child_outputs.end()) {
+				continue;
+			}
+			EnsureJoinChildEmitsColumn(join_node, column_name);
+			child_outputs.push_back(column_name);
+		}
+	}
+
+	void EnsureAggregateChildReferencedBindings(LogicalOperator &op,
+	                                            const vector<unique_ptr<AstNode>> &child_nodes) const {
+		if (op.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			return;
+		}
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		vector<ColumnBinding> refs;
+		for (auto &group : aggregate.groups) {
+			CollectColumnRefs(*group, refs);
+		}
+		for (auto &agg_expr : aggregate.expressions) {
+			CollectColumnRefs(*agg_expr, refs);
+		}
+		EnsureJoinChildReferencedBindings(child_nodes, refs);
+	}
+
+	void EnsureProjectionChildReferencedBindings(LogicalOperator &op,
+	                                             const vector<unique_ptr<AstNode>> &child_nodes) const {
+		if (op.type != LogicalOperatorType::LOGICAL_PROJECTION) {
+			return;
+		}
+		auto &projection = op.Cast<LogicalProjection>();
+		vector<ColumnBinding> refs;
+		for (auto &expr : projection.expressions) {
+			CollectColumnRefs(*expr, refs);
+		}
+		EnsureJoinChildReferencedBindings(child_nodes, refs);
 	}
 
 	/// SQL dialect for expression serialization (function renaming, etc.)
@@ -347,15 +470,6 @@ private:
 				RegisterChildBindingFallbacks(*child, child_bindings);
 			}
 		});
-	}
-
-	static void CollectColumnRefs(const Expression &expr, vector<ColumnBinding> &refs) {
-		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			const auto &bcr = expr.Cast<BoundColumnRefExpression>();
-			AddUniqueBinding(refs, bcr.binding);
-		}
-		ExpressionIterator::EnumerateChildren(const_cast<Expression &>(expr),
-		                                      [&](Expression &child) { CollectColumnRefs(child, refs); });
 	}
 
 	bool EnsureBindingAvailableFrom(LogicalOperator *op, const ColumnBinding &binding) {
@@ -1449,6 +1563,7 @@ private:
 				}
 			}
 			auto extra_it = extra_projection_outputs.find(op.get());
+			const idx_t visible_column_count = cte_column_names.size();
 			if (extra_it != extra_projection_outputs.end()) {
 				for (const auto &binding : extra_it->second) {
 					const unique_ptr<ColStruct> &src = FindColumnBinding(binding, "projection extra output");
@@ -1462,7 +1577,8 @@ private:
 				}
 			}
 
-			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index);
+			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index,
+			                                 /*is_window=*/false, visible_column_count);
 		}
 
 		//----------------------------------------------------------------------
@@ -1948,7 +2064,8 @@ private:
 				order_items.push_back(OrderByToAliasedString(order));
 			}
 			vector<string> cte_column_names = OutputColumnNames(*op, "order by output");
-			return make_uniq<AstOrderNode>(std::move(order_items), std::move(cte_column_names));
+			return make_uniq<AstOrderNode>(std::move(order_items), std::move(cte_column_names),
+			                               order_op.projection_map);
 		}
 
 		//----------------------------------------------------------------------
@@ -2518,6 +2635,10 @@ private:
 				child_nodes.push_back(RecursiveTraversal(child, false));
 			}
 		}
+		// Preserve child bindings that this aggregate references before BuildNode remaps
+		// group bindings to the aggregate output columns.
+		EnsureAggregateChildReferencedBindings(*op, child_nodes);
+		EnsureProjectionChildReferencedBindings(*op, child_nodes);
 		// 2. Build this node (column_map is now populated by children).
 		unique_ptr<AstNode> node = BuildNode(op, is_root);
 		// A nullptr return means this node should be skipped (e.g. compressed
@@ -2525,6 +2646,11 @@ private:
 		if (!node) {
 			D_ASSERT(child_nodes.size() == 1);
 			return std::move(child_nodes[0]);
+		}
+		if (node->NodeType() == "Join") {
+			auto &join_node = static_cast<AstJoinNode &>(*node);
+			join_node.select_expressions =
+			    BuildJoinSelectExpressions(*op, child_nodes, join_node.cte_column_names.size());
 		}
 		// 3. Attach children to preserve the tree structure.
 		for (auto &c : child_nodes) {

@@ -139,13 +139,17 @@ class AstProjectNode : public AstNode {
 public:
 	vector<string> expressions;      ///< Projected expressions / column references (child CTE names).
 	vector<string> cte_column_names; ///< CTE-scoped output names (e.g. "t1_name").
+	idx_t visible_column_count;      ///< Number of columns visible after pipeline fusion.
 	size_t table_index;
 	bool is_window; ///< True when this projection carries window (OVER) expressions; a fusion boundary.
 
 	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, size_t table_index,
-	               bool is_window = false)
+	               bool is_window = false, idx_t visible_column_count = DConstants::INVALID_INDEX)
 	    : expressions(std::move(expressions)), cte_column_names(std::move(cte_column_names)), table_index(table_index),
 	      is_window(is_window) {
+		this->visible_column_count =
+		    visible_column_count == DConstants::INVALID_INDEX ? this->cte_column_names.size() : visible_column_count;
+		D_ASSERT(this->visible_column_count <= this->cte_column_names.size());
 	}
 
 	string ToString(int indent = 0) const override;
@@ -186,9 +190,10 @@ public:
 class AstJoinNode : public AstNode {
 public:
 	JoinType join_type;
-	vector<string> conditions;       ///< Join conditions as strings (e.g. "(t0_id = t1_user_id)").
-	vector<string> cte_column_names; ///< All output column names (left ++ right + mark if MARK join).
-	string mark_expression;          ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" expression.
+	vector<string> conditions;         ///< Join conditions as strings (e.g. "(t0_id = t1_user_id)").
+	vector<string> cte_column_names;   ///< All output column names (left ++ right + mark if MARK join).
+	vector<string> select_expressions; ///< Explicit SELECT expressions for projection-map joins.
+	string mark_expression;            ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" expression.
 	/// For a MARK join with exactly one NULL-propagating comparison, the left/right key SQL of that
 	/// comparison, plus the null-safe correlation conditions. Used to build the 3-valued mark
 	/// (TRUE/FALSE/NULL) the SQL semantics of IN/ANY/ALL require. Empty otherwise.
@@ -211,9 +216,10 @@ public:
 	bool is_asof; ///< True for DuckDB ASOF JOIN.
 
 	AstJoinNode(JoinType join_type, vector<string> conditions, vector<string> cte_column_names,
-	            string mark_expression = "", bool is_asof = false)
+	            string mark_expression = "", bool is_asof = false, vector<string> select_expressions = {})
 	    : join_type(join_type), conditions(std::move(conditions)), cte_column_names(std::move(cte_column_names)),
-	      mark_expression(std::move(mark_expression)), is_asof(is_asof) {
+	      select_expressions(std::move(select_expressions)), mark_expression(std::move(mark_expression)),
+	      is_asof(is_asof) {
 	}
 
 	string ToString(int indent = 0) const override;
@@ -330,9 +336,11 @@ class AstOrderNode : public AstNode {
 public:
 	vector<string> order_items;      ///< e.g. "t1_age DESC", "t0_name ASC"
 	vector<string> cte_column_names; ///< passthrough from child.
+	vector<idx_t> projection_map;    ///< COLUMN_LIFETIME pruning map, when ORDER drops child columns.
 
-	AstOrderNode(vector<string> order_items, vector<string> cte_column_names)
-	    : order_items(std::move(order_items)), cte_column_names(std::move(cte_column_names)) {
+	AstOrderNode(vector<string> order_items, vector<string> cte_column_names, vector<idx_t> projection_map = {})
+	    : order_items(std::move(order_items)), cte_column_names(std::move(cte_column_names)),
+	      projection_map(std::move(projection_map)) {
 	}
 
 	string ToString(int indent = 0) const override;
