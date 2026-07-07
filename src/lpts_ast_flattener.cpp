@@ -78,6 +78,20 @@ private:
 		return true;
 	}
 
+	static bool IsQualifiedColumnToken(const string &s) {
+		if (s.empty() || s.find('.') == string::npos) {
+			return false;
+		}
+		for (char c : s) {
+			const bool ok =
+			    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.';
+			if (!ok) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	static bool ColumnListContains(const vector<string> &cols, const string &name) {
 		for (const auto &c : cols) {
 			if (StringUtil::CIEquals(c, name)) {
@@ -128,11 +142,17 @@ private:
 			string rhs = inner.substr(pos + op_lower.size());
 			StringUtil::Trim(lhs);
 			StringUtil::Trim(rhs);
-			if (!IsSimpleColumnToken(lhs) || !IsSimpleColumnToken(rhs)) {
+			const bool lhs_simple = IsSimpleColumnToken(lhs);
+			const bool rhs_simple = IsSimpleColumnToken(rhs);
+			const bool lhs_qualified = IsQualifiedColumnToken(lhs);
+			const bool rhs_qualified = IsQualifiedColumnToken(rhs);
+			if ((!lhs_simple && !lhs_qualified) || (!rhs_simple && !rhs_qualified)) {
 				return cond;
 			}
-			const bool lhs_ambiguous = ColumnListContains(left_cols, lhs) && ColumnListContains(right_cols, lhs);
-			const bool rhs_ambiguous = ColumnListContains(left_cols, rhs) && ColumnListContains(right_cols, rhs);
+			const bool lhs_ambiguous =
+			    lhs_simple && ColumnListContains(left_cols, lhs) && ColumnListContains(right_cols, lhs);
+			const bool rhs_ambiguous =
+			    rhs_simple && ColumnListContains(left_cols, rhs) && ColumnListContains(right_cols, rhs);
 			if (!lhs_ambiguous && !rhs_ambiguous) {
 				return cond;
 			}
@@ -153,6 +173,50 @@ private:
 			out.push_back(QualifyAmbiguousJoinCondition(cond, left_cols, right_cols, left_cte, right_cte));
 		}
 		return out;
+	}
+
+	static void AppendQualifiedColumns(const vector<string> &columns, const string &cte_name, vector<string> &out) {
+		for (const auto &column : columns) {
+			out.push_back(cte_name + "." + column);
+		}
+	}
+
+	static vector<string>
+	BuildQualifiedDefaultJoinSelectExpressions(JoinType join_type, const vector<vector<string>> &children_column_lists,
+	                                           const vector<string> &children_names, idx_t expected_count) {
+		if (children_column_lists.size() != 2 || children_names.size() != 2) {
+			return {};
+		}
+		vector<string> result;
+		if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+			AppendQualifiedColumns(children_column_lists[1], children_names[1], result);
+		} else {
+			AppendQualifiedColumns(children_column_lists[0], children_names[0], result);
+			if (join_type != JoinType::SEMI && join_type != JoinType::ANTI) {
+				AppendQualifiedColumns(children_column_lists[1], children_names[1], result);
+			}
+		}
+		return result.size() == expected_count ? result : vector<string>();
+	}
+
+	static vector<string> QualifySimpleJoinSelectExpressions(const vector<string> &expressions,
+	                                                         const vector<string> &left_cols,
+	                                                         const vector<string> &right_cols, const string &left_cte,
+	                                                         const string &right_cte) {
+		vector<string> result;
+		result.reserve(expressions.size());
+		for (const auto &expr : expressions) {
+			if (!IsSimpleColumnToken(expr)) {
+				result.push_back(expr);
+			} else if (ColumnListContains(left_cols, expr)) {
+				result.push_back(left_cte + "." + expr);
+			} else if (ColumnListContains(right_cols, expr)) {
+				result.push_back(right_cte + "." + expr);
+			} else {
+				result.push_back(expr);
+			}
+		}
+		return result;
 	}
 
 	static string InlineJoinSql(JoinType join_type, vector<string> select_cols, const string &left_sql,
@@ -1077,10 +1141,20 @@ private:
 			const string right_name = MarkRightSideMaterialized(children_names[1]);
 			vector<string> conditions = QualifyAmbiguousJoinConditions(
 			    join.conditions, children_column_lists[0], children_column_lists[1], children_names[0], right_name);
+			vector<string> select_expressions = join.select_expressions;
+			if (select_expressions.empty()) {
+				select_expressions = BuildQualifiedDefaultJoinSelectExpressions(join.join_type, children_column_lists,
+				                                                                {children_names[0], right_name},
+				                                                                join.cte_column_names.size());
+			} else {
+				select_expressions =
+				    QualifySimpleJoinSelectExpressions(select_expressions, children_column_lists[0],
+				                                       children_column_lists[1], children_names[0], right_name);
+			}
 			auto join_node = make_uniq<JoinNode>(
 			    my_index, join.cte_column_names, children_names[0], right_name, join.join_type, conditions,
 			    join.mark_expression, join.is_asof, cte_nodes[cte_nodes.size() - 2]->spark_broadcast_hint,
-			    cte_nodes[cte_nodes.size() - 1]->spark_broadcast_hint, join.select_expressions);
+			    cte_nodes[cte_nodes.size() - 1]->spark_broadcast_hint, select_expressions);
 			join_node->mark_lhs_key = join.mark_lhs_key;
 			join_node->mark_rhs_key = join.mark_rhs_key;
 			join_node->mark_correlation_conditions = join.mark_correlation_conditions;
