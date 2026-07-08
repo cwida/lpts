@@ -594,7 +594,8 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	const bool use_match_sentinel = !mark_expression.empty() && mark_expression != "true";
 	if (!mark_expression.empty() && !cte_column_list.empty()) {
 		select_cols.assign(cte_column_list.begin(), cte_column_list.end() - 1);
-		select_cols.push_back(use_match_sentinel ? "(_rhs_dedup._lpts_matched IS NOT NULL)" : mark_expression);
+		select_cols.push_back(use_match_sentinel ? "(" + right_cte_name + "._lpts_matched IS NOT NULL)"
+		                                         : mark_expression);
 		join_str << "SELECT " << hint;
 		join_str << VecToSeparatedList(select_cols) << " FROM ";
 	} else {
@@ -649,9 +650,9 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 	// carry duplicate rows per correlation key.
 	if (use_match_sentinel) {
 		// Non-null match sentinel (see above): NULL after the LEFT JOIN iff no RHS partner.
-		join_str << "(SELECT DISTINCT *, TRUE AS _lpts_matched FROM " << right_cte_name << ") AS _rhs_dedup";
+		join_str << "(SELECT DISTINCT *, TRUE AS _lpts_matched FROM " << right_cte_name << ") AS " << right_cte_name;
 	} else if (!mark_expression.empty() || join_type == JoinType::SINGLE) {
-		join_str << "(SELECT DISTINCT * FROM " << right_cte_name << ") AS _rhs_dedup";
+		join_str << "(SELECT DISTINCT * FROM " << right_cte_name << ") AS " << right_cte_name;
 	} else {
 		join_str << right_cte_name;
 	}
