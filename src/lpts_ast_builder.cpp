@@ -294,6 +294,38 @@ private:
 	/// Client context for runtime queries (e.g. DuckLake current snapshot).
 	ClientContext &context;
 
+	/// Re-target emitted table references at the destination system's catalog/schema.
+	///
+	/// The optimized plan carries the catalog/schema the query was planned against.
+	/// When LPTS is used to transpile for another system, those local names are just a
+	/// stand-in for the remote schema and must not appear in the output — the target
+	/// expects its own qualification (e.g. `spark_catalog`.`bronze`). These come from
+	/// `lpts_output_catalog` / `lpts_output_schema`; empty means "keep the planned
+	/// name", so unset behaviour is unchanged.
+	string output_catalog;
+	string output_schema;
+
+	/// Emit table references with no catalog/schema qualification at all, so the
+	/// target system resolves them through its own session default (`USE ...`).
+	/// Useful when one rendered query must run against several destinations that
+	/// agree on table names but not on catalog/schema layout. Takes precedence
+	/// over `output_catalog` / `output_schema`.
+	bool output_unqualified = false;
+
+	void ApplyOutputQualificationOverrides(string &catalog_name, string &schema_name) const {
+		if (output_unqualified) {
+			catalog_name.clear();
+			schema_name.clear();
+			return;
+		}
+		if (!output_catalog.empty()) {
+			catalog_name = output_catalog;
+		}
+		if (!output_schema.empty()) {
+			schema_name = output_schema;
+		}
+	}
+
 	LptsExpressionRenderer expression_renderer;
 
 	/// Cache: DuckLake catalog name → current snapshot_id.
@@ -1037,6 +1069,7 @@ private:
 				if (catalog_entry) {
 					catalog_name = catalog_entry->schema.ParentCatalog().GetName();
 					schema_name = catalog_entry->schema.name;
+					ApplyOutputQualificationOverrides(catalog_name, schema_name);
 					table_name = catalog_entry.get()->name;
 					if (is_ducklake_time_travel) {
 						table_name += " AT (VERSION => " + std::to_string(ducklake_snapshot_id) + ")";
@@ -2665,6 +2698,22 @@ public:
 	      expression_renderer(_dialect, [this](const ColumnBinding &binding, const char *context) {
 		      return FindColumnBinding(binding, context)->ToUniqueColumnName();
 	      }) {
+		output_catalog = ReadOutputQualification(_context, "lpts_output_catalog");
+		output_schema = ReadOutputQualification(_context, "lpts_output_schema");
+		Value unqualified;
+		if (_context.TryGetCurrentSetting("lpts_output_unqualified", unqualified) && !unqualified.IsNull()) {
+			output_unqualified = unqualified.GetValue<bool>();
+		}
+	}
+
+	/// Read one of the output-qualification overrides. Absent or empty means
+	/// "keep the catalog/schema the plan was built against".
+	static string ReadOutputQualification(ClientContext &context, const char *setting_name) {
+		Value setting;
+		if (context.TryGetCurrentSetting(setting_name, setting) && !setting.IsNull()) {
+			return setting.GetValue<string>();
+		}
+		return string();
 	}
 
 	/// Entry point: walk the plan and return the AST root.

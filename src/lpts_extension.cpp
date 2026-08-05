@@ -1322,6 +1322,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "'postgres', 'spark', 'hive', 'trino', 'presto', 'snowflake', 'bigquery', 'redshift', "
 	                          "'mysql', 'mariadb'",
 	                          LogicalType::VARCHAR, Value("duckdb"));
+	// Output qualification overrides. LPTS plans against a LOCAL catalog/schema, so the
+	// rendered table references carry local names. When the output is destined for
+	// another system, that local qualification is wrong: set these to the destination's
+	// names (e.g. lpts_output_catalog='spark_catalog') and every emitted table reference
+	// is qualified with them instead. Empty (default) keeps the planned names, so
+	// existing behaviour is unchanged.
+	config.AddExtensionOption("lpts_output_catalog",
+	                          "Catalog name to qualify emitted table references with, replacing the catalog the "
+	                          "query was planned against. Empty (default) keeps the planned catalog.",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("lpts_output_schema",
+	                          "Schema name to qualify emitted table references with, replacing the schema the "
+	                          "query was planned against. Empty (default) keeps the planned schema.",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("lpts_output_unqualified",
+	                          "Emit table references with no catalog/schema qualification, so the destination "
+	                          "resolves them through its own session default. Takes precedence over "
+	                          "lpts_output_catalog / lpts_output_schema. Default false.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("lpts_enable_data_dependent_optimizers",
 	                          "Enable LPTS planning optimizers that depend on current data, statistics, "
 	                          "cardinality estimates, row groups, or runtime dynamic filters.",
