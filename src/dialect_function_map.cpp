@@ -6,6 +6,7 @@
 //==============================================================================
 
 #include "dialect_function_map.hpp"
+#include "lpts_helpers.hpp"
 
 namespace duckdb {
 
@@ -20,6 +21,15 @@ string RemapForPostgres(const string &name) {
 	}
 	if (name == "strftime") {
 		return "to_char";
+	}
+	// PostgreSQL has no arg_min/arg_max, and no rewrite that preserves the
+	// aggregate's semantics in one expression. Refuse explicitly so the query is
+	// reported as inexpressible in this dialect, rather than emitting a call the
+	// target will reject as an unknown function — which reads like an engine
+	// limitation instead of a translation one.
+	if (name == "arg_min" || name == "argmin" || name == "arg_max" || name == "argmax") {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", SqlDialect::POSTGRES, "aggregate", name,
+		                        "AGGREGATE", "postgres has no arg_min/arg_max equivalent");
 	}
 	if (name == "string_split" || name == "str_split") {
 		// PostgreSQL uses string_to_array(string, delimiter) for the same purpose.
@@ -37,6 +47,14 @@ string RemapForPostgres(const string &name) {
 string RemapForSpark(const string &name) {
 	if (name == "strftime") {
 		return "date_format";
+	}
+	// DuckDB arg_min(arg, val) -> Spark min_by(arg, val): same argument order,
+	// same semantics (the arg at the extreme of val).
+	if (name == "arg_min" || name == "argmin") {
+		return "min_by";
+	}
+	if (name == "arg_max" || name == "argmax") {
+		return "max_by";
 	}
 	if (name == "strptime") {
 		return "to_timestamp";

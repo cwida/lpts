@@ -1742,6 +1742,13 @@ private:
 				// routine, so emitting it verbatim fails with "Cannot resolve routine
 				// count_star". The star is not a child expression, so the call is written out
 				// here rather than going through the name remap.
+				// Aggregates did NOT go through the dialect remap: the aggregate path emitted
+				// ba.function.name verbatim, so any DuckDB-only aggregate (arg_min, ...) reached
+				// the target as an unknown routine. count_star keeps its own case below because
+				// a name remap cannot express the star.
+				if (agg_name != "count_star") {
+					agg_name = RemapFunctionNameForDialect(agg_name, dialect);
+				}
 				const bool render_count_star = agg_name == "count_star" && ba.children.empty() &&
 				                               !is_export_state && dialect != SqlDialect::DUCKDB;
 				if (render_count_star) {
