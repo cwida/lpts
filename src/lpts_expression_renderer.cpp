@@ -7,6 +7,8 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+
+#include <set>
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -812,6 +814,36 @@ string LptsExpressionRenderer::OrderByToAliasedString(const BoundOrderByNode &or
 	return result.str();
 }
 
+namespace {
+
+/// Return a constant datetime-unit argument as a bare uppercase keyword, or ""
+/// when the argument is not a recognised unit literal.
+///
+/// Spark spells the unit as a keyword (`datediff(DAY, a, b)`) where DuckDB uses a
+/// string (`datediff('day', a, b)`). Only the units Spark documents are unquoted;
+/// anything else (a non-constant expression, an alias like 'dow', a unit Spark
+/// does not accept) returns "" so the caller emits the original form and the
+/// engine reports it, rather than this silently inventing a keyword.
+string UnquotedDatetimeUnitLiteral(const unique_ptr<Expression> &arg) {
+	if (!arg || arg->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return string();
+	}
+	const auto &constant = arg->Cast<BoundConstantExpression>();
+	if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
+		return string();
+	}
+	static const std::set<string> kSparkUnits = {"YEAR",   "QUARTER", "MONTH",       "WEEK",
+	                                             "DAY",    "DAYOFYEAR", "HOUR",      "MINUTE",
+	                                             "SECOND", "MILLISECOND", "MICROSECOND"};
+	string unit = StringUtil::Upper(constant.value.GetValue<string>());
+	if (kSparkUnits.find(unit) == kSparkUnits.end()) {
+		return string();
+	}
+	return unit;
+}
+
+} // namespace
+
 string LptsExpressionRenderer::WindowFunctionName(const BoundWindowExpression &window) const {
 	if (window.aggregate) {
 		string agg_name = window.aggregate->name;
@@ -1395,6 +1427,21 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			string emit_name = func_name;
 			if (func_name == "position" || func_name == "substring" || func_name == "overlay" || func_name == "trim") {
 				emit_name = "\"" + func_name + "\"";
+			}
+			// Spark's datediff takes the unit as a bare keyword, not a string:
+			// `datediff('day', a, b)` fails with INVALID_PARAMETER_VALUE.DATETIME_UNIT,
+			// it wants `datediff(DAY, a, b)`. Only datediff is affected — Spark's
+			// date_trunc/date_part really do take a quoted string, so they are left alone.
+			if (dialect == SqlDialect::SPARK && func_name == "datediff" && child_count >= 1) {
+				string unit = UnquotedDatetimeUnitLiteral(func_expr.children[0]);
+				if (!unit.empty()) {
+					expr_str << emit_name << "(" << unit;
+					for (idx_t i = 1; i < child_count; i++) {
+						expr_str << ", " << ExpressionToAliasedString(func_expr.children[i]);
+					}
+					expr_str << ")";
+					break;
+				}
 			}
 			expr_str << emit_name << "(";
 			if (UsesBigQueryDateFunctionArgumentOrder(func_expr.function.name, dialect) && child_count >= 2) {

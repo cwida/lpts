@@ -1738,7 +1738,17 @@ private:
 					// EXPORT_STATE)` does.
 					agg_str << "(";
 				}
-				agg_str << agg_name << "(";
+				// `count_star()` is DuckDB's spelling of `COUNT(*)`; no other dialect has that
+				// routine, so emitting it verbatim fails with "Cannot resolve routine
+				// count_star". The star is not a child expression, so the call is written out
+				// here rather than going through the name remap.
+				const bool render_count_star = agg_name == "count_star" && ba.children.empty() &&
+				                               !is_export_state && dialect != SqlDialect::DUCKDB;
+				if (render_count_star) {
+					agg_str << "count(*";
+				} else {
+					agg_str << agg_name << "(";
+				}
 				if (ba.IsDistinct()) {
 					agg_str << "DISTINCT ";
 				}
