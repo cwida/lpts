@@ -38,6 +38,23 @@ string RemapForPostgres(const string &name) {
 	return name;
 }
 
+/// Feldera uses Calcite's SQL surface. Its date formatting functions use the
+/// BigQuery-style names and argument order, while string splitting uses SPLIT.
+/// ARG_MIN/ARG_MAX are native Feldera aggregates and must not take PostgreSQL's
+/// unsupported-function path.
+string RemapForFeldera(const string &name) {
+	if (name == "strftime") {
+		return "FORMAT_TIMESTAMP";
+	}
+	if (name == "strptime") {
+		return "PARSE_TIMESTAMP";
+	}
+	if (name == "string_split" || name == "str_split") {
+		return "SPLIT";
+	}
+	return name;
+}
+
 /// Spark SQL equivalents for DuckDB function names that OpenIVM-emitted plans
 /// actually exercise. Functions Spark already has with identical signatures
 /// (e.g. `coalesce`, `greatest`, `least`, arithmetic operators, `length`,
@@ -196,7 +213,7 @@ string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect
 	case SqlDialect::POSTGRES:
 		return RemapForPostgres(duckdb_name);
 	case SqlDialect::FELDERA:
-		return duckdb_name;
+		return RemapForFeldera(duckdb_name);
 	case SqlDialect::SPARK:
 		return RemapForSpark(duckdb_name);
 	case SqlDialect::HIVE:

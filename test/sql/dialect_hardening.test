@@ -7,7 +7,7 @@ require lpts
 # Feldera is PostgreSQL-like but supports ARG_MIN/ARG_MAX directly. Its
 # DataFusion-backed ad-hoc evaluator also needs standard EXTRACT syntax.
 statement ok
-CREATE TABLE feldera_edges (id INTEGER, amount DECIMAL(12,2), ts TIMESTAMP);
+CREATE TABLE feldera_edges (id INTEGER, amount DECIMAL(12,2), ts TIMESTAMP, name VARCHAR);
 
 statement ok
 SET lpts_dialect = 'feldera';
@@ -31,6 +31,13 @@ query II
 SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS ansi_interval,
        sql NOT LIKE '%::INTERVAL%' AS no_duckdb_interval_cast
 FROM lpts_query('SELECT ts + INTERVAL ''30'' DAY FROM feldera_edges');
+----
+true	true
+
+query II
+SELECT sql LIKE '%FORMAT_TIMESTAMP(''%Y-%m'', ts)%' AS format_timestamp,
+       sql LIKE '%PARSE_TIMESTAMP(''%Y-%m-%d'', t0_name)%' AS parse_timestamp
+FROM lpts_query('SELECT strftime(ts, ''%Y-%m''), strptime(name, ''%Y-%m-%d'') FROM feldera_edges');
 ----
 true	true
 

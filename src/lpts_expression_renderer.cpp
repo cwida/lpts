@@ -234,8 +234,8 @@ static bool IsDateFormatFunction(const string &function_name) {
 	return function_name == "strftime" || function_name == "strptime";
 }
 
-static bool UsesBigQueryDateFunctionArgumentOrder(const string &function_name, SqlDialect dialect) {
-	return dialect == SqlDialect::BIGQUERY && IsDateFormatFunction(function_name);
+static bool UsesFormatFirstDateFunctionArgumentOrder(const string &function_name, SqlDialect dialect) {
+	return (dialect == SqlDialect::BIGQUERY || dialect == SqlDialect::FELDERA) && IsDateFormatFunction(function_name);
 }
 
 static bool IsDuckDBListFunction(const string &name) {
@@ -1479,7 +1479,7 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 				}
 			}
 			expr_str << emit_name << "(";
-			if (UsesBigQueryDateFunctionArgumentOrder(func_expr.function.name, dialect) && child_count >= 2) {
+			if (UsesFormatFirstDateFunctionArgumentOrder(func_expr.function.name, dialect) && child_count >= 2) {
 				expr_str << ExpressionToAliasedString(func_expr.children[1]);
 				expr_str << ", ";
 				expr_str << ExpressionToAliasedString(func_expr.children[0]);
