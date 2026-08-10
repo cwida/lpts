@@ -13,6 +13,7 @@ namespace duckdb {
 enum class SqlDialect {
 	DUCKDB,   ///< Default. Uses DuckDB-specific syntax (fully-qualified table refs, "ident" quoting, etc.)
 	POSTGRES, ///< PostgreSQL-compatible syntax (unqualified table refs, "ident" quoting, etc.)
+	FELDERA,  ///< Feldera SQL (unqualified refs, ANSI quoting, native ARG_MIN/ARG_MAX)
 	SPARK,    ///< Apache Spark SQL syntax (catalog.schema.table qualified, `ident` backtick quoting, ROWS/RANGE-only
 	          ///< windows)
 	HIVE,     ///< Apache Hive SQL syntax (schema.table qualified, `ident` backtick quoting)

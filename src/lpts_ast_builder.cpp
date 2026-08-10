@@ -475,6 +475,7 @@ private:
 	/// arguments bound to a pre-projection column; without carrying that binding upward, LPTS
 	/// can emit a stale CTE column name in the aggregate SELECT list.
 	unordered_map<const LogicalOperator *, vector<ColumnBinding>> extra_projection_outputs;
+	vector<ColumnBinding> referenced_bindings;
 
 	const unique_ptr<ColStruct> &FindColumnBinding(const ColumnBinding &binding, const char *context) const {
 		auto it = column_map.find(MappableColumnBinding(binding));
@@ -548,6 +549,7 @@ private:
 			auto *child = op->children[0].get();
 			const auto child_bindings = child->GetColumnBindings();
 			for (const auto &ref : refs) {
+				AddUniqueBinding(referenced_bindings, ref);
 				if (!HasBinding(child_bindings, ref)) {
 					EnsureBindingAvailableFrom(child, ref);
 				}
@@ -571,6 +573,7 @@ private:
 			auto *child = op->children[0].get();
 			const auto child_bindings = child->GetColumnBindings();
 			for (const auto &ref : refs) {
+				AddUniqueBinding(referenced_bindings, ref);
 				if (!HasBinding(child_bindings, ref)) {
 					EnsureBindingAvailableFrom(child, ref);
 				}
@@ -1224,6 +1227,11 @@ private:
 				// (optimizer removed unused columns), the binding index may
 				// differ from the loop index.
 				const idx_t col_id_idx = cb.column_index;
+				if (dialect != SqlDialect::DUCKDB && col_id_idx < col_ids.size() &&
+				    col_ids[col_id_idx].IsVirtualColumn() && !HasBinding(referenced_bindings, cb)) {
+					all_columns_native = false;
+					continue;
+				}
 				if (col_id_idx >= col_ids.size()) {
 					all_columns_native = false;
 					string col_name = "rowid";
@@ -1335,7 +1343,7 @@ private:
 				cte_column_names.clear();
 				column_is_expr.clear();
 				column_names.push_back("1");
-				column_is_expr.push_back(false);
+				column_is_expr.push_back(true);
 				cte_column_names.push_back("t" + std::to_string(table_index) + "_dummy");
 			}
 
@@ -1749,8 +1757,8 @@ private:
 				if (agg_name != "count_star") {
 					agg_name = RemapFunctionNameForDialect(agg_name, dialect);
 				}
-				const bool render_count_star = agg_name == "count_star" && ba.children.empty() &&
-				                               !is_export_state && dialect != SqlDialect::DUCKDB;
+				const bool render_count_star = agg_name == "count_star" && ba.children.empty() && !is_export_state &&
+				                               dialect != SqlDialect::DUCKDB;
 				if (render_count_star) {
 					agg_str << "count(*";
 				} else {

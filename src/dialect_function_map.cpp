@@ -28,8 +28,8 @@ string RemapForPostgres(const string &name) {
 	// target will reject as an unknown function — which reads like an engine
 	// limitation instead of a translation one.
 	if (name == "arg_min" || name == "argmin" || name == "arg_max" || name == "argmax") {
-		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", SqlDialect::POSTGRES, "aggregate", name,
-		                        "AGGREGATE", "postgres has no arg_min/arg_max equivalent");
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", SqlDialect::POSTGRES, "aggregate", name, "AGGREGATE",
+		                        "postgres has no arg_min/arg_max equivalent");
 	}
 	if (name == "string_split" || name == "str_split") {
 		// PostgreSQL uses string_to_array(string, delimiter) for the same purpose.
@@ -195,6 +195,8 @@ string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect
 	switch (dialect) {
 	case SqlDialect::POSTGRES:
 		return RemapForPostgres(duckdb_name);
+	case SqlDialect::FELDERA:
+		return duckdb_name;
 	case SqlDialect::SPARK:
 		return RemapForSpark(duckdb_name);
 	case SqlDialect::HIVE:
