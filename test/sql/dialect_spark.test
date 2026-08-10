@@ -21,6 +21,9 @@ CREATE TABLE events (id INTEGER, ts TIMESTAMP, vals INTEGER[]);
 statement ok
 INSERT INTO events VALUES (1, TIMESTAMP '2024-01-15 00:00:00', [1, 2, 3]);
 
+statement ok
+CREATE TABLE compiler_edges (d DECIMAL(4,4), name VARCHAR);
+
 # ============================================================
 # Setup: enable SPARK dialect
 # ============================================================
@@ -126,6 +129,30 @@ query I
 SELECT sql LIKE '%COALESCE(%' AS coalesce_passthrough FROM lpts_query('SELECT coalesce(name, CAST(id AS VARCHAR)) AS c FROM users');
 ----
 true
+
+# Cross-engine compiler-bench regressions: do not expose DuckDB's synthetic
+# rowid for COUNT(*), and emit Spark-native casts/function calls.
+query III
+SELECT sql NOT LIKE '%rowid%' AS count_star_has_no_rowid,
+       sql LIKE '%SELECT  1%' AS count_star_uses_dummy,
+       sql LIKE '%count(*)%' AS count_star_preserved
+FROM lpts_query('SELECT count(*) FROM compiler_edges');
+----
+true	true	true
+
+query II
+SELECT sql LIKE '%CAST(d AS STRING)%' AS varchar_cast_is_string,
+       sql NOT LIKE '%"substring"(%' AS substring_is_not_quoted
+FROM lpts_query('SELECT CAST(d AS VARCHAR), substring(name, 1, 2) FROM compiler_edges');
+----
+true	true
+
+query II
+SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS spark_interval,
+       sql NOT LIKE '%::INTERVAL%' AS no_postgres_interval_cast
+FROM lpts_query('SELECT ts + INTERVAL ''30'' DAY FROM events');
+----
+true	true
 
 # ============================================================
 # Window-frame SPARK gate: EXCLUDE clauses → NotImplementedException

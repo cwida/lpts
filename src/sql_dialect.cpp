@@ -13,6 +13,9 @@ SqlDialect ParseSqlDialectSetting(const string &value, const string &setting_nam
 	if (normalized == "postgres" || normalized == "postgresql") {
 		return SqlDialect::POSTGRES;
 	}
+	if (normalized == "feldera") {
+		return SqlDialect::FELDERA;
+	}
 	if (normalized == "spark") {
 		return SqlDialect::SPARK;
 	}
@@ -35,7 +38,7 @@ SqlDialect ParseSqlDialectSetting(const string &value, const string &setting_nam
 		return SqlDialect::MYSQL_MARIADB;
 	}
 	throw InvalidInputException(
-	    "Unknown %s '%s'. Valid values: 'duckdb', 'postgres', 'spark', 'hive', 'trino', 'presto', "
+	    "Unknown %s '%s'. Valid values: 'duckdb', 'postgres', 'feldera', 'spark', 'hive', 'trino', 'presto', "
 	    "'snowflake', 'bigquery', 'redshift', 'mysql', 'mariadb'",
 	    setting_name, value);
 }
@@ -50,6 +53,8 @@ string SqlDialectToString(SqlDialect dialect) {
 		return "duckdb";
 	case SqlDialect::POSTGRES:
 		return "postgres";
+	case SqlDialect::FELDERA:
+		return "feldera";
 	case SqlDialect::SPARK:
 		return "spark";
 	case SqlDialect::HIVE:
@@ -75,7 +80,7 @@ bool DialectUsesBacktickQuotedIdentifiers(SqlDialect dialect) {
 }
 
 bool DialectUsesUnqualifiedTableNames(SqlDialect dialect) {
-	return dialect == SqlDialect::POSTGRES || dialect == SqlDialect::REDSHIFT;
+	return dialect == SqlDialect::POSTGRES || dialect == SqlDialect::FELDERA || dialect == SqlDialect::REDSHIFT;
 }
 
 bool DialectUsesSchemaQualifiedTableNames(SqlDialect dialect) {

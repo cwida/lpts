@@ -4,6 +4,39 @@
 
 require lpts
 
+# Feldera is PostgreSQL-like but supports ARG_MIN/ARG_MAX directly. Its
+# DataFusion-backed ad-hoc evaluator also needs standard EXTRACT syntax.
+statement ok
+CREATE TABLE feldera_edges (id INTEGER, amount DECIMAL(12,2), ts TIMESTAMP);
+
+statement ok
+SET lpts_dialect = 'feldera';
+
+query III
+SELECT sql LIKE '%arg_min(%' AS arg_min_preserved,
+       sql LIKE '%arg_max(%' AS arg_max_preserved,
+       sql NOT LIKE '%LPTS_UNSUPPORTED_FUNCTION%' AS translated
+FROM lpts_query('SELECT arg_min(id, amount), arg_max(id, amount) FROM feldera_edges');
+----
+true	true	true
+
+query II
+SELECT sql LIKE '%EXTRACT(YEAR FROM%' AS extract_year,
+       sql LIKE '%EXTRACT(MONTH FROM%' AS extract_month
+FROM lpts_query('SELECT extract(year FROM ts), extract(month FROM ts) FROM feldera_edges');
+----
+true	true
+
+query II
+SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS ansi_interval,
+       sql NOT LIKE '%::INTERVAL%' AS no_duckdb_interval_cast
+FROM lpts_query('SELECT ts + INTERVAL ''30'' DAY FROM feldera_edges');
+----
+true	true
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
 statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, ts TIMESTAMP, vals INTEGER[]);
 

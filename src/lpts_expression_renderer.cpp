@@ -338,7 +338,7 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 	case LogicalTypeId::DECIMAL:
 		return type.ToString();
 	case LogicalTypeId::VARCHAR:
-		return "VARCHAR";
+		return dialect == SqlDialect::SPARK ? "STRING" : "VARCHAR";
 	case LogicalTypeId::DATE:
 		return "DATE";
 	case LogicalTypeId::TIME:
@@ -375,6 +375,35 @@ static string RenderConstantForDialect(const BoundConstantExpression &constant, 
 		return "TIMESTAMP '" + EscapeSingleQuotes(value.ToString()) + "'";
 	case LogicalTypeId::VARCHAR:
 		return "'" + EscapeSingleQuotes(value.GetValue<string>()) + "'";
+	case LogicalTypeId::INTERVAL: {
+		const auto interval = value.GetValue<interval_t>();
+		vector<string> parts;
+		if (interval.months != 0) {
+			parts.push_back("INTERVAL '" + std::to_string(interval.months) + "' MONTH");
+		}
+		if (interval.days != 0) {
+			parts.push_back("INTERVAL '" + std::to_string(interval.days) + "' DAY");
+		}
+		if (interval.micros != 0) {
+			const bool negative = interval.micros < 0;
+			const uint64_t magnitude = negative ? uint64_t(-(interval.micros + 1)) + 1 : uint64_t(interval.micros);
+			const uint64_t seconds = magnitude / Interval::MICROS_PER_SEC;
+			const uint64_t micros = magnitude % Interval::MICROS_PER_SEC;
+			string seconds_text = (negative ? "-" : "") + std::to_string(seconds);
+			if (micros != 0) {
+				string fraction = StringUtil::Format("%06llu", (unsigned long long)micros);
+				while (fraction.back() == '0') {
+					fraction.pop_back();
+				}
+				seconds_text += "." + fraction;
+			}
+			parts.push_back("INTERVAL '" + seconds_text + "' SECOND");
+		}
+		if (parts.empty()) {
+			return "INTERVAL '0' SECOND";
+		}
+		return parts.size() == 1 ? parts[0] : "(" + StringUtil::Join(parts, " + ") + ")";
+	}
 	default:
 		return value.ToSQLString();
 	}
@@ -832,9 +861,8 @@ string UnquotedDatetimeUnitLiteral(const unique_ptr<Expression> &arg) {
 	if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
 		return string();
 	}
-	static const std::set<string> kSparkUnits = {"YEAR",   "QUARTER", "MONTH",       "WEEK",
-	                                             "DAY",    "DAYOFYEAR", "HOUR",      "MINUTE",
-	                                             "SECOND", "MILLISECOND", "MICROSECOND"};
+	static const std::set<string> kSparkUnits = {"YEAR", "QUARTER", "MONTH",  "WEEK",        "DAY",        "DAYOFYEAR",
+	                                             "HOUR", "MINUTE",  "SECOND", "MILLISECOND", "MICROSECOND"};
 	string unit = StringUtil::Upper(constant.value.GetValue<string>());
 	if (kSparkUnits.find(unit) == kSparkUnits.end()) {
 		return string();
@@ -1383,6 +1411,12 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			break;
 		}
 		ValidateFunctionForDialect(func_expr, dialect);
+		if (dialect == SqlDialect::FELDERA && func_expr.children.size() == 1 &&
+		    (func_expr.function.name == "year" || func_expr.function.name == "month")) {
+			expr_str << "EXTRACT(" << StringUtil::Upper(func_expr.function.name) << " FROM "
+			         << ExpressionToAliasedString(func_expr.children[0]) << ")";
+			break;
+		}
 		// Dialect-specific function name remapping (see dialect_function_map.hpp).
 		string func_name = RemapFunctionNameForDialect(func_expr.function.name, dialect);
 		// For lambda functions, only serialize non-lambda, non-capture children
@@ -1425,7 +1459,8 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			// function resolver see the function call directly and bypass the
 			// keyword-syntax path.
 			string emit_name = func_name;
-			if (func_name == "position" || func_name == "substring" || func_name == "overlay" || func_name == "trim") {
+			if (IsDuckDBDialect(dialect) && (func_name == "position" || func_name == "substring" ||
+			                                 func_name == "overlay" || func_name == "trim")) {
 				emit_name = "\"" + func_name + "\"";
 			}
 			// Spark's datediff takes the unit as a bare keyword, not a string:
