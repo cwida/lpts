@@ -848,9 +848,9 @@ namespace {
 /// Return a constant datetime-unit argument as a bare uppercase keyword, or ""
 /// when the argument is not a recognised unit literal.
 ///
-/// Spark spells the unit as a keyword (`datediff(DAY, a, b)`) where DuckDB uses a
-/// string (`datediff('day', a, b)`). Only the units Spark documents are unquoted;
-/// anything else (a non-constant expression, an alias like 'dow', a unit Spark
+/// Spark and Feldera spell the unit as a keyword (`datediff(DAY, a, b)`) where
+/// DuckDB uses a string (`datediff('day', a, b)`). Only documented units are unquoted;
+/// anything else (a non-constant expression, an alias like 'dow', a unit the target
 /// does not accept) returns "" so the caller emits the original form and the
 /// engine reports it, rather than this silently inventing a keyword.
 string UnquotedDatetimeUnitLiteral(const unique_ptr<Expression> &arg) {
@@ -861,10 +861,11 @@ string UnquotedDatetimeUnitLiteral(const unique_ptr<Expression> &arg) {
 	if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
 		return string();
 	}
-	static const std::set<string> kSparkUnits = {"YEAR", "QUARTER", "MONTH",  "WEEK",        "DAY",        "DAYOFYEAR",
-	                                             "HOUR", "MINUTE",  "SECOND", "MILLISECOND", "MICROSECOND"};
+	static const std::set<string> kDatetimeUnits = {"YEAR",   "QUARTER",     "MONTH",      "WEEK",
+	                                                "DAY",    "DAYOFYEAR",   "HOUR",       "MINUTE",
+	                                                "SECOND", "MILLISECOND", "MICROSECOND"};
 	string unit = StringUtil::Upper(constant.value.GetValue<string>());
-	if (kSparkUnits.find(unit) == kSparkUnits.end()) {
+	if (kDatetimeUnits.find(unit) == kDatetimeUnits.end()) {
 		return string();
 	}
 	return unit;
@@ -1463,11 +1464,12 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			                                 func_name == "overlay" || func_name == "trim")) {
 				emit_name = "\"" + func_name + "\"";
 			}
-			// Spark's datediff takes the unit as a bare keyword, not a string:
+			// Spark and Feldera take the datediff unit as a bare keyword, not a string:
 			// `datediff('day', a, b)` fails with INVALID_PARAMETER_VALUE.DATETIME_UNIT,
 			// it wants `datediff(DAY, a, b)`. Only datediff is affected — Spark's
 			// date_trunc/date_part really do take a quoted string, so they are left alone.
-			if (dialect == SqlDialect::SPARK && func_name == "datediff" && child_count >= 1) {
+			if ((dialect == SqlDialect::SPARK || dialect == SqlDialect::FELDERA) && func_name == "datediff" &&
+			    child_count >= 1) {
 				string unit = UnquotedDatetimeUnitLiteral(func_expr.children[0]);
 				if (!unit.empty()) {
 					expr_str << emit_name << "(" << unit;

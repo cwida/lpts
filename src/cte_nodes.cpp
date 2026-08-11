@@ -973,7 +973,12 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 			SelectParts p;
 			if (nodes[i]->BuildSelectParts(dialect, p)) {
 				RenameParts(p, rename);
-				out << RenderSelectPretty(p, /*out_names=*/vector<string>(), INDENT_WIDTH, dialect);
+				// DataFusion validates a projection's expression names before applying the
+				// enclosing CTE's positional column aliases. Name Feldera projection
+				// expressions inside the SELECT so duplicate inputs remain distinguishable.
+				const bool name_projection_outputs =
+				    dialect == SqlDialect::FELDERA && dynamic_cast<ProjectNode *>(nodes[i].get()) != nullptr;
+				out << RenderSelectPretty(p, name_projection_outputs ? cols : vector<string>(), INDENT_WIDTH, dialect);
 			} else {
 				// Fallback (set ops, recursive CTE, table functions): the node's single-line body.
 				out << string(INDENT_WIDTH, ' ') << SubstituteColumnTokens(nodes[i]->ToQuery(dialect), rename);

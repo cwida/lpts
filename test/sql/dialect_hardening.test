@@ -41,6 +41,21 @@ FROM lpts_query('SELECT strftime(ts, ''%Y-%m''), strptime(name, ''%Y-%m-%d'') FR
 ----
 true	true
 
+query II
+SELECT sql LIKE '%datediff(DAY, min(ts), max(ts))%' AS unquoted_datediff_unit,
+       sql NOT LIKE '%datediff(''day''%' AS no_quoted_datediff_unit
+FROM lpts_query('SELECT datediff(''day'', min(ts), max(ts)) FROM feldera_edges');
+----
+true	true
+
+# DataFusion validates projection names before applying a CTE's positional column
+# aliases, so duplicate expressions must be named uniquely inside the projection.
+query I
+SELECT sql LIKE '%t0_id AS t1_id%' AS duplicate_projection_aliased
+FROM lpts_query('SELECT * FROM (SELECT DISTINCT id, id FROM feldera_edges) AS __lpts_input');
+----
+true
+
 statement ok
 SET lpts_dialect = 'duckdb';
 
