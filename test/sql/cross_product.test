@@ -52,3 +52,11 @@ SELECT u.id, u.name, o.id, o.user_id, o.amount FROM users u CROSS JOIN orders o;
 # Cross product with duplicate column names (both tables have "id")
 statement ok
 SELECT u.id, o.id FROM users u CROSS JOIN orders o;
+
+# A projected UNNEST child can expose rewritten bindings on the CROSS_PRODUCT itself.
+# The cross product must use the columns actually emitted by its children.
+statement ok
+SELECT t.t AS tier, COUNT(*)
+FROM (SELECT unnest(['premium', 'standard', 'basic']) AS t) t
+CROSS JOIN users u
+GROUP BY t.t;

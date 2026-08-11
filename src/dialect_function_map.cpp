@@ -62,6 +62,21 @@ string RemapForFeldera(const string &name) {
 /// functions surface as a Spark-side error rather than being silently
 /// mistranslated.
 string RemapForSpark(const string &name) {
+	if (name == "unnest") {
+		return "explode";
+	}
+	if (name == "~~") {
+		return "LIKE";
+	}
+	if (name == "~~*") {
+		return "ILIKE";
+	}
+	if (name == "!~~") {
+		return "NOT LIKE";
+	}
+	if (name == "!~~*") {
+		return "NOT ILIKE";
+	}
 	if (name == "strftime") {
 		return "date_format";
 	}

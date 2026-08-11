@@ -366,6 +366,9 @@ private:
 			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", "OUTER", context,
 			                        "MySQL/MariaDB do not support FULL OUTER JOIN");
 		}
+		if ((join_type == JoinType::SEMI || join_type == JoinType::ANTI) && dialect == SqlDialect::SPARK) {
+			return;
+		}
 		if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::RIGHT_SEMI ||
 		    join_type == JoinType::RIGHT_ANTI) {
 			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_JOIN_TYPE", dialect, "join_type", EnumUtil::ToString(join_type),
@@ -1080,7 +1083,7 @@ private:
 				} else {
 					// Table function without catalog entry (e.g. range(), read_csv())
 					std::ostringstream func_str;
-					func_str << get.function.name << "(";
+					func_str << RemapFunctionNameForDialect(get.function.name, dialect) << "(";
 					bool first_arg = true;
 					bool takes_table_argument = false;
 					for (const auto &arg_type : get.function.arguments) {
@@ -1802,6 +1805,12 @@ private:
 				} else if (agg_name == "reservoir_quantile" && child_exprs.size() == 1 && ba.bind_info) {
 					agg_str << ", " << ReservoirQuantileArguments(ba);
 				}
+				if (dialect == SqlDialect::SPARK && ba.order_bys && !ba.order_bys->orders.empty()) {
+					ThrowLptsNotImplemented(
+					    "LPTS_UNSUPPORTED_AGGREGATE_ORDER", dialect, "aggregate", agg_name,
+					    "LOGICAL_AGGREGATE_AND_GROUP_BY",
+					    "Spark 3.5 has no verified equivalent for this ordered aggregate expression");
+				}
 				// Preserve intra-aggregate ORDER BY — matters for LIST, STRING_AGG,
 				// and other order-sensitive aggregates. Drop it only for aggregates
 				// whose result is order-independent (sum/count/min/max/avg), since
@@ -2039,8 +2048,7 @@ private:
 
 		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
 			vector<string> cross_condition = {"(TRUE)"};
-			vector<string> cte_column_names = OutputColumnNames(*op, "cross product output");
-			return make_uniq<AstJoinNode>(JoinType::INNER, std::move(cross_condition), std::move(cte_column_names));
+			return make_uniq<AstJoinNode>(JoinType::INNER, std::move(cross_condition), vector<string>());
 		}
 
 		//----------------------------------------------------------------------
@@ -2707,6 +2715,17 @@ private:
 		}
 		if (node->NodeType() == "Join") {
 			auto &join_node = static_cast<AstJoinNode &>(*node);
+			if (op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+				// A cross product has no projection map: its output is exactly the left AST child followed by
+				// the right AST child. Use those emitted columns directly. A zero-column scan, for example,
+				// emits a synthetic dummy column to preserve row multiplicity but has no registered DuckDB
+				// output binding for that column.
+				for (const auto &child : child_nodes) {
+					auto child_columns = child->OutputColumnNames();
+					join_node.cte_column_names.insert(join_node.cte_column_names.end(), child_columns.begin(),
+					                                  child_columns.end());
+				}
+			}
 			join_node.select_expressions =
 			    BuildJoinSelectExpressions(*op, child_nodes, join_node.cte_column_names.size());
 		}

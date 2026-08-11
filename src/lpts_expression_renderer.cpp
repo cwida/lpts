@@ -345,6 +345,14 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 		return "TIME";
 	case LogicalTypeId::TIMESTAMP:
 		return "TIMESTAMP";
+	case LogicalTypeId::TIMESTAMP_TZ:
+		if (dialect == SqlDialect::SPARK) {
+			// Both types represent an absolute instant and render it in the session time zone.
+			return "TIMESTAMP_LTZ";
+		}
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
+		                        "target dialect has no verified timestamp-with-local-time-zone cast type");
+		return type.ToString();
 	default:
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
 		                        "no verified target dialect cast type mapping");
@@ -352,11 +360,7 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 	}
 }
 
-static string RenderConstantForDialect(const BoundConstantExpression &constant, SqlDialect dialect) {
-	if (IsDuckDBDialect(dialect)) {
-		return constant.ToString();
-	}
-	const auto &value = constant.value;
+static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
 	if (value.IsNull()) {
 		// An untyped NULL literal (SQLNULL) has no target-dialect cast type; emit a
 		// bare NULL, which is valid in every non-DuckDB dialect. Casting it to its own
@@ -369,6 +373,19 @@ static string RenderConstantForDialect(const BoundConstantExpression &constant, 
 		return "CAST(NULL AS " + RenderCastTargetType(value.type(), dialect) + ")";
 	}
 	switch (value.type().id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY: {
+		if (dialect != SqlDialect::SPARK) {
+			return value.ToSQLString();
+		}
+		const auto &children = ListValue::GetChildren(value);
+		vector<string> elements;
+		elements.reserve(children.size());
+		for (const auto &child : children) {
+			elements.push_back(RenderValueForDialect(child, dialect));
+		}
+		return "array(" + StringUtil::Join(elements, ", ") + ")";
+	}
 	case LogicalTypeId::DATE:
 		return "DATE '" + EscapeSingleQuotes(value.ToString()) + "'";
 	case LogicalTypeId::TIMESTAMP:
@@ -407,6 +424,13 @@ static string RenderConstantForDialect(const BoundConstantExpression &constant, 
 	default:
 		return value.ToSQLString();
 	}
+}
+
+static string RenderConstantForDialect(const BoundConstantExpression &constant, SqlDialect dialect) {
+	if (IsDuckDBDialect(dialect)) {
+		return constant.ToString();
+	}
+	return RenderValueForDialect(constant.value, dialect);
 }
 
 static string RenderComparisonForDialect(const string &lhs, const string &rhs, ExpressionType comparison,
@@ -1464,11 +1488,37 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			                                 func_name == "overlay" || func_name == "trim")) {
 				emit_name = "\"" + func_name + "\"";
 			}
-			// Spark and Feldera take the datediff unit as a bare keyword, not a string:
-			// `datediff('day', a, b)` fails with INVALID_PARAMETER_VALUE.DATETIME_UNIT,
-			// it wants `datediff(DAY, a, b)`. Only datediff is affected — Spark's
-			// date_trunc/date_part really do take a quoted string, so they are left alone.
-			if ((dialect == SqlDialect::SPARK || dialect == SqlDialect::FELDERA) && func_name == "datediff" &&
+			if (dialect == SqlDialect::SPARK &&
+			    (func_expr.function.name == "struct_pack" || func_expr.function.name == "row") &&
+			    func_expr.return_type.id() == LogicalTypeId::STRUCT && !StructType::IsUnnamed(func_expr.return_type)) {
+				expr_str << "named_struct(";
+				for (idx_t i = 0; i < child_count; i++) {
+					if (i > 0) {
+						expr_str << ", ";
+					}
+					expr_str << "'" << EscapeSingleQuotes(StructType::GetChildName(func_expr.return_type, i)) << "', "
+					         << ExpressionToAliasedString(func_expr.children[i]);
+				}
+				expr_str << ")";
+				break;
+			}
+			// DuckDB's date_diff(unit, start, end) differs from Spark 3.5's two-argument
+			// datediff(end, start). The DAY form is exactly expressible by reversing the value arguments;
+			// refuse other units until they have a verified Spark equivalent.
+			if (dialect == SqlDialect::SPARK && (func_name == "datediff" || func_name == "date_diff") &&
+			    child_count == 3) {
+				string unit = UnquotedDatetimeUnitLiteral(func_expr.children[0]);
+				if (unit != "DAY") {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", func_name,
+					                        "BOUND_FUNCTION",
+					                        "Spark 3.5 only has a verified date_diff mapping for DAY");
+				}
+				expr_str << "datediff(" << ExpressionToAliasedString(func_expr.children[2]) << ", "
+				         << ExpressionToAliasedString(func_expr.children[1]) << ")";
+				break;
+			}
+			// Feldera takes the three-argument datediff unit as a bare keyword.
+			if (dialect == SqlDialect::FELDERA && (func_name == "datediff" || func_name == "date_diff") &&
 			    child_count >= 1) {
 				string unit = UnquotedDatetimeUnitLiteral(func_expr.children[0]);
 				if (!unit.empty()) {
@@ -1747,7 +1797,8 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	}
 	case ExpressionClass::BOUND_UNNEST: {
 		const BoundUnnestExpression &unnest_expr = expression->Cast<BoundUnnestExpression>();
-		expr_str << "UNNEST(" << ExpressionToAliasedString(unnest_expr.child) << ")";
+		expr_str << (dialect == SqlDialect::SPARK ? "explode(" : "UNNEST(")
+		         << ExpressionToAliasedString(unnest_expr.child) << ")";
 		break;
 	}
 	case ExpressionClass::BOUND_WINDOW: {

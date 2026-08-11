@@ -130,6 +130,65 @@ SELECT sql LIKE '%COALESCE(%' AS coalesce_passthrough FROM lpts_query('SELECT co
 ----
 true
 
+# Spark supports left SEMI/ANTI joins directly.
+query II
+SELECT semi_result.sql LIKE '%SEMI JOIN%' AS semi_join,
+       anti_result.sql LIKE '%ANTI JOIN%' AS anti_join
+FROM lpts_query('SELECT u.id FROM users u SEMI JOIN events e ON u.id = e.id') semi_result,
+     lpts_query('SELECT u.id FROM users u ANTI JOIN events e ON u.id = e.id') anti_result;
+----
+true	true
+
+# DuckDB list constants and UNNEST use Spark's array()/explode() syntax in both
+# projection and table-function plans.
+query III
+SELECT projection.sql LIKE '%explode(array(''a'', ''b''))%' AS projection_explode,
+       table_func.sql LIKE '%FROM explode(array(1, 2))%' AS table_explode,
+       list_value.sql LIKE '%array(''a'', ''b'')%' AS constant_array
+FROM lpts_query('SELECT unnest([''a'', ''b''])') projection,
+     lpts_query('SELECT * FROM unnest([1, 2]) AS u(v)') table_func,
+     lpts_query('SELECT [''a'', ''b'']') list_value;
+----
+true	true	true
+
+# Spark operator/function spellings used by the compiler corpus.
+query III
+SELECT ilike_sql.sql LIKE '% ILIKE %' AS ilike_operator,
+       struct_sql.sql LIKE '%named_struct(''name'',%' AS named_struct,
+       datediff_sql.sql LIKE '%datediff(max_ts, min_ts)%' AS spark_date_diff
+FROM lpts_query('SELECT id FROM users WHERE name ILIKE ''%a%''') ilike_sql,
+     lpts_query('SELECT struct_pack(name := name, id := id) FROM users') struct_sql,
+     lpts_query('SELECT date_diff(''day'', min(ts), max(ts)) FROM events') datediff_sql;
+----
+true	true	true
+
+statement error
+SELECT * FROM lpts_query('SELECT date_diff(''hour'', min(ts), max(ts)) FROM events');
+----
+LPTS_UNSUPPORTED_FUNCTION
+
+query I
+SELECT sql LIKE '%CAST(ts AS TIMESTAMP_LTZ)%' AS timestamp_with_time_zone
+FROM lpts_query('SELECT CAST(ts AS TIMESTAMPTZ) FROM events');
+----
+true
+
+# Spark has no verified general equivalent for DuckDB's ordered list/string aggregation.
+statement error
+SELECT * FROM lpts_query('SELECT list(id ORDER BY name) FROM users');
+----
+LPTS_UNSUPPORTED_AGGREGATE_ORDER
+
+statement error
+SELECT * FROM lpts_query('SELECT mode(name ORDER BY name) FROM users');
+----
+LPTS_UNSUPPORTED_AGGREGATE_ORDER
+
+statement error
+SELECT * FROM lpts_query('SELECT string_agg(name, '','' ORDER BY name) FROM users');
+----
+LPTS_UNSUPPORTED_AGGREGATE_ORDER
+
 # Cross-engine compiler-bench regressions: do not expose DuckDB's synthetic
 # rowid for COUNT(*), and emit Spark-native casts/function calls.
 query III
