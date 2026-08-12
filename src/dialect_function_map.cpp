@@ -62,6 +62,9 @@ string RemapForFeldera(const string &name) {
 /// functions surface as a Spark-side error rather than being silently
 /// mistranslated.
 string RemapForSpark(const string &name) {
+	if (name == "get_current_timestamp") {
+		return "current_timestamp";
+	}
 	if (name == "unnest") {
 		return "explode";
 	}

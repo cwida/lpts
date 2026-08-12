@@ -146,7 +146,8 @@ static void LptsRunOptimizer(ClientContext &context, OptimizerType type, const s
 }
 
 static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &context, Binder &binder,
-                                                            unique_ptr<LogicalOperator> plan) {
+                                                            unique_ptr<LogicalOperator> plan,
+                                                            bool preserve_wall_clock) {
 	switch (plan->type) {
 	case LogicalOperatorType::LOGICAL_TRANSACTION:
 	case LogicalOperatorType::LOGICAL_PRAGMA:
@@ -164,7 +165,10 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 	}
 
 	Optimizer optimizer(binder, context);
-	LptsRunOptimizer(context, OptimizerType::EXPRESSION_REWRITER, [&]() { optimizer.rewriter.VisitOperator(*plan); });
+	if (!preserve_wall_clock) {
+		LptsRunOptimizer(context, OptimizerType::EXPRESSION_REWRITER,
+		                 [&]() { optimizer.rewriter.VisitOperator(*plan); });
+	}
 
 	LptsRunOptimizer(context, OptimizerType::CTE_INLINING, [&]() {
 		CTEInlining cte_inlining(optimizer);
@@ -330,12 +334,12 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 }
 
 static unique_ptr<LogicalOperator> LptsOptimizePlan(ClientContext &context, Binder &binder,
-                                                    unique_ptr<LogicalOperator> plan) {
-	if (EnableDataDependentOptimizers(context)) {
+                                                    unique_ptr<LogicalOperator> plan, bool preserve_wall_clock) {
+	if (EnableDataDependentOptimizers(context) && !preserve_wall_clock) {
 		Optimizer optimizer(binder, context);
 		return optimizer.Optimize(std::move(plan));
 	}
-	return LptsOptimizeConservative(context, binder, std::move(plan));
+	return LptsOptimizeConservative(context, binder, std::move(plan), preserve_wall_clock);
 }
 
 /// Plan a query and run it through the optimizer, returning the optimized
@@ -374,7 +378,8 @@ static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const strin
 	Planner planner(context);
 	planner.CreatePlan(parser.statements[0]->Copy());
 
-	auto result = LptsOptimizePlan(context, *planner.binder, std::move(planner.plan));
+	auto result =
+	    LptsOptimizePlan(context, *planner.binder, std::move(planner.plan), HasWallClockFunctionSQL(normalized));
 
 #if LPTS_DEBUG
 	LPTS_DEBUG_PRINT("[LPTS] ===== Optimized logical plan =====");

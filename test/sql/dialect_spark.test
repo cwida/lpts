@@ -173,6 +173,16 @@ FROM lpts_query('SELECT CAST(ts AS TIMESTAMPTZ) FROM events');
 ----
 true
 
+# CURRENT_TIMESTAMP must remain a function call. DuckDB's expression rewriter
+# normally folds it to a TIMESTAMPTZ constant at LPTS planning time, which both
+# froze the wall clock and leaked DuckDB's `::TIMESTAMP WITH TIME ZONE` syntax.
+query II
+SELECT sql LIKE '%current_timestamp()%' AS current_timestamp_preserved,
+       sql NOT LIKE '%TIMESTAMP WITH TIME ZONE%' AS no_duckdb_timestamp_cast
+FROM lpts_query('SELECT date_diff(''day'', ts, CURRENT_TIMESTAMP) FROM events');
+----
+true	true
+
 # Spark has no verified general equivalent for DuckDB's ordered list/string aggregation.
 statement error
 SELECT * FROM lpts_query('SELECT list(id ORDER BY name) FROM users');
@@ -205,6 +215,15 @@ SELECT sql LIKE '%CAST(d AS STRING)%' AS varchar_cast_is_string,
 FROM lpts_query('SELECT CAST(d AS VARCHAR), substring(name, 1, 2) FROM compiler_edges');
 ----
 true	true
+
+# DuckDB widens several ordinary integer aggregate expressions through HUGEINT.
+# Spark has no 128-bit integer, but casts from source domains no wider than
+# BIGINT/DECIMAL(38) are exactly representable as DECIMAL(38,0).
+query I
+SELECT sql LIKE '%CAST(id AS DECIMAL(38,0))%' AS bounded_hugeint_cast
+FROM lpts_query('SELECT CAST(id AS HUGEINT) FROM users');
+----
+true
 
 query II
 SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS spark_interval,

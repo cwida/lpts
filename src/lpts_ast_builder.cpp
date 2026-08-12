@@ -1961,7 +1961,7 @@ private:
 			if (is_asof && dialect != SqlDialect::DUCKDB) {
 				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
 				                        LogicalOperatorToString(op->type), "AstBuilder",
-				                        "ASOF JOIN SQL syntax is DuckDB-specific");
+				                        "Spark 3.5 has no ASOF JOIN SQL syntax");
 			}
 			vector<string> conditions;
 			vector<ColumnBinding> child_bindings = ChildBindings(*op);
@@ -2056,7 +2056,7 @@ private:
 			if (dialect != SqlDialect::DUCKDB) {
 				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
 				                        LogicalOperatorToString(op->type), "AstBuilder",
-				                        "POSITIONAL JOIN SQL syntax is DuckDB-specific");
+				                        "Spark 3.5 has no positional row-alignment join");
 			}
 			vector<string> cte_column_names = OutputColumnNames(*op, "positional join output");
 			return make_uniq<AstPositionalJoinNode>(std::move(cte_column_names));
@@ -2065,9 +2065,10 @@ private:
 		//----------------------------------------------------------------------
 		case LogicalOperatorType::LOGICAL_SAMPLE: {
 			if (dialect != SqlDialect::DUCKDB) {
-				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator",
-				                        LogicalOperatorToString(op->type), "AstBuilder",
-				                        "USING SAMPLE SQL syntax is DuckDB-specific");
+				ThrowLptsNotImplemented(
+				    "LPTS_UNSUPPORTED_OPERATOR", dialect, "logical_operator", LogicalOperatorToString(op->type),
+				    "AstBuilder",
+				    "Spark TABLESAMPLE ROWS is approximate and does not preserve DuckDB reservoir semantics");
 			}
 			const LogicalSample &sample = op->Cast<LogicalSample>();
 			if (!sample.sample_options) {

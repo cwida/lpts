@@ -83,6 +83,12 @@ void RemoveRedundantWhitespaces(string &query);
 /// can depend on evaluation order (avg/stddev*/variance/var_*).
 bool IsLikelyNondeterministicSQL(const string &sql, string &reason);
 
+/// True when `sql` references a wall-clock or transaction-time function. LPTS
+/// must preserve these expressions through planning: DuckDB's expression
+/// rewriter otherwise folds them to the planning instant, changing the query's
+/// meaning when the rendered SQL is executed later.
+bool HasWallClockFunctionSQL(const string &sql);
+
 // Build the SQL for `DISTINCT ON (targets) ... [ORDER BY orders]` as a portable row_number() filter:
 //   SELECT <cols> FROM (SELECT <cols>, row_number() OVER (PARTITION BY <targets> [ORDER BY <orders>])
 //                       AS _lpts_distinct_on_rn FROM <from_clause>) AS _lpts_distinct_on
