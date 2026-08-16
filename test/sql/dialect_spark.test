@@ -9,6 +9,12 @@
 
 require lpts
 
+# Some SPARK-dialect assertions translate queries whose binding folds
+# CURRENT_TIMESTAMP to a TIMESTAMPTZ constant, which pulls in icu. CI runners
+# that cannot autoload icu (e.g. offline linux_amd64) would otherwise fail the
+# whole file; require it so those runners skip instead of erroring.
+require icu
+
 statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
 
