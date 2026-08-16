@@ -8,6 +8,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 
+#include <map>
 #include <set>
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -912,6 +913,36 @@ namespace {
 /// Return a constant datetime-unit argument as a bare uppercase keyword, or ""
 /// when the argument is not a recognised unit literal.
 ///
+/// PostgreSQL EXTRACT field for a DuckDB single-argument date-part function, or
+/// nullptr when there is no exact equivalent.
+///
+/// Only fields whose DuckDB and SQL-standard meanings coincide are listed.
+/// `dayofweek` maps to DOW because both count Sunday as 0; `isodow` differs and
+/// is therefore mapped separately rather than folded in. Anything absent falls
+/// through to the generic call path, so an unmapped function is reported by the
+/// target instead of being silently mistranslated.
+const char *PostgresExtractField(const string &function_name) {
+	static const std::map<string, const char *> kExtractFields = {
+	    {"year", "YEAR"},
+	    {"month", "MONTH"},
+	    {"day", "DAY"},
+	    {"hour", "HOUR"},
+	    {"minute", "MINUTE"},
+	    {"second", "SECOND"},
+	    {"quarter", "QUARTER"},
+	    {"week", "WEEK"},
+	    {"dayofweek", "DOW"},
+	    {"dayofyear", "DOY"},
+	    {"isodow", "ISODOW"},
+	    {"epoch", "EPOCH"},
+	    {"millennium", "MILLENNIUM"},
+	    {"century", "CENTURY"},
+	    {"decade", "DECADE"},
+	};
+	auto entry = kExtractFields.find(StringUtil::Lower(function_name));
+	return entry == kExtractFields.end() ? nullptr : entry->second;
+}
+
 /// Spark and Feldera spell the unit as a keyword (`datediff(DAY, a, b)`) where
 /// DuckDB uses a string (`datediff('day', a, b)`). Only documented units are unquoted;
 /// anything else (a non-constant expression, an alias like 'dow', a unit the target
@@ -1490,6 +1521,30 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		    (func_expr.function.name == "year" || func_expr.function.name == "month")) {
 			expr_str << "EXTRACT(" << StringUtil::Upper(func_expr.function.name) << " FROM "
 			         << ExpressionToAliasedString(func_expr.children[0]) << ")";
+			break;
+		}
+		// PostgreSQL has no year()/month()/dayofweek()/... date-part shorthands;
+		// the part is spelled EXTRACT(<field> FROM value). Emitting the DuckDB
+		// name produced "function year(timestamp without time zone) does not
+		// exist" at the target, which reads as an engine gap when it is really a
+		// translation one. Only the fields whose DuckDB and SQL-standard
+		// meanings coincide are mapped; anything else falls through to the
+		// generic path and is reported honestly by the target.
+		if (dialect == SqlDialect::POSTGRES && func_expr.children.size() == 1) {
+			const char *extract_field = PostgresExtractField(func_expr.function.name);
+			if (extract_field != nullptr) {
+				expr_str << "EXTRACT(" << extract_field << " FROM " << ExpressionToAliasedString(func_expr.children[0])
+				         << ")";
+				break;
+			}
+		}
+		// DuckDB's contains(haystack, needle) -> boolean has no PostgreSQL
+		// equivalent under that name, but strpos() is exactly it once compared
+		// against zero.
+		if (dialect == SqlDialect::POSTGRES && func_expr.function.name == "contains" &&
+		    func_expr.children.size() == 2) {
+			expr_str << "(strpos(" << ExpressionToAliasedString(func_expr.children[0]) << ", "
+			         << ExpressionToAliasedString(func_expr.children[1]) << ") > 0)";
 			break;
 		}
 		// Dialect-specific function name remapping (see dialect_function_map.hpp).

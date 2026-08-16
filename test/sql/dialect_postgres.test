@@ -112,6 +112,78 @@ SELECT sql LIKE '%string_to_array(%' AS postgres_string_split FROM lpts_query('S
 ----
 true
 
+# ------------------------------------------------------------
+# Date-part shorthands → EXTRACT
+# ------------------------------------------------------------
+# PostgreSQL has no year()/month()/... functions; emitting the DuckDB name
+# produced "function year(timestamp without time zone) does not exist" at the
+# target, which reads as an engine gap rather than a translation one.
+
+query I
+SELECT sql LIKE '%EXTRACT(YEAR FROM %' AS postgres_year FROM lpts_query('SELECT year(ts) AS y FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%EXTRACT(MONTH FROM %' AS postgres_month FROM lpts_query('SELECT month(ts) AS m FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%EXTRACT(HOUR FROM %' AS postgres_hour FROM lpts_query('SELECT hour(ts) AS h FROM events');
+----
+true
+
+# dayofweek maps to DOW: both DuckDB and PostgreSQL count Sunday as 0.
+query I
+SELECT sql LIKE '%EXTRACT(DOW FROM %' AS postgres_dayofweek FROM lpts_query('SELECT dayofweek(ts) AS d FROM events');
+----
+true
+
+query I
+SELECT sql LIKE '%EXTRACT(EPOCH FROM %' AS postgres_epoch FROM lpts_query('SELECT epoch(ts) AS e FROM events');
+----
+true
+
+# Round-trip: the EXTRACT form must still produce DuckDB's answer.
+query I
+SELECT year(ts) AS y FROM events ORDER BY y;
+----
+2024
+
+query II
+SELECT month(ts) AS m, dayofweek(ts) AS d FROM events ORDER BY m;
+----
+1	1
+
+# A single-argument function with no exact EXTRACT equivalent is left alone, so
+# the target reports it rather than this inventing a field name.
+query I
+SELECT sql NOT LIKE '%EXTRACT(%' AS postgres_length_untouched FROM lpts_query('SELECT length(name) AS n FROM users');
+----
+true
+
+# ------------------------------------------------------------
+# contains() → strpos() > 0
+# ------------------------------------------------------------
+# PostgreSQL has no contains(); strpos() is exactly it once compared to zero.
+
+query I
+SELECT sql LIKE '%strpos(%' AS postgres_contains FROM lpts_query('SELECT contains(name, ''li'') AS c FROM users');
+----
+true
+
+query I
+SELECT sql LIKE '%> 0)%' AS postgres_contains_boolean FROM lpts_query('SELECT contains(name, ''li'') AS c FROM users');
+----
+true
+
+query II
+SELECT name, contains(name, 'li') AS c FROM users ORDER BY name;
+----
+Alice	true
+Bob	false
+
 # Functions shared between DuckDB and PostgreSQL pass through unchanged.
 # COALESCE is a BOUND_OPERATOR so it bypasses the dialect function remap.
 query I
