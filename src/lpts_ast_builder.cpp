@@ -99,6 +99,8 @@ private:
 		}
 	};
 
+	using ColumnMap = std::map<MappableColumnBinding, unique_ptr<ColStruct>>;
+
 	// A set of emitted CTE column names with case-insensitive membership. DuckDB resolves identifiers
 	// case-insensitively, so two generated names differing only in case (t1_hello vs t1_HeLlO) would
 	// collide when referenced. Deduping against this set treats them as equal, so the second gets a suffix.
@@ -140,6 +142,20 @@ private:
 			}
 		}
 		return false;
+	}
+
+	static bool IsSetOperationType(LogicalOperatorType type) {
+		return type == LogicalOperatorType::LOGICAL_UNION || type == LogicalOperatorType::LOGICAL_EXCEPT ||
+		       type == LogicalOperatorType::LOGICAL_INTERSECT;
+	}
+
+	static ColumnMap CloneColumnMap(const ColumnMap &source) {
+		ColumnMap cloned;
+		for (const auto &entry : source) {
+			cloned[entry.first] =
+			    make_uniq<ColStruct>(entry.second->table_index, entry.second->column_name, entry.second->alias);
+		}
+		return cloned;
 	}
 
 	static void AddUniqueBinding(vector<ColumnBinding> &bindings, const ColumnBinding &binding) {
@@ -462,7 +478,7 @@ private:
 
 	/// Global map: ColumnBinding → ColStruct.
 	/// Populated bottom-up; each operator registers its output columns here.
-	std::map<MappableColumnBinding, unique_ptr<ColStruct>> column_map;
+	ColumnMap column_map;
 
 	/// Maps DELIM_GET table_index → source column names (from the outer/left CTE).
 	/// Populated by PreregisterDelimGetColumns before the right subtree is traversed.
@@ -491,6 +507,23 @@ private:
 		    context, (unsigned long long)binding.table_index, (unsigned long long)binding.column_index);
 	}
 
+	bool TryResolveProjectionBinding(const LogicalProjection &proj, const ColumnBinding &binding,
+	                                 ColumnBinding &resolved) const {
+		if (proj.children.empty()) {
+			return false;
+		}
+		const auto child_bindings = proj.children[0]->GetColumnBindings();
+		resolved = binding;
+		if ((!HasBinding(child_bindings, resolved) && IsSetOperationType(proj.children[0]->type)) ||
+		    column_map.find(MappableColumnBinding(resolved)) == column_map.end()) {
+			if (resolved.column_index >= child_bindings.size()) {
+				return false;
+			}
+			resolved = child_bindings[resolved.column_index];
+		}
+		return true;
+	}
+
 	void RegisterChildBindingFallbacks(Expression &expr, const vector<ColumnBinding> &child_bindings) {
 		if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = expr.Cast<BoundColumnRefExpression>();
@@ -504,6 +537,25 @@ private:
 		ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
 			if (child) {
 				RegisterChildBindingFallbacks(*child, child_bindings);
+			}
+		});
+	}
+
+	void RegisterChildBindingFallbacks(Expression &expr, const LogicalProjection &proj) {
+		if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
+			auto &bcr = expr.Cast<BoundColumnRefExpression>();
+			ColumnBinding resolved;
+			if (TryResolveProjectionBinding(proj, bcr.binding, resolved) &&
+			    (!(resolved == bcr.binding) ||
+			     column_map.find(MappableColumnBinding(bcr.binding)) == column_map.end())) {
+				auto &src = FindColumnBinding(resolved, "projection fallback");
+				column_map[MappableColumnBinding(bcr.binding)] =
+				    make_uniq<ColStruct>(src->table_index, src->column_name, src->alias);
+			}
+		}
+		ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
+			if (child) {
+				RegisterChildBindingFallbacks(*child, proj);
 			}
 		});
 	}
@@ -835,12 +887,8 @@ private:
 		}
 		const auto child_bindings = proj.children[0]->GetColumnBindings();
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		resolved = bcr.binding;
-		if (column_map.find(MappableColumnBinding(resolved)) == column_map.end()) {
-			if (resolved.column_index >= child_bindings.size()) {
-				return false;
-			}
-			resolved = child_bindings[resolved.column_index];
+		if (!TryResolveProjectionBinding(proj, bcr.binding, resolved)) {
+			return false;
 		}
 		if (ordinal >= child_bindings.size()) {
 			return false;
@@ -1555,12 +1603,8 @@ private:
 				if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = expr->Cast<BoundColumnRefExpression>();
 					ColumnBinding lookup_binding = bcr.binding;
-					if (column_map.find(MappableColumnBinding(lookup_binding)) == column_map.end() &&
-					    !proj.children.empty()) {
-						auto child_bindings = proj.children[0]->GetColumnBindings();
-						if (lookup_binding.column_index < child_bindings.size()) {
-							lookup_binding = child_bindings[lookup_binding.column_index];
-						}
+					if (TryResolveProjectionBinding(proj, bcr.binding, lookup_binding)) {
+						// lookup_binding already resolved against the set-op child when needed.
 					}
 					const unique_ptr<ColStruct> &desc = FindColumnBinding(lookup_binding, "projection");
 					const string src_name = desc->ToUniqueColumnName();
@@ -1585,7 +1629,7 @@ private:
 					column_map[MappableColumnBinding(new_cb)] = std::move(new_col);
 				} else {
 					if (!proj.children.empty()) {
-						RegisterChildBindingFallbacks(*expr, proj.children[0]->GetColumnBindings());
+						RegisterChildBindingFallbacks(*expr, proj);
 					}
 					string expr_str = ExpressionToAliasedString(expr);
 					expressions.emplace_back(expr_str);
@@ -2617,19 +2661,15 @@ private:
 	unique_ptr<AstNode> RecursiveTraversal(unique_ptr<LogicalOperator> &op, bool is_root = false) {
 		// 1. Recurse into children first (post-order).
 		vector<unique_ptr<AstNode>> child_nodes;
-		if ((op->type == LogicalOperatorType::LOGICAL_UNION || op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
-		     op->type == LogicalOperatorType::LOGICAL_INTERSECT) &&
-		    op->children.size() >= 2) {
+		if (IsSetOperationType(op->type) && op->children.size() >= 2) {
 			// Set operations: scope column_map to prevent sibling children from overwriting
 			// each other's entries when subtrees share table indices.
 			child_nodes.push_back(RecursiveTraversal(op->children[0]));
-			// Save column_map after first child; restore before each subsequent child
-			std::map<MappableColumnBinding, unique_ptr<ColStruct>> saved_map;
-			for (auto &entry : column_map) {
-				saved_map[entry.first] =
-				    make_uniq<ColStruct>(entry.second->table_index, entry.second->column_name, entry.second->alias);
-			}
+			// Save the lhs-visible bindings, then replay each sibling under that same scope so one branch
+			// cannot leak its table-index mappings into another or into the parent set-op output.
+			ColumnMap saved_map = CloneColumnMap(column_map);
 			for (size_t ci = 1; ci < op->children.size(); ci++) {
+				column_map = CloneColumnMap(saved_map);
 				child_nodes.push_back(RecursiveTraversal(op->children[ci]));
 			}
 			column_map = std::move(saved_map);
