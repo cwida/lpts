@@ -1,4 +1,5 @@
 #include "lpts_helpers.hpp"
+#include "lpts_sql_scanner.hpp"
 
 #include "duckdb/parser/keyword_helper.hpp"
 
@@ -365,6 +366,28 @@ static bool HasWindowFunctionCall(const string &sql, const string &function_name
 	return HasFunctionCall(sql, function_name) && ContainsNormalizedPhrase(sql, "over");
 }
 
+static bool HasIdentifierToken(const string &sql, const string &identifier) {
+	for (idx_t pos = 0; pos < sql.size();) {
+		idx_t end;
+		if (TryReadSkippableSqlSpan(sql, pos, end)) {
+			pos = end;
+			continue;
+		}
+		if (MatchesKeywordAt(sql, pos, identifier)) {
+			return true;
+		}
+		pos++;
+	}
+	return false;
+}
+
+bool HasWallClockFunctionSQL(const string &sql) {
+	return HasFunctionCall(sql, "now") || HasIdentifierToken(sql, "current_timestamp") ||
+	       HasIdentifierToken(sql, "current_date") || HasIdentifierToken(sql, "current_time") ||
+	       HasFunctionCall(sql, "get_current_timestamp") || HasFunctionCall(sql, "transaction_timestamp") ||
+	       HasFunctionCall(sql, "current_localtimestamp") || HasFunctionCall(sql, "current_localtime");
+}
+
 bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 	// Order-sensitive aggregates (string_agg, group_concat, listagg, list, array_agg) concatenate/collect
 	// their inputs in an order that is only fully defined when an in-aggregate ORDER BY names a UNIQUE key.
@@ -405,10 +428,7 @@ bool IsLikelyNondeterministicSQL(const string &sql, string &reason) {
 		return true;
 	}
 	// Wall-clock / transaction-time functions return a value that depends on when they run.
-	if (HasFunctionCall(sql, "now") || ContainsNormalizedPhrase(sql, "current_timestamp") ||
-	    ContainsNormalizedPhrase(sql, "current_date") || ContainsNormalizedPhrase(sql, "current_time") ||
-	    HasFunctionCall(sql, "get_current_timestamp") || HasFunctionCall(sql, "transaction_timestamp") ||
-	    HasFunctionCall(sql, "current_localtimestamp") || HasFunctionCall(sql, "current_localtime")) {
+	if (HasWallClockFunctionSQL(sql)) {
 		reason = "wall-clock/transaction time function";
 		return true;
 	}
