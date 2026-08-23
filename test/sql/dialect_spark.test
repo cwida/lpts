@@ -212,6 +212,41 @@ FROM lpts_query('SELECT CAST(d AS VARCHAR), substring(name, 1, 2) FROM compiler_
 ----
 true	true
 
+# DuckDB/OpenIVM introduces HUGEINT casts while widening ordinary integer
+# expressions. Spark has no 128-bit integer, so use DECIMAL(38,0) only when the
+# source domain is provably no wider than 38 digits.
+query II
+SELECT sql LIKE '%CAST(id AS DECIMAL(38,0))%' AS bounded_hugeint_cast,
+       sql NOT LIKE '%HUGEINT%' AS no_spark_hugeint
+FROM lpts_query('SELECT CAST(id AS HUGEINT) FROM users');
+----
+true	true
+
+# Exact aggregate shape from the nine canary failures: SUM(BIGINT) widens to
+# HUGEINT, so DuckDB binds the COALESCE fallback through a HUGEINT cast.
+query I
+SELECT sql LIKE '%COALESCE(%CAST(0 AS DECIMAL(38,0))%)%' AS bounded_sum_fallback
+FROM lpts_query('SELECT CAST(COALESCE(SUM(CAST(id AS BIGINT)), 0) AS INTEGER) FROM users');
+----
+true
+
+query II
+SELECT sql LIKE '%CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))%' AS bounded_hugeint_constant,
+       sql LIKE '%CAST(NULL AS DECIMAL(38,0))%' AS typed_hugeint_null
+FROM lpts_query('SELECT 99999999999999999999999999999999999999::HUGEINT, NULL::HUGEINT');
+----
+true	true
+
+statement error
+SELECT * FROM lpts_query('SELECT CAST(name AS HUGEINT) FROM users');
+----
+LPTS_UNSUPPORTED_TYPE
+
+statement error
+SELECT * FROM lpts_query('SELECT 170141183460469231731687303715884105727::HUGEINT');
+----
+LPTS_UNSUPPORTED_TYPE
+
 query II
 SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS spark_interval,
        sql NOT LIKE '%::INTERVAL%' AS no_postgres_interval_cast

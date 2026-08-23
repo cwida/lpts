@@ -360,6 +360,26 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 	}
 }
 
+static bool SparkCanRepresentHugeintCastAsDecimal38(const LogicalType &source_type) {
+	switch (source_type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::SQLNULL:
+		// These source domains fit exactly in Spark DECIMAL(38,0). DuckDB
+		// HUGEINT itself does not: its signed 128-bit range needs 39 digits.
+		return true;
+	default:
+		return false;
+	}
+}
+
 static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
 	if (value.IsNull()) {
 		// An untyped NULL literal (SQLNULL) has no target-dialect cast type; emit a
@@ -369,6 +389,9 @@ static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
 		// their explicit CAST so downstream type inference is preserved.
 		if (value.type().id() == LogicalTypeId::SQLNULL) {
 			return "NULL";
+		}
+		if (dialect == SqlDialect::SPARK && value.type().id() == LogicalTypeId::HUGEINT) {
+			return "CAST(NULL AS DECIMAL(38,0))";
 		}
 		return "CAST(NULL AS " + RenderCastTargetType(value.type(), dialect) + ")";
 	}
@@ -390,6 +413,17 @@ static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
 		return "DATE '" + EscapeSingleQuotes(value.ToString()) + "'";
 	case LogicalTypeId::TIMESTAMP:
 		return "TIMESTAMP '" + EscapeSingleQuotes(value.ToString()) + "'";
+	case LogicalTypeId::HUGEINT:
+		if (dialect == SqlDialect::SPARK) {
+			const string integer = value.ToString();
+			const idx_t digits = !integer.empty() && integer[0] == '-' ? integer.size() - 1 : integer.size();
+			if (digits <= 38) {
+				return "CAST(" + integer + " AS DECIMAL(38,0))";
+			}
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", value.type().ToString(), "BOUND_CONSTANT",
+			                        "the HUGEINT constant needs 39 digits, beyond Spark DECIMAL(38,0)");
+		}
+		return value.ToSQLString();
 	case LogicalTypeId::VARCHAR:
 		return "'" + EscapeSingleQuotes(value.GetValue<string>()) + "'";
 	case LogicalTypeId::INTERVAL: {
@@ -1340,7 +1374,17 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		}
 		expr_str << (cast_expr.try_cast ? "TRY_CAST(" : "CAST(");
 		expr_str << ExpressionToAliasedString(cast_expr.child);
-		expr_str << " AS " + RenderCastTargetType(cast_expr.return_type, dialect) + ")";
+		if (dialect == SqlDialect::SPARK && cast_expr.return_type.id() == LogicalTypeId::HUGEINT &&
+		    SparkCanRepresentHugeintCastAsDecimal38(cast_expr.child->return_type)) {
+			expr_str << " AS DECIMAL(38,0))";
+		} else if (dialect == SqlDialect::SPARK && cast_expr.return_type.id() == LogicalTypeId::HUGEINT) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", cast_expr.return_type.ToString(),
+			                        "BOUND_CAST",
+			                        "source type " + cast_expr.child->return_type.ToString() +
+			                            " may use DuckDB HUGEINT's 39-digit range, beyond Spark DECIMAL(38,0)");
+		} else {
+			expr_str << " AS " + RenderCastTargetType(cast_expr.return_type, dialect) + ")";
+		}
 		break;
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {

@@ -2128,16 +2128,35 @@ private:
 			vector<string> cte_column_names;
 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
 			const auto &union_bindings = op->GetColumnBindings();
+			const idx_t physical_column_count =
+			    op->types.empty() ? std::min(lhs_bindings.size(), union_bindings.size()) : op->types.size();
+			if (lhs_bindings.size() < physical_column_count || union_bindings.size() < physical_column_count) {
+				throw InternalException("LPTS UNION: physical output arity exceeds available column bindings");
+			}
 			// Two union output columns can derive from source columns with the same name (e.g.
 			// SELECT t1.a, t2.a ... UNION ...), which would emit a header like (t7_a, t7_a) — DuckDB
 			// resolves later references to the first, silently dropping the second column. Dedup so each
 			// output column gets a distinct generated name.
 			CaseInsensitiveNameSet seen_names;
-			for (size_t i = 0; i < lhs_bindings.size(); ++i) {
+			for (idx_t i = 0; i < physical_column_count; ++i) {
 				const unique_ptr<ColStruct> &lhs_col = FindColumnBinding(lhs_bindings[i], "union lhs");
 				auto new_col = MakeDedupedColumn(table_index, lhs_col->column_name, lhs_col->alias, seen_names, 1);
 				cte_column_names.push_back(new_col->ToUniqueColumnName());
 				column_map[MappableColumnBinding(union_bindings[i])] = std::move(new_col);
+			}
+			if (union_bindings.size() > physical_column_count) {
+				// Some post-optimizer rewrites expose one trailing alias binding for the
+				// physical multiplicity column without widening the UNION types or children.
+				// Preserve that binding by pointing it at the existing last positional output.
+				if (physical_column_count == 0 || union_bindings.size() != physical_column_count + 1) {
+					throw NotImplementedException(
+					    "LPTS_UNSUPPORTED_COLUMN_REF: UNION exposes %llu bindings for %llu physical columns",
+					    (unsigned long long)union_bindings.size(), (unsigned long long)physical_column_count);
+				}
+				const auto &last_output =
+				    FindColumnBinding(union_bindings[physical_column_count - 1], "union trailing alias source");
+				column_map[MappableColumnBinding(union_bindings[physical_column_count])] =
+				    make_uniq<ColStruct>(last_output->table_index, last_output->column_name, last_output->alias);
 			}
 			return make_uniq<AstUnionNode>(set_op.setop_all, std::move(cte_column_names));
 		}
