@@ -289,8 +289,15 @@ private:
 				}
 			}
 			sql += " FROM ";
+			string inline_base_name;
+			string inline_snapshot_suffix;
 			if (!get.catalog.empty()) {
 				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect);
+			} else if (TrySplitDialectSnapshotSuffix(get.table_name, dialect, inline_base_name,
+			                                         inline_snapshot_suffix)) {
+				// Pinned-snapshot scan rendered unqualified: the dialect-specific qualifier must not be
+				// mistaken for a table-function argument list by the `_tf` aliasing below.
+				sql += inline_base_name + inline_snapshot_suffix;
 			} else {
 				// An in-out (lateral) table function has the delim/correlation source as its AST child:
 				// inline it as the left comma-join input (mirrors GetNode's input_cte_name handling).

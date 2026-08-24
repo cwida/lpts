@@ -108,6 +108,94 @@ static string NormalizeBracketIdentifiers(const string &sql, SqlDialect dialect)
 	return result;
 }
 
+/// Match a Spark/Delta temporal-clause keyword at `pos` and map it to the DuckDB `AT (...)` named
+/// parameter that carries the same snapshot. `VERSION`/`SYSTEM_VERSION` pin a commit version,
+/// `TIMESTAMP`/`SYSTEM_TIME` pin a point in time.
+static bool TryReadTimeTravelKeyword(const string &sql, idx_t pos, idx_t &end, string &at_parameter) {
+	struct TimeTravelKeyword {
+		const char *keyword;
+		const char *at_parameter;
+	};
+	static const TimeTravelKeyword KEYWORDS[] = {{"system_version", "VERSION"},
+	                                             {"version", "VERSION"},
+	                                             {"system_time", "TIMESTAMP"},
+	                                             {"timestamp", "TIMESTAMP"}};
+	for (const auto &candidate : KEYWORDS) {
+		if (MatchesKeywordAt(sql, pos, candidate.keyword)) {
+			end = pos + strlen(candidate.keyword);
+			at_parameter = candidate.at_parameter;
+			return true;
+		}
+	}
+	return false;
+}
+
+/// Rewrite the Spark/Delta time-travel clause into DuckDB's `AT (...)` snapshot clause:
+///
+///     FROM t [FOR] VERSION   AS OF 366        ->  FROM t AT (VERSION => 366)
+///     FROM t [FOR] TIMESTAMP AS OF '2024-...' ->  FROM t AT (TIMESTAMP => '2024-...')
+///
+/// The pinned snapshot is *represented*, never dropped: DuckDB's `AT` clause is the semantically
+/// equivalent spelling, so the plan keeps reading the pinned snapshot and the generated SQL can
+/// render the pin back out in the target dialect. Dropping the clause here would silently promote
+/// every pinned scan to "read latest", changing the meaning of the query.
+///
+/// A match requires the full `<keyword> AS OF <literal>` sequence, so a column or alias merely named
+/// `version` / `timestamp` is left alone.
+static string RewriteTimeTravelClauses(const string &sql, SqlDialect dialect) {
+	if (dialect != SqlDialect::SPARK) {
+		return sql;
+	}
+
+	string result;
+	for (idx_t i = 0; i < sql.size(); i++) {
+		if (TryAppendSkippableSqlSpan(sql, i, result)) {
+			continue;
+		}
+
+		idx_t keyword_start = i;
+		if (MatchesKeywordAt(sql, i, "for")) {
+			keyword_start = SkipWhitespace(sql, i + 3);
+		}
+		idx_t keyword_end = keyword_start;
+		string at_parameter;
+		if (!TryReadTimeTravelKeyword(sql, keyword_start, keyword_end, at_parameter)) {
+			result += sql[i];
+			continue;
+		}
+		idx_t as_pos = SkipWhitespace(sql, keyword_end);
+		if (!MatchesKeywordAt(sql, as_pos, "as")) {
+			result += sql[i];
+			continue;
+		}
+		idx_t of_pos = SkipWhitespace(sql, as_pos + 2);
+		if (!MatchesKeywordAt(sql, of_pos, "of")) {
+			result += sql[i];
+			continue;
+		}
+
+		idx_t value_start = SkipWhitespace(sql, of_pos + 2);
+		idx_t value_end = value_start;
+		string literal;
+		string value_sql;
+		if (TryReadSingleQuotedLiteral(sql, value_start, value_end, literal)) {
+			value_sql = SingleQuotedSqlString(literal);
+		} else if (TryReadNumericToken(sql, value_start, value_end, value_sql)) {
+			if (at_parameter == "TIMESTAMP") {
+				ThrowUnsupportedInputDialectFeature(
+				    dialect, "time_travel", "timestamp time travel needs a string literal, got '" + value_sql + "'");
+			}
+		} else {
+			result += sql[i];
+			continue;
+		}
+
+		result += "AT (" + at_parameter + " => " + value_sql + ")";
+		i = value_end - 1;
+	}
+	return result;
+}
+
 enum class InputFunctionRewriteKind : uint8_t {
 	RENAME,
 	DATE_ADD_DAYS,
@@ -652,6 +740,7 @@ string NormalizeInputSqlToDuckDB(const string &query, SqlDialect dialect) {
 
 	string result = NormalizeBacktickIdentifiers(query, dialect);
 	result = NormalizeBracketIdentifiers(result, dialect);
+	result = RewriteTimeTravelClauses(result, dialect);
 	result = RewriteIntervals(result, dialect);
 	result = RewriteCastTypes(result, dialect);
 	RejectRiskyAliasReferences(result, dialect);

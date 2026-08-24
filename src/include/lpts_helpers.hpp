@@ -25,6 +25,12 @@ string VecToQuotedIdentifierList(const vector<string> &input_list, const string 
 /// Quote a table name, preserving a DuckDB AT (...) snapshot suffix if present.
 string QuoteTableWithOptionalSuffix(const string &table_name);
 
+/// Split a table name that carries a pinned snapshot (`name AT (<PARAM> => <value>)`, the DuckDB
+/// spelling LPTS uses internally) into `base_name` and the `dialect`-rendered snapshot qualifier
+/// (e.g. ` VERSION AS OF 366` for Spark). Returns false and leaves the outputs untouched when
+/// `table_name` carries no snapshot. Throws when `dialect` has no verified time-travel syntax.
+bool TrySplitDialectSnapshotSuffix(const string &table_name, SqlDialect dialect, string &base_name, string &suffix);
+
 /// Build catalog.schema.table with each identifier quoted when needed.
 string QualifiedTableName(const string &catalog, const string &schema, const string &table_name);
 

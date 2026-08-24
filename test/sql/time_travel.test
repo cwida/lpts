@@ -1,0 +1,201 @@
+# name: test/sql/time_travel.test
+# description: Spark/Delta time travel (VERSION/TIMESTAMP AS OF) <-> DuckDB AT (...) snapshot pinning
+# group: [sql]
+
+require lpts
+
+require parquet
+
+statement ok
+SET lpts_check = true;
+
+# ============================================================
+# Input dialect: the Spark/Delta temporal clause normalizes to
+# DuckDB's AT (...) clause. The pinned snapshot is represented,
+# never dropped -- dropping it would silently turn a pinned scan
+# into a read of the latest snapshot.
+# ============================================================
+
+statement ok
+SET lpts_input_dialect = 'spark';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT COUNT(*) AS row_count FROM arc_sql_db_bi.billing_meter_dim VERSION AS OF 366');
+----
+SELECT COUNT(*) AS row_count FROM arc_sql_db_bi.billing_meter_dim AT (VERSION => 366)
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t FOR VERSION AS OF 7');
+----
+SELECT * FROM t AT (VERSION => 7)
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t FOR SYSTEM_VERSION AS OF 7');
+----
+SELECT * FROM t AT (VERSION => 7)
+
+# Delta path relations keep their alias after the snapshot qualifier.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM delta.`/mnt/mv` VERSION AS OF 42 v');
+----
+SELECT * FROM delta."/mnt/mv" AT (VERSION => 42) v
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t TIMESTAMP AS OF ''2024-01-15 08:09:10''');
+----
+SELECT * FROM t AT (TIMESTAMP => '2024-01-15 08:09:10')
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t FOR SYSTEM_TIME AS OF ''2024-01-15''');
+----
+SELECT * FROM t AT (TIMESTAMP => '2024-01-15')
+
+# A column/alias merely named `version` or `timestamp` is not a temporal clause.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT version AS of FROM t');
+----
+SELECT version AS of FROM t
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT timestamp AS of FROM t');
+----
+SELECT timestamp AS of FROM t
+
+# String literals are never rewritten.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT ''x VERSION AS OF 3'' AS lit FROM t');
+----
+SELECT 'x VERSION AS OF 3' AS lit FROM t
+
+# A timestamp pin needs a timestamp literal, not a version number: refuse rather than
+# silently pin to the wrong thing.
+statement error
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t TIMESTAMP AS OF 366');
+----
+LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
+
+# Non-Spark input dialects do not carry the Delta temporal clause.
+statement ok
+SET lpts_input_dialect = 'duckdb';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 366');
+----
+SELECT * FROM t VERSION AS OF 366
+
+statement ok
+SET lpts_input_dialect = 'postgres';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 366');
+----
+SELECT * FROM t VERSION AS OF 366
+
+statement ok
+SET lpts_input_dialect = 'duckdb';
+
+# ============================================================
+# Round trip against a catalog that really supports time travel.
+# products: version 2 has 2 rows, version 3 (latest) has 3 rows,
+# so a dropped pin is observable in the result, not just the SQL.
+# ============================================================
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/lpts_time_travel.ducklake' AS dl;
+
+statement ok
+CREATE TABLE dl.products(product_id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO dl.products VALUES (1, 'Widget'), (2, 'Gadget');
+
+statement ok
+INSERT INTO dl.products VALUES (3, 'Gizmo');
+
+query I
+SELECT COUNT(*) FROM dl.products AT (VERSION => 2);
+----
+2
+
+query I
+SELECT COUNT(*) FROM dl.products;
+----
+3
+
+# Spark input: the pinned scan plans against the pinned snapshot, and the regenerated
+# DuckDB SQL still carries the pin (lpts_check re-runs the rewrite of the bare query above
+# and compares result bags, so a dropped pin would surface as 3 rows instead of 2).
+statement ok
+SET lpts_input_dialect = 'spark';
+
+query I
+SELECT sql LIKE '%AT (VERSION => 2)%' AS spark_input_pin_survives_planning
+FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
+----
+true
+
+# ============================================================
+# Output dialect: the pin renders in the target dialect's own
+# spelling. Spark gets `VERSION AS OF`, DuckDB keeps `AT (...)`,
+# and a dialect with no verified time-travel syntax refuses
+# instead of emitting SQL the target cannot parse.
+# ============================================================
+
+statement ok
+SET lpts_dialect = 'spark';
+
+query I
+SELECT sql LIKE '%VERSION AS OF 2%' AND sql NOT LIKE '%AT (VERSION%' AS spark_snapshot_preserved
+FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
+----
+true
+
+query I
+SELECT sql LIKE '%VERSION AS OF 2%' AND sql NOT LIKE '%AT (VERSION%' AS spark_snapshot_preserved_with_filter
+FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 WHERE product_id > 1');
+----
+true
+
+# An unpinned scan stays unpinned: no snapshot qualifier is invented.
+query I
+SELECT sql NOT LIKE '%VERSION AS OF%' AND sql NOT LIKE '%AT (VERSION%' AS unpinned_scan_unchanged
+FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+query I
+SELECT sql LIKE '%AT (VERSION => 2)%' AS duckdb_snapshot_preserved
+FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
+----
+true
+
+statement ok
+SET lpts_dialect = 'postgres';
+
+statement error
+SELECT sql FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
+----
+LPTS_UNSUPPORTED_TIME_TRAVEL
+
+statement ok
+SET lpts_dialect = 'hive';
+
+statement error
+SELECT sql FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
+----
+LPTS_UNSUPPORTED_TIME_TRAVEL
+
+statement ok
+SET lpts_dialect = 'duckdb';
+
+statement ok
+SET lpts_input_dialect = 'duckdb';

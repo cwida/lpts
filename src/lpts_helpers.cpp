@@ -81,13 +81,67 @@ string DialectVecToQuotedIdentifierList(const vector<string> &input_list, SqlDia
 	return ret_str.str();
 }
 
-string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect) {
-	static const string at_suffix = " AT (";
-	auto suffix_pos = table_name.find(at_suffix);
+/// Split `name AT (<PARAM> => <value>)` — the DuckDB spelling LPTS uses internally to carry a pinned
+/// snapshot on a table name — into its base name and `AT` parameter/value.
+static bool TrySplitSnapshotSuffix(const string &table_name, string &base_name, string &at_parameter,
+                                   string &at_value) {
+	static const string AT_SUFFIX = " AT (";
+	auto suffix_pos = table_name.find(AT_SUFFIX);
 	if (suffix_pos == string::npos) {
+		return false;
+	}
+	string body = table_name.substr(suffix_pos + AT_SUFFIX.size());
+	if (body.empty() || body.back() != ')') {
+		return false;
+	}
+	body.pop_back();
+	auto arrow_pos = body.find("=>");
+	if (arrow_pos == string::npos) {
+		return false;
+	}
+	base_name = table_name.substr(0, suffix_pos);
+	at_parameter = TrimCopy(body.substr(0, arrow_pos));
+	at_value = TrimCopy(body.substr(arrow_pos + 2));
+	return !at_parameter.empty() && !at_value.empty();
+}
+
+/// Render a pinned-snapshot qualifier in `dialect`. LPTS carries the pin in DuckDB's spelling
+/// (`AT (VERSION => 366)`); Spark/Delta spells the same pin `VERSION AS OF 366`. A dialect with no
+/// verified time-travel syntax refuses instead of emitting a qualifier the target cannot parse —
+/// dropping it would silently turn a pinned scan into a read of the latest snapshot.
+static string DialectSnapshotSuffix(const string &base_name, const string &at_parameter, const string &at_value,
+                                    SqlDialect dialect) {
+	if (dialect == SqlDialect::DUCKDB) {
+		return " AT (" + at_parameter + " => " + at_value + ")";
+	}
+	string parameter = LowerCopy(at_parameter);
+	if (dialect == SqlDialect::SPARK && (parameter == "version" || parameter == "timestamp")) {
+		return (parameter == "version" ? string(" VERSION AS OF ") : string(" TIMESTAMP AS OF ")) + at_value;
+	}
+	ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TIME_TRAVEL", dialect, "time_travel", at_parameter + " => " + at_value,
+	                        base_name, "no verified time-travel syntax for target dialect");
+}
+
+string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect) {
+	string base_name;
+	string at_parameter;
+	string at_value;
+	if (!TrySplitSnapshotSuffix(table_name, base_name, at_parameter, at_value)) {
 		return DialectQuoteIdent(table_name, dialect);
 	}
-	return DialectQuoteIdent(table_name.substr(0, suffix_pos), dialect) + table_name.substr(suffix_pos);
+	return DialectQuoteIdent(base_name, dialect) + DialectSnapshotSuffix(base_name, at_parameter, at_value, dialect);
+}
+
+bool TrySplitDialectSnapshotSuffix(const string &table_name, SqlDialect dialect, string &base_name, string &suffix) {
+	string at_parameter;
+	string at_value;
+	string split_base;
+	if (!TrySplitSnapshotSuffix(table_name, split_base, at_parameter, at_value)) {
+		return false;
+	}
+	suffix = DialectSnapshotSuffix(split_base, at_parameter, at_value, dialect);
+	base_name = split_base;
+	return true;
 }
 
 string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
