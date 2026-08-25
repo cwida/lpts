@@ -3,6 +3,8 @@
 #include "lpts_date_format.hpp"
 #include "lpts_sql_scanner.hpp"
 
+#include "duckdb/parser/parser.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -130,10 +132,64 @@ static bool TryReadTimeTravelKeyword(const string &sql, idx_t pos, idx_t &end, s
 	return false;
 }
 
+/// True when `token` may name a relation on its own, without a leading `AS`. DuckDB's `alias_clause`
+/// takes a `ColId`, which admits plain identifiers plus the unreserved and column-name keywords but
+/// not the reserved or type/function ones -- so `WHERE`, `JOIN`, `NATURAL`, `TABLESAMPLE` and their
+/// kin end the relation instead of naming it.
+static bool CanBeBareRelationAlias(const string &token) {
+	const KeywordCategory category = Parser::IsKeyword(LowerCopy(token));
+	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
+}
+
+/// Read the optional `[AS] alias [(column, ...)]` that Spark allows *after* a temporal clause,
+/// yielding the original text so quoting and case survive being moved. Returns false when the
+/// relation is unaliased, i.e. when what follows continues the query (`WHERE`, `JOIN`, `,`, `)`).
+static bool TryReadRelationAlias(const string &sql, idx_t pos, idx_t &end, string &alias_sql) {
+	const idx_t start = SkipWhitespace(sql, pos);
+	idx_t cursor = start;
+	const bool explicit_as = MatchesKeywordAt(sql, cursor, "as");
+	if (explicit_as) {
+		cursor = SkipWhitespace(sql, cursor + 2);
+	}
+
+	idx_t alias_end;
+	string token;
+	if (cursor < sql.size() && sql[cursor] == '"') {
+		if (!TryReadSkippableSqlSpan(sql, cursor, alias_end)) {
+			return false;
+		}
+	} else if (TryReadIdentifierToken(sql, cursor, alias_end, token)) {
+		// An explicit `AS` already committed to an alias; a bare token only aliases when the grammar
+		// lets it, otherwise it is the next clause.
+		if (!explicit_as && !CanBeBareRelationAlias(token)) {
+			return false;
+		}
+	} else {
+		return false;
+	}
+
+	const idx_t columns_start = SkipWhitespace(sql, alias_end);
+	if (columns_start < sql.size() && sql[columns_start] == '(') {
+		const idx_t columns_end = FindMatchingParen(sql, columns_start);
+		if (columns_end == DConstants::INVALID_INDEX) {
+			return false;
+		}
+		alias_end = columns_end + 1;
+	}
+
+	end = alias_end;
+	alias_sql = sql.substr(start, alias_end - start);
+	return true;
+}
+
 /// Rewrite the Spark/Delta time-travel clause into DuckDB's `AT (...)` snapshot clause:
 ///
 ///     FROM t [FOR] VERSION   AS OF 366        ->  FROM t AT (VERSION => 366)
 ///     FROM t [FOR] TIMESTAMP AS OF '2024-...' ->  FROM t AT (TIMESTAMP => '2024-...')
+///     FROM t VERSION AS OF 366 AS v           ->  FROM t AS v AT (VERSION => 366)
+///
+/// Spark puts the clause between the relation and its alias; DuckDB puts it after the alias, so the
+/// alias is carried across the rewrite rather than left stranded behind the qualifier.
 ///
 /// The pinned snapshot is *represented*, never dropped: DuckDB's `AT` clause is the semantically
 /// equivalent spelling, so the plan keeps reading the pinned snapshot and the generated SQL can
@@ -190,8 +246,17 @@ static string RewriteTimeTravelClauses(const string &sql, SqlDialect dialect) {
 			continue;
 		}
 
+		// Spark: `<relation> VERSION AS OF <v> [AS] alias`. DuckDB: `<relation> [AS] alias AT (...)`.
+		// Emit the alias first so the qualifier still attaches to the relation it pins.
+		idx_t clause_end = value_end;
+		idx_t alias_end;
+		string alias_sql;
+		if (TryReadRelationAlias(sql, value_end, alias_end, alias_sql)) {
+			result += alias_sql + " ";
+			clause_end = alias_end;
+		}
 		result += "AT (" + at_parameter + " => " + value_sql + ")";
-		i = value_end - 1;
+		i = clause_end - 1;
 	}
 	return result;
 }

@@ -34,12 +34,6 @@ SELECT sql FROM lpts_normalize_query('SELECT * FROM t FOR SYSTEM_VERSION AS OF 7
 ----
 SELECT * FROM t AT (VERSION => 7)
 
-# Delta path relations keep their alias after the snapshot qualifier.
-query T
-SELECT sql FROM lpts_normalize_query('SELECT * FROM delta.`/mnt/mv` VERSION AS OF 42 v');
-----
-SELECT * FROM delta."/mnt/mv" AT (VERSION => 42) v
-
 query T
 SELECT sql FROM lpts_normalize_query('SELECT * FROM t TIMESTAMP AS OF ''2024-01-15 08:09:10''');
 ----
@@ -74,6 +68,122 @@ SELECT sql FROM lpts_normalize_query('SELECT * FROM t TIMESTAMP AS OF 366');
 ----
 LPTS_UNSUPPORTED_INPUT_DIALECT_FEATURE
 
+# ============================================================
+# Alias ordering. Spark writes the pin *between* the relation and
+# its alias; DuckDB writes it *after* the alias. The alias has to
+# travel with the rewrite -- `FROM t AT (VERSION => 2) p` and
+# `FROM t AT (VERSION => 2) AS p` are both DuckDB parse errors.
+# ============================================================
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 p');
+----
+SELECT * FROM t p AT (VERSION => 2)
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 AS p');
+----
+SELECT * FROM t AS p AT (VERSION => 2)
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t TIMESTAMP AS OF ''2024-01-15'' AS p');
+----
+SELECT * FROM t AS p AT (TIMESTAMP => '2024-01-15')
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t FOR SYSTEM_VERSION AS OF 7 AS p');
+----
+SELECT * FROM t AS p AT (VERSION => 7)
+
+# Quoted aliases keep their quoting and their spaces.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 AS `odd alias`');
+----
+SELECT * FROM t AS "odd alias" AT (VERSION => 2)
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 `odd alias`');
+----
+SELECT * FROM t "odd alias" AT (VERSION => 2)
+
+# An alias may carry a column list.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 p(a, b)');
+----
+SELECT * FROM t p(a, b) AT (VERSION => 2)
+
+# Delta path relations behave the same way.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM delta.`/mnt/mv` VERSION AS OF 42 v');
+----
+SELECT * FROM delta."/mnt/mv" v AT (VERSION => 42)
+
+# Every relation in a join keeps its own alias and its own pin.
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1 x JOIN b VERSION AS OF 2 y ON x.id = y.id');
+----
+SELECT * FROM a x AT (VERSION => 1) JOIN b y AT (VERSION => 2) ON x.id = y.id
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1 AS x, b VERSION AS OF 2 AS y');
+----
+SELECT * FROM a AS x AT (VERSION => 1), b AS y AT (VERSION => 2)
+
+# ------------------------------------------------------------
+# What follows an unaliased pin must not be mistaken for its
+# alias: a reserved or type/function keyword continues the query.
+# ------------------------------------------------------------
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 WHERE x > 1');
+----
+SELECT * FROM t AT (VERSION => 2) WHERE x > 1
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 GROUP BY a');
+----
+SELECT * FROM t AT (VERSION => 2) GROUP BY a
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 ORDER BY a LIMIT 3');
+----
+SELECT * FROM t AT (VERSION => 2) ORDER BY a LIMIT 3
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1 CROSS JOIN b');
+----
+SELECT * FROM a AT (VERSION => 1) CROSS JOIN b
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1 NATURAL JOIN b');
+----
+SELECT * FROM a AT (VERSION => 1) NATURAL JOIN b
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1 LEFT JOIN b ON a.i = b.i');
+----
+SELECT * FROM a AT (VERSION => 1) LEFT JOIN b ON a.i = b.i
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1 ANTI JOIN b ON a.i = b.i');
+----
+SELECT * FROM a AT (VERSION => 1) ANTI JOIN b ON a.i = b.i
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM a VERSION AS OF 1, b');
+----
+SELECT * FROM a AT (VERSION => 1), b
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM (SELECT * FROM t VERSION AS OF 2) x');
+----
+SELECT * FROM (SELECT * FROM t AT (VERSION => 2)) x
+
+query T
+SELECT sql FROM lpts_normalize_query('WITH c AS (SELECT * FROM t VERSION AS OF 2 v) SELECT * FROM c UNION ALL SELECT * FROM t VERSION AS OF 3');
+----
+WITH c AS (SELECT * FROM t v AT (VERSION => 2)) SELECT * FROM c UNION ALL SELECT * FROM t AT (VERSION => 3)
+
 # Non-Spark input dialects do not carry the Delta temporal clause.
 statement ok
 SET lpts_input_dialect = 'duckdb';
@@ -96,8 +206,13 @@ SET lpts_input_dialect = 'duckdb';
 
 # ============================================================
 # Round trip against a catalog that really supports time travel.
-# products: version 2 has 2 rows, version 3 (latest) has 3 rows,
-# so a dropped pin is observable in the result, not just the SQL.
+# products: version 2 has 2 rows, version 3 has 3 rows, version 4
+# (latest) has 4 rows -- so both pinned versions are non-latest and
+# a dropped pin changes the rows, not just the SQL text.
+#
+# Every query below runs under `lpts_check = true`, which executes
+# the LPTS-regenerated SQL alongside the original and compares the
+# result bags: these are real scans, not string assertions.
 # ============================================================
 
 statement ok
@@ -118,25 +233,91 @@ INSERT INTO dl.products VALUES (1, 'Widget'), (2, 'Gadget');
 statement ok
 INSERT INTO dl.products VALUES (3, 'Gizmo');
 
+statement ok
+INSERT INTO dl.products VALUES (4, 'Doohickey');
+
 query I
 SELECT COUNT(*) FROM dl.products AT (VERSION => 2);
 ----
 2
 
 query I
-SELECT COUNT(*) FROM dl.products;
+SELECT COUNT(*) FROM dl.products AT (VERSION => 3);
 ----
 3
 
-# Spark input: the pinned scan plans against the pinned snapshot, and the regenerated
-# DuckDB SQL still carries the pin (lpts_check re-runs the rewrite of the bare query above
-# and compares result bags, so a dropped pin would surface as 3 rows instead of 2).
+query I
+SELECT COUNT(*) FROM dl.products;
+----
+4
+
+# The exact shape the Spark normalizer emits, executed: alias before the pin, with the
+# projection and the filter qualified by that alias.
+query T
+SELECT p.name FROM dl.products AS p AT (VERSION => 2) WHERE p.product_id > 1;
+----
+Gadget
+
+query T
+SELECT p.name FROM dl.products p AT (VERSION => 2) WHERE p.product_id > 1;
+----
+Gadget
+
+query T
+SELECT "odd alias".name FROM dl.products AS "odd alias" AT (VERSION => 2) WHERE "odd alias".product_id = 2;
+----
+Gadget
+
+query I
+SELECT pid FROM dl.products p(pid, pname) AT (VERSION => 2) WHERE pname = 'Gadget';
+----
+2
+
+# Two aliased relations over the same table, pinned to two different non-latest versions.
+query I
+SELECT COUNT(*) FROM dl.products p AT (VERSION => 2) JOIN dl.products q AT (VERSION => 3) ON p.product_id = q.product_id;
+----
+2
+
+query I
+SELECT COUNT(*) FROM dl.products AS p AT (VERSION => 2), dl.products AS q AT (VERSION => 3);
+----
+6
+
+# ------------------------------------------------------------
+# Spark input against the same catalog: normalization produces
+# exactly the executable statements asserted above, and the
+# pinned scan plans against the pinned snapshot.
+# ------------------------------------------------------------
+
 statement ok
 SET lpts_input_dialect = 'spark';
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT p.name FROM dl.products VERSION AS OF 2 AS p WHERE p.product_id > 1');
+----
+SELECT p.name FROM dl.products AS p AT (VERSION => 2) WHERE p.product_id > 1
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT COUNT(*) FROM dl.products VERSION AS OF 2 p JOIN dl.products VERSION AS OF 3 q ON p.product_id = q.product_id');
+----
+SELECT COUNT(*) FROM dl.products p AT (VERSION => 2) JOIN dl.products q AT (VERSION => 3) ON p.product_id = q.product_id
 
 query I
 SELECT sql LIKE '%AT (VERSION => 2)%' AS spark_input_pin_survives_planning
 FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
+----
+true
+
+query I
+SELECT sql LIKE '%AT (VERSION => 2)%' AS aliased_spark_input_pin_survives_planning
+FROM lpts_query('SELECT p.name AS n FROM dl.products VERSION AS OF 2 AS p WHERE p.product_id > 1');
+----
+true
+
+query I
+SELECT sql LIKE '%AT (VERSION => 2)%' AND sql LIKE '%AT (VERSION => 3)%' AS both_pins_survive_planning
+FROM lpts_query('SELECT COUNT(*) AS c FROM dl.products VERSION AS OF 2 p, dl.products VERSION AS OF 3 q WHERE p.product_id = q.product_id');
 ----
 true
 
@@ -158,7 +339,13 @@ true
 
 query I
 SELECT sql LIKE '%VERSION AS OF 2%' AND sql NOT LIKE '%AT (VERSION%' AS spark_snapshot_preserved_with_filter
-FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 WHERE product_id > 1');
+FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 AS p WHERE p.product_id > 1');
+----
+true
+
+query I
+SELECT sql LIKE '%VERSION AS OF 2%' AND sql LIKE '%VERSION AS OF 3%' AS both_pins_render_in_spark
+FROM lpts_query('SELECT COUNT(*) AS c FROM dl.products VERSION AS OF 2 p, dl.products VERSION AS OF 3 q WHERE p.product_id = q.product_id');
 ----
 true
 
