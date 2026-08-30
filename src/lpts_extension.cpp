@@ -8,6 +8,7 @@
 #include "lpts_helpers.hpp"
 #include "lpts_debug.hpp"
 #include "lpts_parser.hpp"
+#include "spark_scalar_functions.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -1315,6 +1316,10 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 //------------------------------------------------------------------------------
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Register Spark-compatible scalar functions (e.g. add_months) that DuckDB
+	// lacks natively but that appear in Spark SQL translated through lpts.
+	RegisterSparkScalarFunctions(loader);
+
 	// Register the lpts_dialect session setting.
 	// Users can change it with: SET lpts_dialect = 'postgres';
 	DBConfig &config = DBConfig::GetConfig(loader.GetDatabaseInstance());

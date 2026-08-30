@@ -9,6 +9,12 @@
 
 require lpts
 
+# Some SPARK-dialect assertions translate queries whose binding folds
+# CURRENT_TIMESTAMP to a TIMESTAMPTZ constant, which pulls in icu. CI runners
+# that cannot autoload icu (e.g. offline linux_amd64) would otherwise fail the
+# whole file; require it so those runners skip instead of erroring.
+require icu
+
 statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
 
@@ -216,14 +222,40 @@ FROM lpts_query('SELECT CAST(d AS VARCHAR), substring(name, 1, 2) FROM compiler_
 ----
 true	true
 
-# DuckDB widens several ordinary integer aggregate expressions through HUGEINT.
-# Spark has no 128-bit integer, but casts from source domains no wider than
-# BIGINT/DECIMAL(38) are exactly representable as DECIMAL(38,0).
-query I
-SELECT sql LIKE '%CAST(id AS DECIMAL(38,0))%' AS bounded_hugeint_cast
+# DuckDB widens several ordinary integer expressions through HUGEINT. Spark has
+# no 128-bit integer, so use DECIMAL(38,0) only when the source domain is
+# provably no wider than BIGINT/DECIMAL(38).
+query II
+SELECT sql LIKE '%CAST(id AS DECIMAL(38,0))%' AS bounded_hugeint_cast,
+       sql NOT LIKE '%HUGEINT%' AS no_spark_hugeint
 FROM lpts_query('SELECT CAST(id AS HUGEINT) FROM users');
 ----
+true	true
+
+# Exact aggregate shape from the nine canary failures: SUM(BIGINT) widens to
+# HUGEINT, so DuckDB binds the COALESCE fallback through a HUGEINT cast.
+query I
+SELECT sql LIKE '%COALESCE(%CAST(0 AS DECIMAL(38,0))%)%' AS bounded_sum_fallback
+FROM lpts_query('SELECT CAST(COALESCE(SUM(CAST(id AS BIGINT)), 0) AS INTEGER) FROM users');
+----
 true
+
+query II
+SELECT sql LIKE '%CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))%' AS bounded_hugeint_constant,
+       sql LIKE '%CAST(NULL AS DECIMAL(38,0))%' AS typed_hugeint_null
+FROM lpts_query('SELECT 99999999999999999999999999999999999999::HUGEINT, NULL::HUGEINT');
+----
+true	true
+
+statement error
+SELECT * FROM lpts_query('SELECT CAST(name AS HUGEINT) FROM users');
+----
+LPTS_UNSUPPORTED_TYPE
+
+statement error
+SELECT * FROM lpts_query('SELECT 170141183460469231731687303715884105727::HUGEINT');
+----
+LPTS_UNSUPPORTED_TYPE
 
 query II
 SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS spark_interval,

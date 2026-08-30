@@ -146,6 +146,92 @@ INSERT INTO extra VALUES (99);
 statement ok
 SELECT id FROM users UNION ALL SELECT id FROM staff UNION ALL SELECT user_id FROM orders UNION ALL SELECT val FROM extra;
 
+# --- N-ary UNION ALL with a downstream join/projection keeps each sibling under the lhs scope. ---
+statement ok
+CREATE TABLE union_labels(id INTEGER, tag VARCHAR);
+
+statement ok
+INSERT INTO union_labels VALUES (1, 'one'), (2, 'two'), (99, 'ninety-nine');
+
+query IIT rowsort
+SELECT u.id, l.tag, u.label
+FROM (
+    SELECT u.id, u.name AS label
+    FROM users u
+    INNER JOIN orders o ON u.id = o.user_id
+    UNION ALL
+    SELECT s.id, s.dept AS label
+    FROM staff s
+    INNER JOIN orders o ON s.id = o.user_id
+    UNION ALL
+    SELECT val AS id, 'extra' AS label
+    FROM extra
+) u
+LEFT JOIN union_labels l ON u.id = l.id
+ORDER BY 1, 2, 3;
+----
+1	one	Alice
+1	one	Alice
+1	one	eng
+1	one	eng
+2	two	Bob
+2	two	sales
+99	ninety-nine	extra
+
+# --- OpenIVM join-delta UNION terms carry eleven visible machine-status columns,
+# followed by a duplicated hidden left key and multiplicity. A left-deep UNION
+# must preserve and bind all thirteen positions, including the hidden key. ---
+statement ok
+CREATE TABLE machine_status_terms (
+    event_time INTEGER,
+    machine_arm_id VARCHAR,
+    customer_key INTEGER,
+    subscription_offer_type_key INTEGER,
+    subscription_workload_type_key INTEGER,
+    infrastructure_key INTEGER,
+    operating_system_key INTEGER,
+    mssqldiscovered BOOLEAN,
+    mysqldiscovered BOOLEAN,
+    pgsqldiscovered BOOLEAN,
+    physical_cores INTEGER
+);
+
+statement ok
+INSERT INTO machine_status_terms VALUES
+    (10, 'arm-1', 1, 2, 3, 4, 5, true, false, false, 8),
+    (20, 'arm-2', 6, 7, 8, 9, 10, false, true, false, 16),
+    (30, 'arm-3', 11, 12, 13, 14, 15, false, false, true, 32);
+
+query ITIIIIIIIIITI rowsort
+SELECT *
+FROM (
+    SELECT event_time, machine_arm_id, customer_key, subscription_offer_type_key,
+           subscription_workload_type_key, infrastructure_key, operating_system_key,
+           mssqldiscovered, mysqldiscovered, pgsqldiscovered, physical_cores,
+           machine_arm_id AS openivm_left_key, 1 AS openivm_multiplicity
+    FROM machine_status_terms
+    WHERE event_time = 10
+    UNION ALL
+    SELECT event_time, machine_arm_id, customer_key, subscription_offer_type_key,
+           subscription_workload_type_key, infrastructure_key, operating_system_key,
+           mssqldiscovered, mysqldiscovered, pgsqldiscovered, physical_cores,
+           machine_arm_id AS openivm_left_key, -1 AS openivm_multiplicity
+    FROM machine_status_terms
+    WHERE event_time = 20
+    UNION ALL
+    SELECT event_time, machine_arm_id, customer_key, subscription_offer_type_key,
+           subscription_workload_type_key, infrastructure_key, operating_system_key,
+           mssqldiscovered, mysqldiscovered, pgsqldiscovered, physical_cores,
+           machine_arm_id AS openivm_left_key, 1 AS openivm_multiplicity
+    FROM machine_status_terms
+    WHERE event_time = 30
+) AS delta_terms
+ORDER BY event_time;
+----
+10	arm-1	1	2	3	4	5	true	false	false	8	arm-1	1
+20	arm-2	6	7	8	9	10	false	true	false	16	arm-2	-1
+30	arm-3	11	12	13	14	15	false	false	true	32	arm-3	1
+
 # --- N-ary UNION with aggregate on top (regression) ---
 # The AstFlattener splits N-ary UNION into left-deep binary UNIONs and appends
 # intermediate CTEs to cte_nodes. Parent operators must reference each child
