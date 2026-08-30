@@ -256,6 +256,7 @@ statement error
 SELECT * FROM lpts_query('SELECT 170141183460469231731687303715884105727::HUGEINT');
 ----
 LPTS_UNSUPPORTED_TYPE
+
 query II
 SELECT sql LIKE '%INTERVAL ''30'' DAY%' AS spark_interval,
        sql NOT LIKE '%::INTERVAL%' AS no_postgres_interval_cast
