@@ -251,6 +251,7 @@ CteBaseNode (base, ToQuery(SqlDialect))
 | `test/sql/data_dependent_optimizers.test` | `lpts_enable_data_dependent_optimizers` |
 | `test/sql/tpch.test` | All 22 TPC-H queries under `lpts_check` |
 | `test/sql/ducklake.test` | DuckLake scans |
+| `test/sql/time_travel.test` | Snapshot pinning: Spark/Delta `VERSION`/`TIMESTAMP AS OF` ↔ DuckDB `AT (...)` |
 | `test/sql/explain_format_sql.test` | `EXPLAIN (FORMAT SQL)` |
 | `test/sql/print_ast.test` | AST `ToString()` output |
 | `test/sql/check_mode.test` | `lpts_check` round-trip semantics (canonical example) |

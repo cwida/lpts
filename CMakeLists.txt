@@ -23,7 +23,8 @@ set(EXTENSION_SOURCES
     src/lpts_ast_renderer.cpp
     src/lpts_ast_builder.cpp
     src/lpts_ast_flattener.cpp
-    src/dialect_function_map.cpp)
+    src/dialect_function_map.cpp
+    src/spark_scalar_functions.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

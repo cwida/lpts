@@ -254,6 +254,106 @@ query I
 2
 3
 
+# --- A projection that duplicates a UNION ALL key must render both aliases from the set-op output,
+# not a stale child binding from one branch. Closest SQL shape to the OpenIVM hidden-left-key rewrite. ---
+statement ok
+CREATE TABLE isf_bugf(instance_arm_collection_key INT, event_time INT);
+
+statement ok
+INSERT INTO isf_bugf VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE acd_bugf(arm_collection_key INT, subscription_id INT, arm_id VARCHAR, rn INT);
+
+statement ok
+INSERT INTO acd_bugf VALUES (1, 100, 'arm-1', 1), (2, 200, 'arm-2', 1);
+
+statement ok
+CREATE TABLE imlmv_bugf(instance_arm_id VARCHAR, container_resource_id VARCHAR);
+
+statement ok
+INSERT INTO imlmv_bugf VALUES ('arm-1', 'machine-1');
+
+statement ok
+CREATE TABLE cores_bugf(instance_arm_id VARCHAR, instance_effective_cores DOUBLE);
+
+statement ok
+INSERT INTO cores_bugf VALUES ('arm-1', 4.0), ('arm-2', 8.0);
+
+query TT rowsort
+WITH base_filtered_fact AS (
+    SELECT isf.event_time, acd.subscription_id, acd.arm_id AS instance_arm_id,
+           lower(coalesce(imlmv.container_resource_id, 'NA')) AS container_resource_id
+    FROM isf_bugf isf
+    INNER JOIN (SELECT arm_collection_key, subscription_id, arm_id FROM acd_bugf WHERE rn = 1) AS acd
+      ON isf.instance_arm_collection_key = acd.arm_collection_key
+    LEFT JOIN imlmv_bugf imlmv ON acd.arm_id = imlmv.instance_arm_id
+),
+keyed AS (
+    SELECT bff.event_time, bff.subscription_id, bff.instance_arm_id, bff.container_resource_id,
+           coalesce(cores.instance_effective_cores, 0.0) AS instance_effective_cores
+    FROM base_filtered_fact AS bff
+    LEFT JOIN cores_bugf cores ON bff.instance_arm_id = cores.instance_arm_id
+    WHERE lower(bff.container_resource_id) <> lower('NA') OR bff.container_resource_id IS NULL
+),
+no_machine AS (
+    SELECT bff.event_time, bff.subscription_id, bff.instance_arm_id, bff.container_resource_id,
+           coalesce(cores.instance_effective_cores, 0.0) AS instance_effective_cores
+    FROM base_filtered_fact AS bff
+    LEFT JOIN cores_bugf cores ON bff.instance_arm_id = cores.instance_arm_id
+    WHERE lower(bff.container_resource_id) = lower('NA')
+)
+SELECT combined.instance_arm_id AS instance_arm_id, combined.instance_arm_id AS openivm_left_key
+FROM (
+    SELECT keyed.subscription_id, keyed.instance_arm_id, keyed.instance_effective_cores FROM keyed
+    UNION ALL
+    SELECT no_machine.subscription_id, no_machine.instance_arm_id, no_machine.instance_effective_cores FROM no_machine
+) combined
+ORDER BY 1, 2;
+----
+arm-1	arm-1
+arm-2	arm-2
+
+query I
+SELECT regexp_extract(sql,
+                      '(?s).*SELECT\\s+([^ ,]+) AS instance_arm_id,\\s+([^ ,]+) AS openivm_left_key.*',
+                      1) =
+       regexp_extract(sql,
+                      '(?s).*SELECT\\s+([^ ,]+) AS instance_arm_id,\\s+([^ ,]+) AS openivm_left_key.*',
+                      2)
+FROM lpts_query($$
+WITH base_filtered_fact AS (
+    SELECT isf.event_time, acd.subscription_id, acd.arm_id AS instance_arm_id,
+           lower(coalesce(imlmv.container_resource_id, 'NA')) AS container_resource_id
+    FROM isf_bugf isf
+    INNER JOIN (SELECT arm_collection_key, subscription_id, arm_id FROM acd_bugf WHERE rn = 1) AS acd
+      ON isf.instance_arm_collection_key = acd.arm_collection_key
+    LEFT JOIN imlmv_bugf imlmv ON acd.arm_id = imlmv.instance_arm_id
+),
+keyed AS (
+    SELECT bff.event_time, bff.subscription_id, bff.instance_arm_id, bff.container_resource_id,
+           coalesce(cores.instance_effective_cores, 0.0) AS instance_effective_cores
+    FROM base_filtered_fact AS bff
+    LEFT JOIN cores_bugf cores ON bff.instance_arm_id = cores.instance_arm_id
+    WHERE lower(bff.container_resource_id) <> lower('NA') OR bff.container_resource_id IS NULL
+),
+no_machine AS (
+    SELECT bff.event_time, bff.subscription_id, bff.instance_arm_id, bff.container_resource_id,
+           coalesce(cores.instance_effective_cores, 0.0) AS instance_effective_cores
+    FROM base_filtered_fact AS bff
+    LEFT JOIN cores_bugf cores ON bff.instance_arm_id = cores.instance_arm_id
+    WHERE lower(bff.container_resource_id) = lower('NA')
+)
+SELECT combined.instance_arm_id AS instance_arm_id, combined.instance_arm_id AS openivm_left_key
+FROM (
+    SELECT keyed.subscription_id, keyed.instance_arm_id, keyed.instance_effective_cores FROM keyed
+    UNION ALL
+    SELECT no_machine.subscription_id, no_machine.instance_arm_id, no_machine.instance_effective_cores FROM no_machine
+) combined
+$$);
+----
+true
+
 # --- A pushed-down filter on a column that is NOT projected (filter-only) must still resolve through
 # the table-function alias. ---
 query I
