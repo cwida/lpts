@@ -15,6 +15,26 @@ require lpts
 # whole file; require it so those runners skip instead of erroring.
 require icu
 
+# A table name is an identifier, even when its characters resemble a snapshot clause.
+statement ok
+CREATE TABLE "events AT (VERSION => 2)" (id INTEGER);
+
+statement ok
+INSERT INTO "events AT (VERSION => 2)" VALUES (1), (1), (2);
+
+statement ok
+SET lpts_check = true;
+
+query I rowsort
+SELECT id FROM "events AT (VERSION => 2)";
+----
+1
+1
+2
+
+statement ok
+SET lpts_check = false;
+
 statement ok
 CREATE TABLE users (id INTEGER, name VARCHAR, "order" INTEGER);
 
@@ -36,6 +56,12 @@ CREATE TABLE compiler_edges (d DECIMAL(4,4), name VARCHAR);
 
 statement ok
 SET lpts_dialect = 'spark';
+
+query I
+SELECT sql LIKE '%`memory`.`main`.`events AT (VERSION => 2)`%' AND sql NOT LIKE '%VERSION AS OF%'
+FROM lpts_query('SELECT id FROM "events AT (VERSION => 2)"');
+----
+true
 
 # ============================================================
 # Identifier quoting — backticks

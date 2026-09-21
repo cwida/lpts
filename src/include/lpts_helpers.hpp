@@ -10,6 +10,9 @@
 
 namespace duckdb {
 
+class AtClause;
+string RenderSnapshotSuffix(optional_ptr<AtClause> snapshot, SqlDialect dialect);
+
 /// Convert a vector of strings into a separated list (e.g. "a, b, c").
 string VecToSeparatedList(const vector<string> &input_list, const string &separator = ", ");
 
@@ -22,15 +25,6 @@ string QuoteIdentifier(const string &identifier);
 /// Quote a list of identifiers and join them with a separator.
 string VecToQuotedIdentifierList(const vector<string> &input_list, const string &separator = ", ");
 
-/// Quote a table name, preserving a DuckDB AT (...) snapshot suffix if present.
-string QuoteTableWithOptionalSuffix(const string &table_name);
-
-/// Split a table name that carries a pinned snapshot (`name AT (<PARAM> => <value>)`, the DuckDB
-/// spelling LPTS uses internally) into `base_name` and the `dialect`-rendered snapshot qualifier
-/// (e.g. ` VERSION AS OF 366` for Spark). Returns false and leaves the outputs untouched when
-/// `table_name` carries no snapshot. Throws when `dialect` has no verified time-travel syntax.
-bool TrySplitDialectSnapshotSuffix(const string &table_name, SqlDialect dialect, string &base_name, string &suffix);
-
 /// Build catalog.schema.table with each identifier quoted when needed.
 string QualifiedTableName(const string &catalog, const string &schema, const string &table_name);
 
@@ -38,7 +32,6 @@ string QualifiedTableName(const string &catalog, const string &schema, const str
 /// fall back to `KeywordHelper::WriteOptionallyQuoted` (matching the dialect-blind overloads above).
 string DialectVecToQuotedIdentifierList(const vector<string> &input_list, SqlDialect dialect,
                                         const string &separator = ", ");
-string DialectQuoteTableWithOptionalSuffix(const string &table_name, SqlDialect dialect);
 string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
                                  SqlDialect dialect);
 

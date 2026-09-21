@@ -112,6 +112,16 @@ SELECT sql FROM lpts_normalize_query('SELECT * FROM t VERSION AS OF 2 p(a, b)');
 ----
 SELECT * FROM t p(a, b) AT (VERSION => 2)
 
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM `a``b` VERSION AS OF 2 AS `p``q`(id)');
+----
+SELECT * FROM "a`b" AS "p`q"(id) AT (VERSION => 2)
+
+query T
+SELECT sql FROM lpts_normalize_query('SELECT * FROM main . t VERSION AS OF 2 AS p(id)');
+----
+SELECT * FROM main . t AS p(id) AT (VERSION => 2)
+
 # Delta path relations behave the same way.
 query T
 SELECT sql FROM lpts_normalize_query('SELECT * FROM delta.`/mnt/mv` VERSION AS OF 42 v');
@@ -284,6 +294,18 @@ SELECT COUNT(*) FROM dl.products AS p AT (VERSION => 2), dl.products AS q AT (VE
 ----
 6
 
+# The non-fused GET renderer must carry the same typed snapshot as a fused scan.
+statement ok
+SET lpts_merge_pipeline = false;
+
+query T
+SELECT name FROM dl.products AT (VERSION => 2) WHERE product_id > 1;
+----
+Gadget
+
+statement ok
+SET lpts_merge_pipeline = true;
+
 # ------------------------------------------------------------
 # Spark input against the same catalog: normalization produces
 # exactly the executable statements asserted above, and the
@@ -342,6 +364,36 @@ SELECT sql LIKE '%VERSION AS OF 2%' AND sql NOT LIKE '%AT (VERSION%' AS spark_sn
 FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 AS p WHERE p.product_id > 1');
 ----
 true
+
+statement ok
+SET lpts_merge_pipeline = false;
+
+query I
+SELECT sql LIKE '%`dl`.`main`.`products` VERSION AS OF 2%' AND sql NOT LIKE '%AT (VERSION%'
+FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 WHERE product_id > 1');
+----
+true
+
+statement ok
+SET lpts_output_unqualified = true;
+
+query I
+SELECT sql LIKE '%`products` VERSION AS OF 2%' AND sql NOT LIKE '%_tf(%'
+FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 WHERE product_id > 1');
+----
+true
+
+statement ok
+SET lpts_merge_pipeline = true;
+
+query I
+SELECT sql LIKE '%`products` VERSION AS OF 2%' AND sql NOT LIKE '%_tf(%'
+FROM lpts_query('SELECT name FROM dl.products VERSION AS OF 2 WHERE product_id > 1');
+----
+true
+
+statement ok
+SET lpts_output_unqualified = false;
 
 query I
 SELECT sql LIKE '%VERSION AS OF 2%' AND sql LIKE '%VERSION AS OF 3%' AS both_pins_render_in_spark

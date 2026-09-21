@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/parser/tableref/at_clause.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
 
 namespace duckdb {
@@ -69,6 +70,7 @@ public:
 	string catalog;
 	string schema;
 	string table_name;
+	unique_ptr<AtClause> snapshot;
 	size_t table_index;
 	vector<string> column_names;     ///< Physical column names (e.g. "age", "name").
 	vector<string> cte_column_names; ///< CTE-scoped names (e.g. "t0_age", "t0_name").

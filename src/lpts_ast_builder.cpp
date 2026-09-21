@@ -7,6 +7,7 @@
 #include "lpts_expression_renderer.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -309,6 +310,7 @@ private:
 
 	/// Client context for runtime queries (e.g. DuckLake current snapshot).
 	ClientContext &context;
+	const SnapshotResolver &snapshot_resolver;
 
 	/// Re-target emitted table references at the destination system's catalog/schema.
 	///
@@ -1125,9 +1127,6 @@ private:
 					schema_name = catalog_entry->schema.name;
 					ApplyOutputQualificationOverrides(catalog_name, schema_name);
 					table_name = catalog_entry.get()->name;
-					if (is_ducklake_time_travel) {
-						table_name += " AT (VERSION => " + std::to_string(ducklake_snapshot_id) + ")";
-					}
 				} else {
 					// Table function without catalog entry (e.g. range(), read_csv())
 					std::ostringstream func_str;
@@ -1468,6 +1467,12 @@ private:
 			                                      std::move(column_names), std::move(cte_column_names),
 			                                      std::move(table_filters), table_function_output_count);
 			get_node->table_function_alias = std::move(table_function_alias);
+			if (is_ducklake_time_travel) {
+				get_node->snapshot =
+				    make_uniq<AtClause>("VERSION", make_uniq<ConstantExpression>(Value::UBIGINT(ducklake_snapshot_id)));
+			} else if (catalog_entry && snapshot_resolver) {
+				get_node->snapshot = snapshot_resolver(*catalog_entry);
+			}
 			// Only carry the flags when at least one column is a struct-extract expression; an all-false
 			// vector is equivalent to "empty" and the renderers treat empty as all plain identifiers.
 			for (auto is_expr : column_is_expr) {
@@ -2797,8 +2802,8 @@ private:
 	}
 
 public:
-	AstBuilder(ClientContext &_context, SqlDialect _dialect = SqlDialect::DUCKDB)
-	    : dialect(_dialect), context(_context),
+	AstBuilder(ClientContext &_context, SqlDialect _dialect, const SnapshotResolver &_snapshot_resolver)
+	    : dialect(_dialect), context(_context), snapshot_resolver(_snapshot_resolver),
 	      expression_renderer(_dialect, [this](const ColumnBinding &binding, const char *context) {
 		      return FindColumnBinding(binding, context)->ToUniqueColumnName();
 	      }) {
@@ -2831,8 +2836,9 @@ public:
 //==============================================================================
 // Phase 1 entry point
 //==============================================================================
-unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalOperator> &plan, SqlDialect dialect) {
-	AstBuilder builder(context, dialect);
+unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalOperator> &plan, SqlDialect dialect,
+                                     const SnapshotResolver &snapshot_resolver) {
+	AstBuilder builder(context, dialect, snapshot_resolver);
 	return builder.Build(plan);
 }
 

@@ -384,17 +384,12 @@ string GetNode::ToQuery(SqlDialect dialect) {
 		get_str << VecToSeparatedList(RenderGetSelectColumns(column_names, column_is_expression, dialect));
 	}
 	get_str << " FROM ";
-	string base_table_name;
-	string snapshot_suffix;
-	const bool unqualified_snapshot =
-	    catalog.empty() && TrySplitDialectSnapshotSuffix(table_name, dialect, base_table_name, snapshot_suffix);
 	if (!catalog.empty()) {
 		// Fully-qualified: catalog.schema.table (DuckDB / Spark dialect)
-		get_str << DialectQualifiedTableName(catalog, schema, table_name, dialect);
-	} else if (unqualified_snapshot) {
-		// A pinned-snapshot scan rendered unqualified: the qualifier is dialect-specific and must not be
-		// mistaken for a table-function argument list by the `_tf` aliasing below.
-		get_str << base_table_name << snapshot_suffix;
+		get_str << DialectQualifiedTableName(catalog, schema, table_name, dialect)
+		        << RenderSnapshotSuffix(snapshot.get(), dialect);
+	} else if (snapshot) {
+		get_str << DialectQuoteIdent(table_name, dialect) << RenderSnapshotSuffix(snapshot.get(), dialect);
 	} else {
 		// A TABLE-argument function: the child CTE is the function's argument, not a lateral input.
 		const size_t table_arg_pos = table_name.find("%LPTS_TABLE_ARG%");
@@ -447,7 +442,9 @@ bool GetNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 		return false;
 	}
 	out.select_exprs = RenderGetSelectColumns(column_names, column_is_expression, dialect);
-	out.from = catalog.empty() ? table_name : DialectQualifiedTableName(catalog, schema, table_name, dialect);
+	out.from = catalog.empty() ? (snapshot ? DialectQuoteIdent(table_name, dialect) : table_name)
+	                           : DialectQualifiedTableName(catalog, schema, table_name, dialect);
+	out.from += RenderSnapshotSuffix(snapshot.get(), dialect);
 	out.where_conds = table_filters; // already complete conditions; the renderer wraps each in parens
 	return true;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/parser/tableref/at_clause.hpp"
 #include "sql_dialect.hpp"
 
 namespace duckdb {
@@ -189,6 +190,7 @@ class GetNode : public CteNode {
 public:
 	/// `_tf(...)` alias list in the table function's output order (empty = use projected column order).
 	vector<string> table_function_alias;
+	unique_ptr<AtClause> snapshot;
 	/// Parallel to `column_names`: true where the entry is a raw SQL expression (struct field-extraction
 	/// pushdown) emitted verbatim rather than quoted. Empty means "all plain identifiers".
 	vector<bool> column_is_expression;

@@ -22,6 +22,7 @@ InsertionOrderPreservingMap<string> AstNode::GetExtraInfo() const {
 string AstGetNode::ToString(int indent) const {
 	string result = Indent(indent) + "Get";
 	result += " " + catalog + "." + schema + "." + table_name;
+	result += snapshot ? " " + snapshot->ToString() : "";
 	result += " (table_index=" + std::to_string(table_index) + ")";
 	result += "\n" + Indent(indent + 2) + "columns: [";
 	for (size_t i = 0; i < column_names.size(); i++) {
@@ -49,7 +50,7 @@ string AstGetNode::ToString(int indent) const {
 
 InsertionOrderPreservingMap<string> AstGetNode::GetExtraInfo() const {
 	InsertionOrderPreservingMap<string> info;
-	info.insert("Table", catalog + "." + schema + "." + table_name);
+	info.insert("Table", catalog + "." + schema + "." + table_name + (snapshot ? " " + snapshot->ToString() : ""));
 	string cols = "[";
 	for (size_t i = 0; i < column_names.size(); i++) {
 		if (i > 0) {
