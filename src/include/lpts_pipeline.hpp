@@ -2,13 +2,20 @@
 
 #include "lpts_ast.hpp"
 #include "cte_nodes.hpp"
+#include <functional>
 
 namespace duckdb {
+
+class TableCatalogEntry;
+class AtClause;
+// Called by the existing GET visit with the original catalog entry, unaffected by output qualification overrides.
+using SnapshotResolver = std::function<unique_ptr<AtClause>(const TableCatalogEntry &)>;
 
 /// Phase 1: Convert a DuckDB LogicalOperator tree into a dialect-agnostic AST.
 /// `dialect` is forwarded to expression serialization for dialect-specific function renaming.
 unique_ptr<AstNode> LogicalPlanToAst(ClientContext &context, unique_ptr<LogicalOperator> &plan,
-                                     SqlDialect dialect = SqlDialect::DUCKDB);
+                                     SqlDialect dialect = SqlDialect::DUCKDB,
+                                     const SnapshotResolver &snapshot_resolver = {});
 
 /// Phase 2: Convert an AST into a flat CTE list.
 /// `dialect` controls dialect-specific SQL rendering (default: DuckDB).

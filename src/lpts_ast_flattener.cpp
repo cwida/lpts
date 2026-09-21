@@ -289,15 +289,11 @@ private:
 				}
 			}
 			sql += " FROM ";
-			string inline_base_name;
-			string inline_snapshot_suffix;
 			if (!get.catalog.empty()) {
-				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect);
-			} else if (TrySplitDialectSnapshotSuffix(get.table_name, dialect, inline_base_name,
-			                                         inline_snapshot_suffix)) {
-				// Pinned-snapshot scan rendered unqualified: the dialect-specific qualifier must not be
-				// mistaken for a table-function argument list by the `_tf` aliasing below.
-				sql += inline_base_name + inline_snapshot_suffix;
+				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect) +
+				       RenderSnapshotSuffix(get.snapshot.get(), dialect);
+			} else if (get.snapshot) {
+				sql += DialectQuoteIdent(get.table_name, dialect) + RenderSnapshotSuffix(get.snapshot.get(), dialect);
 			} else {
 				// An in-out (lateral) table function has the delim/correlation source as its AST child:
 				// inline it as the left comma-join input (mirrors GetNode's input_cte_name handling).
@@ -743,6 +739,7 @@ private:
 		if (absorb_get) {
 			from_clause =
 			    DialectQualifiedTableName(absorb_get->catalog, absorb_get->schema, absorb_get->table_name, dialect);
+			from_clause += RenderSnapshotSuffix(absorb_get->snapshot.get(), dialect);
 			for (size_t i = 0; i < absorb_get->cte_column_names.size(); i++) {
 				// Struct field-extraction columns are raw SQL expressions, emitted verbatim; plain columns
 				// are quoted identifiers.
@@ -1100,6 +1097,7 @@ private:
 			                                   get.table_index, get.table_filters, get.column_names, input_cte_name,
 			                                   get.table_function_output_count);
 			get_node->table_function_alias = get.table_function_alias;
+			get_node->snapshot = get.snapshot ? get.snapshot->Copy() : nullptr;
 			get_node->column_is_expression = get.column_is_expression;
 			get_node->spark_broadcast_hint =
 			    emit_spark_hints && dialect == SqlDialect::SPARK && IsOpenIvmDeltaTable(get.table_name);
