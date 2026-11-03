@@ -1478,7 +1478,6 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 	// data-independent planning retains it. Inspect both plans, since WITH RECURSIVE
 	// can also be written around CTEs that are not recursive.
 	bool has_recursive_cte = dialect == SqlDialect::DUCKDB && PlanHasRecursiveCte(*original);
-	const bool original_can_throw = PlanCanThrowDuringExecution(*original);
 
 	// A sequence function may be hidden inside a macro that the text heuristic cannot see. Running the
 	// rewritten side would advance mutable sequence state a second time, so bypass checking entirely instead
@@ -1585,8 +1584,9 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		// parse/bind — a translation BUG — logged as FAIL so the coverage gate treats it like WRONG.
 		const string error_text = e.what();
 		const ErrorData error(e);
-		const bool equivalent_execution_error = rewrite_stage == CheckRewriteStage::REWRITTEN_REPLAN &&
-		                                        original_can_throw && Exception::IsExecutionError(error.Type());
+		const bool equivalent_execution_error = rewrite_stage == CheckRewriteStage::REWRITTEN_REPLAN && original &&
+		                                        Exception::IsExecutionError(error.Type()) &&
+		                                        PlanCanThrowDuringExecution(*original);
 		const bool unsupported = rewrite_stage == CheckRewriteStage::ORIGINAL_REPLAN ||
 		                         IsIntentionalLptsRefusal(error_text) || equivalent_execution_error;
 		LptsCheckAppendLog(run.log_path, run.qnum, unsupported ? "UNSUPPORTED" : "FAIL");
