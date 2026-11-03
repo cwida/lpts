@@ -26,8 +26,6 @@ SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50);
 4	40
 5	50
 
-statement ok
-SELECT id, val FROM t WHERE val IN (10, 20, 30, 40, 50);
 
 # --- partial match ---
 
@@ -38,8 +36,6 @@ SELECT id, val FROM t WHERE val IN (10, 30, 50);
 3	30
 5	50
 
-statement ok
-SELECT id, val FROM t WHERE val IN (10, 30, 50);
 
 # --- NOT IN: produces an ANTI join; no rows match when all values are listed ---
 
@@ -47,8 +43,6 @@ query II
 SELECT id, val FROM t WHERE val NOT IN (10, 20, 30, 40, 50);
 ----
 
-statement ok
-SELECT id, val FROM t WHERE val NOT IN (10, 20, 30, 40, 50);
 
 # ============================================================
 # MATERIALIZED_CTE + CTE_REF x2: WITH clause used twice
@@ -61,8 +55,6 @@ WITH high AS (SELECT id, val FROM t WHERE val >= 30) SELECT h1.id, h1.val FROM h
 ----
 5	50
 
-statement ok
-WITH high AS (SELECT id, val FROM t WHERE val >= 30) SELECT h1.id, h1.val FROM high h1 WHERE h1.val = (SELECT max(val) FROM high);
 
 # CTE self-joined
 query I rowsort
@@ -72,8 +64,6 @@ WITH numbered AS (SELECT id, val FROM t) SELECT a.id FROM numbered a JOIN number
 4
 5
 
-statement ok
-WITH numbered AS (SELECT id, val FROM t) SELECT a.id FROM numbered a JOIN numbered b ON a.id = b.id WHERE a.val > 20;
 
 # Chained CTEs (base → derived): each CTE used once, no materialization
 query II
@@ -84,8 +74,6 @@ WITH base AS (SELECT id, val FROM t WHERE val > 10), doubled AS (SELECT id, val 
 4	80
 5	100
 
-statement ok
-WITH base AS (SELECT id, val FROM t WHERE val > 10), doubled AS (SELECT id, val * 2 AS val FROM base) SELECT id, val FROM doubled ORDER BY id;
 # A long single-use CTE chain needs a real boundary so DuckDB's decorrelator
 # does not traverse the whole inlined chain on a worker's small stack.
 query I
@@ -182,6 +170,42 @@ SELECT MIN(x) FROM c39;
 ----
 40
 
+# A repeated NOT MATERIALIZED CTE doubles the optimized tree at each level.
+# Reuse its constant scans as well as its SELECT blocks so SQL size stays linear.
+query I
+WITH c0 AS NOT MATERIALIZED (SELECT 1 AS x),
+     c1 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c0 a, c0 b),
+     c2 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c1 a, c1 b),
+     c3 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c2 a, c2 b),
+     c4 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c3 a, c3 b),
+     c5 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c4 a, c4 b),
+     c6 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c5 a, c5 b),
+     c7 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c6 a, c6 b),
+     c8 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c7 a, c7 b),
+     c9 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c8 a, c8 b),
+     c10 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c9 a, c9 b)
+SELECT x FROM c10;
+----
+1024
+
+query I
+SELECT length(sql) < 12000 FROM lpts_query($$
+WITH c0 AS NOT MATERIALIZED (SELECT 1 AS x),
+     c1 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c0 a, c0 b),
+     c2 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c1 a, c1 b),
+     c3 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c2 a, c2 b),
+     c4 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c3 a, c3 b),
+     c5 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c4 a, c4 b),
+     c6 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c5 a, c5 b),
+     c7 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c6 a, c6 b),
+     c8 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c7 a, c7 b),
+     c9 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c8 a, c8 b),
+     c10 AS NOT MATERIALIZED (SELECT a.x + b.x AS x FROM c9 a, c9 b)
+SELECT x FROM c10
+$$);
+----
+true
+
 
 # CTE with aggregation used twice
 statement ok
@@ -226,8 +250,6 @@ WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single
 4	40
 5	50
 
-statement ok
-WITH single AS (SELECT id, val FROM t WHERE val > 20) SELECT id, val FROM single ORDER BY id;
 
 # ============================================================
 # WITH NOT MATERIALIZED: explicitly prevents materialization, always inlined
@@ -239,8 +261,6 @@ WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, va
 1	10
 2	20
 
-statement ok
-WITH nm AS NOT MATERIALIZED (SELECT id, val FROM t WHERE val < 30) SELECT id, val FROM nm ORDER BY id;
 
 # ============================================================
 # WITH MATERIALIZED: explicitly forces materialization
@@ -259,8 +279,6 @@ WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FR
 1	10
 2	20
 
-statement ok
-WITH m AS MATERIALIZED (SELECT id, val FROM t WHERE val <= 20) SELECT id, val FROM m ORDER BY id;
 
 # MATERIALIZED CTE referenced twice (the typical reason to force materialization)
 statement ok
@@ -277,8 +295,6 @@ WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS va
 3	90
 4	120
 
-statement ok
-WITH a AS (SELECT id, val FROM t WHERE val > 10), b AS (SELECT id, val * 3 AS val FROM a WHERE id < 5) SELECT id, val FROM b ORDER BY id;
 
 # ============================================================
 # WITH RECURSIVE
@@ -363,579 +379,3 @@ statement error
 SELECT sql FROM lpts_query('WITH RECURSIVE cte(x,y) USING KEY (x) AS (SELECT 1, 0 UNION ALL SELECT x, y+1 FROM cte WHERE y < 10) TABLE cte');
 ----
 LPTS_UNSUPPORTED_RECURSIVE_CTE
-
-
-# DuckDB 2.0 pipeline construction crashes if the generated recursive CTE is inlined under these joins.
-require tpch
-
-statement ok
-CALL dbgen(sf=0.001);
-
-# SQLStorm TPC-H 32742: lpts_check executes both the original and serialized recursive plan.
-statement ok
-WITH RECURSIVE SupplierHierarchy AS (
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal, s.s_nationkey, 0 AS level
-    FROM supplier s
-    WHERE s.s_acctbal > 10000
-    UNION ALL
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal, s.s_nationkey, sh.level + 1
-    FROM supplier s
-    JOIN SupplierHierarchy sh ON s.s_nationkey = sh.s_nationkey
-    WHERE sh.level < 3 AND s.s_acctbal < sh.s_acctbal
-),
-PartSupplierStats AS (
-    SELECT ps.ps_partkey,
-           COUNT(DISTINCT ps.ps_suppkey) AS total_suppliers,
-           SUM(ps.ps_availqty) AS total_avail_qty,
-           AVG(ps.ps_supplycost) AS avg_supply_cost
-    FROM partsupp ps
-    WHERE ps.ps_supplycost > (SELECT AVG(ps_supplycost) FROM partsupp)
-    GROUP BY ps.ps_partkey
-),
-CustomerOrderStats AS (
-    SELECT c.c_custkey,
-           SUM(o.o_totalprice) AS total_spent,
-           COUNT(DISTINCT o.o_orderkey) AS total_orders,
-           DENSE_RANK() OVER (ORDER BY SUM(o.o_totalprice) DESC) AS spend_rank
-    FROM customer c
-    JOIN orders o ON c.c_custkey = o.o_custkey
-    GROUP BY c.c_custkey
-)
-SELECT p.p_name,
-       p.p_retailprice,
-       COALESCE(s.s_name, 'Unknown Supplier') AS supplier_name,
-       ps.total_suppliers,
-       ps.total_avail_qty,
-       cs.total_spent AS customer_spending,
-       cs.spend_rank
-FROM part p
-LEFT JOIN PartSupplierStats ps ON p.p_partkey = ps.ps_partkey
-LEFT JOIN SupplierHierarchy s ON ps.total_suppliers > 10 AND s.s_suppkey = ps.ps_partkey
-LEFT JOIN CustomerOrderStats cs ON ps.total_suppliers = cs.total_orders
-WHERE p.p_retailprice > 50.00
-  AND (s.s_acctbal IS NULL OR s.s_acctbal > 5000)
-ORDER BY p.p_retailprice DESC, cs.total_spent DESC
-LIMIT 100;
-
-# SQLStorm TPC-H 33660: lpts_check executes both the original and serialized recursive plan.
-statement ok
-WITH RECURSIVE supplier_hierarchy AS (
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal, 0 AS level
-    FROM supplier s
-    WHERE s.s_acctbal IS NOT NULL
-    UNION ALL
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal, sh.level + 1
-    FROM supplier_hierarchy sh
-    JOIN partsupp ps ON sh.s_suppkey = ps.ps_suppkey
-    JOIN supplier s ON ps.ps_partkey = s.s_suppkey
-    WHERE sh.level < 5
-),
-ranked_orders AS (
-    SELECT o.o_orderkey, o.o_totalprice, o.o_orderstatus,
-           ROW_NUMBER() OVER (PARTITION BY o.o_orderstatus ORDER BY o.o_totalprice DESC) AS order_rank
-    FROM orders o
-    WHERE o.o_orderdate >= DATE '1997-01-01'
-),
-filtered_customers AS (
-    SELECT c.c_custkey, c.c_name, SUM(o.o_totalprice) AS total_spent
-    FROM customer c
-    JOIN orders o ON c.c_custkey = o.o_custkey
-    WHERE c.c_acctbal > 1000
-    GROUP BY c.c_custkey, c.c_name
-)
-SELECT r.r_name, COUNT(DISTINCT n.n_nationkey) AS nation_count,
-       AVG(f.total_spent) AS average_spent,
-       SUM(CASE WHEN l.l_discount > 0.1 THEN l.l_extendedprice * (1 - l.l_discount) ELSE 0 END) AS discounted_total
-FROM region r
-LEFT JOIN nation n ON r.r_regionkey = n.n_regionkey
-LEFT JOIN supplier_hierarchy sh ON sh.s_suppkey = n.n_nationkey
-LEFT JOIN lineitem l ON l.l_suppkey = sh.s_suppkey
-LEFT JOIN filtered_customers f ON f.c_custkey = l.l_orderkey
-WHERE r.r_name IS NOT NULL
-GROUP BY r.r_name
-HAVING COUNT(DISTINCT n.n_nationkey) > 2 OR AVG(f.total_spent) > 5000
-ORDER BY average_spent DESC;
-
-# SQLStorm TPC-H 1137: ORDER BY on a hidden window column must not add an output column.
-statement ok
-WITH SupplierStats AS (
-    SELECT
-        s.s_suppkey,
-        s.s_name,
-        s.s_acctbal,
-        SUM(ps.ps_availqty) AS total_avail_qty,
-        COUNT(l.l_orderkey) AS total_orders,
-        AVG(l.l_extendedprice * (1 - l.l_discount)) AS avg_order_value
-    FROM
-        supplier s
-    LEFT JOIN
-        partsupp ps ON s.s_suppkey = ps.ps_suppkey
-    LEFT JOIN
-        lineitem l ON ps.ps_partkey = l.l_partkey
-    GROUP BY
-        s.s_suppkey, s.s_name, s.s_acctbal
-),
-TopSuppliers AS (
-    SELECT
-        s.s_suppkey,
-        s.s_name,
-        s.s_acctbal,
-        total_avail_qty,
-        total_orders,
-        avg_order_value,
-        RANK() OVER (ORDER BY avg_order_value DESC) AS rank
-    FROM
-        SupplierStats s
-)
-SELECT
-    r.r_name AS region_name,
-    n.n_name AS nation_name,
-    ts.s_name AS supplier_name,
-    ts.total_avail_qty,
-    ts.total_orders,
-    ts.avg_order_value
-FROM
-    region r
-JOIN
-    nation n ON r.r_regionkey = n.n_regionkey
-LEFT JOIN
-    TopSuppliers ts ON n.n_nationkey = (SELECT s.s_nationkey FROM supplier s WHERE s.s_suppkey = ts.s_suppkey)
-WHERE
-    r.r_name IS NOT NULL
-    AND ts.avg_order_value > (
-        SELECT
-            AVG(avg_order_value)
-        FROM
-            TopSuppliers
-    )
-ORDER BY
-    r.r_name,
-    ts.rank ASC;
-
-# SQLStorm TPC-H 20918: a recursive branch skipped by DuckDB must also be skipped by the checker.
-statement ok
-WITH RECURSIVE SupplierCTE AS (
-    SELECT s_suppkey, s_name, s_acctbal
-    FROM supplier
-    WHERE s_acctbal IS NOT NULL
-    UNION ALL
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal
-    FROM supplier s
-    JOIN SupplierCTE sc ON s.s_suppkey = sc.s_suppkey
-    WHERE s.s_acctbal > 1000
-),
-PartRevenue AS (
-    SELECT p.p_partkey, SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
-    FROM part p
-    JOIN lineitem l ON p.p_partkey = l.l_partkey
-    GROUP BY p.p_partkey
-),
-RegionNation AS (
-    SELECT r.r_regionkey, n.n_nationkey, n.n_name
-    FROM region r
-    LEFT JOIN nation n ON r.r_regionkey = n.n_regionkey
-    WHERE n.n_name IS NOT NULL OR r.r_name LIKE '%America%'
-),
-OrderSummary AS (
-    SELECT o.o_orderkey, SUM(l.l_extendedprice) AS total_price
-    FROM orders o
-    JOIN lineitem l ON o.o_orderkey = l.l_orderkey
-    WHERE o.o_orderstatus = 'F'
-    GROUP BY o.o_orderkey
-)
-SELECT DISTINCT
-    p.p_name,
-    COUNT(DISTINCT s.s_suppkey) AS supplier_count,
-    AVG(o.total_price) AS avg_order_value,
-    CASE
-        WHEN SUM(pr.revenue) > 5000 THEN 'High Revenue'
-        WHEN SUM(pr.revenue) IS NULL THEN 'No Revenue'
-        ELSE 'Moderate Revenue'
-    END AS revenue_category
-FROM part p
-LEFT JOIN partsupp ps ON p.p_partkey = ps.ps_partkey
-LEFT JOIN SupplierCTE s ON ps.ps_suppkey = s.s_suppkey
-LEFT JOIN PartRevenue pr ON p.p_partkey = pr.p_partkey
-LEFT JOIN OrderSummary o ON p.p_partkey = o.o_orderkey
-WHERE p.p_retailprice BETWEEN 10 AND 100
-  AND (s.s_acctbal > 100 OR s.s_acctbal IS NULL)
-  AND EXISTS (
-      SELECT 1
-      FROM RegionNation rn
-      WHERE rn.n_nationkey = (SELECT c.c_nationkey
-                               FROM customer c
-                               WHERE c.c_custkey = o.o_orderkey)
-  )
-GROUP BY p.p_name
-HAVING COUNT(DISTINCT s.s_suppkey) > 0
-ORDER BY revenue_category DESC, supplier_count ASC;
-
-# SQLStorm TPC-H 20200: stale filter projection map after DuckDB 2.0 column pruning.
-statement ok
-WITH RankedOrders AS (
-    SELECT
-        o.o_orderkey,
-        SUM(l.l_extendedprice * (1 - l.l_discount)) AS total_revenue,
-        RANK() OVER (PARTITION BY o.o_orderstatus ORDER BY SUM(l.l_extendedprice * (1 - l.l_discount)) DESC) AS revenue_rank
-    FROM
-        orders o
-    JOIN
-        lineitem l ON o.o_orderkey = l.l_orderkey
-    GROUP BY
-        o.o_orderkey, o.o_orderstatus
-),
-SupplierAvailability AS (
-    SELECT
-        p.p_partkey,
-        COALESCE(SUM(ps.ps_availqty), 0) AS total_available
-    FROM
-        part p
-    LEFT JOIN
-        partsupp ps ON p.p_partkey = ps.ps_partkey
-    GROUP BY
-        p.p_partkey
-),
-CustomerSegment AS (
-    SELECT
-        c.c_custkey,
-        c.c_mktsegment,
-        COUNT(o.o_orderkey) AS total_orders
-    FROM
-        customer c
-    LEFT JOIN
-        orders o ON c.c_custkey = o.o_custkey
-    GROUP BY
-        c.c_custkey, c.c_mktsegment
-),
-BizarreJoin AS (
-    SELECT
-        s.s_name,
-        COUNT(DISTINCT o.o_orderkey) AS order_count,
-        MAX(CASE WHEN l.l_returnflag = 'R' THEN l.l_quantity ELSE 0 END) AS returned_quantity,
-        MIN(CASE WHEN l.l_linestatus = 'O' THEN l.l_discount END) AS lowest_open_discount
-    FROM
-        supplier s
-    LEFT JOIN
-        partsupp ps ON s.s_suppkey = ps.ps_suppkey
-    LEFT JOIN
-        lineitem l ON ps.ps_partkey = l.l_partkey
-    LEFT JOIN
-        orders o ON l.l_orderkey = o.o_orderkey
-    GROUP BY
-        s.s_name
-)
-SELECT
-    r.o_orderkey,
-    r.total_revenue,
-    sa.total_available,
-    cs.c_mktsegment,
-    bz.order_count,
-    bz.returned_quantity,
-    bz.lowest_open_discount
-FROM
-    RankedOrders r
-JOIN
-    SupplierAvailability sa ON r.o_orderkey = sa.p_partkey
-JOIN
-    CustomerSegment cs ON r.o_orderkey IN (SELECT o_orderkey FROM orders WHERE o_custkey IS NULL OR o_orderstatus = 'F')
-LEFT JOIN
-    BizarreJoin bz ON bz.order_count > 0 AND r.o_orderkey NOT IN (SELECT o_orderkey FROM orders WHERE o_orderstatus = 'C')
-WHERE
-    r.revenue_rank <= 5
-ORDER BY
-    r.total_revenue DESC, cs.total_orders ASC;
-
-# SQLStorm TPC-H 21010: stale join projection map after DuckDB 2.0 column pruning.
-statement ok
-WITH RankedOrders AS (
-    SELECT
-        o.o_orderkey,
-        o.o_orderdate,
-        o.o_totalprice,
-        ROW_NUMBER() OVER (PARTITION BY o.o_custkey ORDER BY o.o_orderdate DESC) AS OrderRank
-    FROM
-        orders o
-    WHERE
-        o.o_totalprice > (
-            SELECT AVG(o2.o_totalprice)
-            FROM orders o2
-            WHERE o2.o_orderdate < cast('1998-10-01' as date)
-        )
-),
-SupplierDetails AS (
-    SELECT
-        s.s_suppkey,
-        s.s_name,
-        s.s_nationkey,
-        COUNT(ps.ps_partkey) AS PartsSupplied
-    FROM
-        supplier s
-    LEFT JOIN
-        partsupp ps ON s.s_suppkey = ps.ps_suppkey
-    GROUP BY
-        s.s_suppkey, s.s_name, s.s_nationkey
-),
-CustomerStats AS (
-    SELECT
-        c.c_custkey,
-        SUM(o.o_totalprice) AS TotalSpent,
-        COUNT(DISTINCT o.o_orderkey) AS OrdersCount
-    FROM
-        customer c
-    LEFT JOIN
-        orders o ON c.c_custkey = o.o_custkey
-    GROUP BY
-        c.c_custkey
-),
-FilteredParts AS (
-    SELECT
-        p.p_partkey,
-        p.p_name,
-        p.p_retailprice,
-        COALESCE(SUM(ps.ps_availqty), 0) AS TotalAvailable
-    FROM
-        part p
-    LEFT JOIN
-        partsupp ps ON p.p_partkey = ps.ps_partkey
-    WHERE
-        p.p_retailprice < (SELECT MAX(p2.p_retailprice) FROM part p2 WHERE p2.p_size IS NOT NULL)
-    GROUP BY
-        p.p_partkey, p.p_name, p.p_retailprice
-)
-SELECT
-    rs.o_orderkey,
-    rs.o_orderdate,
-    cs.TotalSpent,
-    ps.p_name,
-    ps.TotalAvailable,
-    sd.PartsSupplied,
-    RANK() OVER (PARTITION BY cs.c_custkey ORDER BY cs.TotalSpent DESC) AS CustomerRank
-FROM
-    RankedOrders rs
-JOIN
-    CustomerStats cs ON rs.o_orderkey IN (SELECT o.o_orderkey FROM orders o WHERE o.o_custkey = cs.c_custkey)
-JOIN
-    FilteredParts ps ON ps.TotalAvailable > 10
-LEFT JOIN
-    SupplierDetails sd ON sd.s_nationkey = (SELECT n.n_nationkey FROM nation n WHERE n.n_name = 'USA')
-WHERE
-    cs.TotalSpent IS NOT NULL
-    AND sd.PartsSupplied > 0
-    AND (rs.o_orderdate BETWEEN '1997-01-01' AND '1997-12-31' OR rs.o_orderdate IS NULL)
-ORDER BY
-    rs.o_orderdate DESC, cs.TotalSpent DESC;
-
-# SQLStorm TPC-H 21797: nested materialized CTEs and conditionless joins in a recursive step.
-statement ok
-WITH RECURSIVE CTE_Suppliers AS (
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal,
-           (SELECT COUNT(*) FROM partsupp ps WHERE ps.ps_suppkey = s.s_suppkey) AS supplier_parts_count
-    FROM supplier s
-    WHERE s.s_acctbal > 1000
-    UNION ALL
-    SELECT s.s_suppkey, s.s_name, s.s_acctbal,
-           c.supplier_parts_count + (SELECT COUNT(*) FROM partsupp ps WHERE ps.ps_suppkey = s.s_suppkey)
-    FROM supplier s
-    JOIN CTE_Suppliers c ON s.s_suppkey = c.s_suppkey + 1
-    WHERE c.supplier_parts_count < 10
-),
-CTE_Orders AS (
-    SELECT o.o_orderkey, o.o_totalprice, o.o_orderdate,
-           DENSE_RANK() OVER (PARTITION BY o.o_orderstatus ORDER BY o.o_totalprice DESC) AS price_rank
-    FROM orders o
-    WHERE o.o_orderdate BETWEEN '1995-01-01' AND '1995-12-31'
-),
-Enhanced_LineItems AS (
-    SELECT l.*,
-           (CASE
-                WHEN l.l_discount = 0 THEN l.l_extendedprice
-                ELSE l.l_extendedprice * (1 - l.l_discount)
-            END) AS net_price,
-           ROW_NUMBER() OVER (PARTITION BY l.l_orderkey ORDER BY l.l_linenumber) AS line_order
-    FROM lineitem l
-    WHERE l.l_quantity > 0
-),
-Final_Result AS (
-    SELECT n.n_name, SUM(el.net_price) AS total_net_price, AVG(s.s_acctbal) AS avg_supplier_acctbal,
-           COUNT(DISTINCT o.o_orderkey) AS total_orders
-    FROM nation n
-    LEFT JOIN supplier s ON n.n_nationkey = s.s_nationkey
-    JOIN CTE_Suppliers cs ON s.s_suppkey = cs.s_suppkey
-    JOIN Enhanced_LineItems el ON s.s_suppkey = el.l_suppkey
-    JOIN CTE_Orders o ON el.l_orderkey = o.o_orderkey
-    WHERE n.n_name IS NOT NULL AND el.l_returnflag = 'R'
-    GROUP BY n.n_name
-    HAVING COUNT(*) > 5 OR MAX(el.l_discount) IS NULL
-)
-SELECT r.r_name, COALESCE(fr.total_net_price, 0) AS total_net_sales,
-       COALESCE(fr.avg_supplier_acctbal, 0) AS avg_supplier_balance
-FROM region r
-LEFT JOIN Final_Result fr ON r.r_name = fr.n_name
-WHERE r.r_regionkey IN (SELECT DISTINCT n.n_regionkey FROM nation n WHERE n.n_name LIKE 'A%')
-ORDER BY total_net_sales DESC, avg_supplier_balance ASC;
-
-# SQLStorm TPC-H 4020: a decorrelated constant group key is a value, not an output ordinal.
-statement ok
-WITH RegionalSales AS (
-    SELECT
-        r.r_name AS region_name,
-        SUM(l.l_extendedprice * (1 - l.l_discount)) AS total_sales,
-        COUNT(DISTINCT o.o_orderkey) AS order_count,
-        RANK() OVER (PARTITION BY r.r_name ORDER BY SUM(l.l_extendedprice * (1 - l.l_discount)) DESC) AS sales_rank
-    FROM
-        region r
-    JOIN
-        nation n ON r.r_regionkey = n.n_regionkey
-    JOIN
-        supplier s ON n.n_nationkey = s.s_nationkey
-    JOIN
-        partsupp ps ON s.s_suppkey = ps.ps_suppkey
-    JOIN
-        part p ON ps.ps_partkey = p.p_partkey
-    JOIN
-        lineitem l ON p.p_partkey = l.l_partkey
-    JOIN
-        orders o ON l.l_orderkey = o.o_orderkey
-    WHERE
-        o.o_orderdate >= DATE '1996-01-01'
-        AND o.o_orderdate < DATE '1997-01-01'
-    GROUP BY
-        r.r_name
-),
-TopRegions AS (
-    SELECT
-        region_name,
-        total_sales,
-        order_count,
-        ROW_NUMBER() OVER (ORDER BY total_sales DESC) AS rank
-    FROM
-        RegionalSales
-    WHERE
-        total_sales > (SELECT AVG(total_sales) FROM RegionalSales)
-)
-SELECT
-    tr.region_name,
-    tr.total_sales,
-    tr.order_count,
-    COALESCE(NULLIF(tr.total_sales / NULLIF(tr.order_count, 0), 0), 0) AS avg_sales_per_order,
-    TRIM(REGEXP_REPLACE(tr.region_name, 'Region', '')) AS cleaned_region_name
-FROM
-    TopRegions tr
-WHERE
-    tr.rank <= 5
-UNION ALL
-SELECT
-    'Other Regions' AS region_name,
-    SUM(tr.total_sales) AS total_sales,
-    SUM(tr.order_count) AS order_count,
-    COALESCE(NULLIF(SUM(tr.total_sales) / NULLIF(SUM(tr.order_count), 0), 0), 0) AS avg_sales_per_order,
-    NULL AS cleaned_region_name
-FROM
-    TopRegions tr
-WHERE
-    tr.rank > 5
-GROUP BY
-    'Other Regions'
-ORDER BY
-    total_sales DESC;
-
-# SQLStorm TPC-H 7445: DuckDB internal limit_rownum is distinct from user WITH ORDINALITY.
-statement ok
-WITH RankedSuppliers AS (
-    SELECT
-        s.s_suppkey,
-        s.s_name,
-        SUM(ps.ps_supplycost * ps.ps_availqty) AS total_supply_value,
-        ROW_NUMBER() OVER (PARTITION BY n.n_regionkey ORDER BY SUM(ps.ps_supplycost * ps.ps_availqty) DESC) AS region_rank
-    FROM
-        supplier s
-    JOIN
-        partsupp ps ON s.s_suppkey = ps.ps_suppkey
-    JOIN
-        nation n ON s.s_nationkey = n.n_nationkey
-    GROUP BY
-        s.s_suppkey, s.s_name, n.n_regionkey
-),
-TopRegions AS (
-    SELECT
-        r.r_name,
-        SUM(rs.total_supply_value) AS total_region_supply
-    FROM
-        region r
-    JOIN
-        RankedSuppliers rs ON r.r_regionkey = rs.region_rank
-    WHERE
-        rs.region_rank <= 3
-    GROUP BY
-        r.r_name
-),
-CustomerOrders AS (
-    SELECT
-        c.c_custkey,
-        c.c_name,
-        SUM(o.o_totalprice) AS total_order_value
-    FROM
-        customer c
-    JOIN
-        orders o ON c.c_custkey = o.o_custkey
-    GROUP BY
-        c.c_custkey, c.c_name
-)
-SELECT
-    cr.c_name,
-    tr.r_name,
-    cr.total_order_value,
-    tr.total_region_supply
-FROM
-    CustomerOrders cr
-JOIN
-    TopRegions tr ON cr.c_custkey = (
-        SELECT c.c_custkey
-        FROM customer c
-        WHERE c.c_nationkey = (
-            SELECT n.n_nationkey
-            FROM nation n
-            WHERE n.n_name = 'NATION_NAME'
-        )
-        ORDER BY total_order_value DESC
-        LIMIT 1
-    )
-ORDER BY
-    cr.total_order_value DESC, tr.total_region_supply DESC;
-
-# SQLStorm TPC-H 30619: WITH RECURSIVE without recursion uses the normal checker path.
-statement ok
-WITH RECURSIVE order_hierarchy AS (
-    SELECT o.o_orderkey, o.o_orderdate, o.o_totalprice,
-           ROW_NUMBER() OVER (PARTITION BY o.o_orderkey ORDER BY o.o_orderdate) AS order_rank
-    FROM orders o
-    WHERE o.o_orderdate >= '1997-01-01'
-), ranked_lineitems AS (
-    SELECT l.l_orderkey, l.l_partkey, l.l_quantity, l.l_extendedprice,
-           SUM(l.l_extendedprice * (1 - l.l_discount)) OVER (PARTITION BY l.l_orderkey) AS total_extended_price,
-           ROW_NUMBER() OVER (PARTITION BY l.l_orderkey ORDER BY l.l_linenumber) AS line_rank
-    FROM lineitem l
-    WHERE l.l_returnflag = 'N'
-), supplier_parts AS (
-    SELECT ps.ps_partkey, ps.ps_suppkey, SUM(ps.ps_availqty) AS total_availqty
-    FROM partsupp ps
-    GROUP BY ps.ps_partkey, ps.ps_suppkey
-), nation_suppliers AS (
-    SELECT n.n_name, s.s_suppkey, s.s_acctbal
-    FROM supplier s
-    JOIN nation n ON s.s_nationkey = n.n_nationkey
-    WHERE n.n_name LIKE 'A%' OR n.n_name LIKE '%N%'
-)
-SELECT oh.o_orderkey, oh.o_orderdate, rli.l_partkey, rli.l_quantity, rli.total_extended_price,
-       CASE
-           WHEN rli.total_extended_price IS NULL THEN 0
-           ELSE rli.total_extended_price
-       END AS calculated_price,
-       ns.n_name, np.total_availqty
-FROM order_hierarchy oh
-LEFT JOIN ranked_lineitems rli ON oh.o_orderkey = rli.l_orderkey
-FULL OUTER JOIN supplier_parts np ON rli.l_partkey = np.ps_partkey
-JOIN nation_suppliers ns ON ns.s_suppkey = np.ps_suppkey
-WHERE (oh.o_totalprice > 1000 AND rli.l_quantity < 10)
-   OR (oh.o_orderdate < cast('1998-10-01' as date) - INTERVAL '30 days' AND rli.total_extended_price IS NULL)
-ORDER BY oh.o_orderdate DESC, calculated_price DESC;

@@ -335,6 +335,10 @@ string BuildReuseSignature(const CteNode &node, SelectParts parts, SqlDialect di
 	return std::to_string(node.cte_column_list.size()) + "\n" + RenderSelectPretty(parts, {}, 0, dialect);
 }
 
+string BuildReuseSignature(const CteNode &node, const string &body) {
+	return std::to_string(node.cte_column_list.size()) + "\n" + body;
+}
+
 template <class CALLBACK>
 void VisitIdentifierTokens(const string &sql, CALLBACK &&callback) {
 	for (idx_t i = 0; i < sql.size();) {
@@ -1074,12 +1078,22 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	for (auto &node : nodes) {
 		SelectParts parts;
 		const bool has_select_parts = node->BuildSelectParts(dialect, parts);
+		string body;
+		if (!has_select_parts) {
+			body = node->ToQuery(dialect);
+		}
 
-		const bool eligible = deduplicate && has_select_parts && !node->materialized;
+		const bool eligible = deduplicate && !node->materialized;
 		if (eligible) {
-			SelectParts canonical_parts = parts;
-			RenameParts(canonical_parts, canonical_replacements);
-			const string signature = BuildReuseSignature(*node, std::move(canonical_parts), dialect);
+			string signature;
+			if (has_select_parts) {
+				SelectParts canonical_parts = parts;
+				RenameParts(canonical_parts, canonical_replacements);
+				signature = BuildReuseSignature(*node, std::move(canonical_parts), dialect);
+			} else {
+				// Constant scans and other nodes with bespoke SQL still have repeatable bodies.
+				signature = BuildReuseSignature(*node, body);
+			}
 			auto match = signature_to_prepared.find(signature);
 			if (match != signature_to_prepared.end()) {
 				auto &representative = *prepared[match->second].node;
@@ -1108,10 +1122,7 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 			signature_to_prepared.emplace(signature, prepared.size());
 		}
 
-		PreparedCte entry {node.get(), has_select_parts, node->materialized, std::move(parts), string(), {}};
-		if (!has_select_parts) {
-			entry.body = node->ToQuery(dialect);
-		}
+		PreparedCte entry {node.get(), has_select_parts, node->materialized, std::move(parts), std::move(body), {}};
 		entry.dependencies = CollectCteDependencies(PreparedCteBody(entry, dialect), known_cte_names);
 		prepared.push_back(std::move(entry));
 		known_cte_names.insert(node->cte_name);

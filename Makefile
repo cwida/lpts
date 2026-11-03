@@ -29,5 +29,17 @@ coverage-check: release
 coverage-baseline: release
 	build/release/extension/lpts/lpts_corpus_gate --update-baseline
 
-# `make test` = the extension's own unit tests, then the corpus coverage gate.
+# `make test` runs SQLStorm regressions, unit tests, then the DuckDB corpus gate.
 test: coverage-check
+
+# Keep the exact SQLStorm regressions in their upstream corpus rather than
+# duplicating hundreds of lines of SQL in test/sql/cte.test.
+ifneq ($(OS),Windows_NT)
+.PHONY: sqlstorm-regressions
+sqlstorm-regressions: release
+	build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10 \
+		--cases 32742,33660,1137,20918,20200,21010,21797,4020,7445,30619 \
+		--require-success --out /tmp/lpts-sqlstorm-regressions.csv
+
+test_release: sqlstorm-regressions
+endif

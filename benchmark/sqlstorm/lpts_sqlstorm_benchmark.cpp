@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <map>
 #include <poll.h>
+#include <set>
 #include <signal.h>
 #include <sstream>
 #include <string>
@@ -1065,7 +1066,7 @@ static bool WriteCSV(const string &out_csv, const vector<string> &query_files,
 }
 
 int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, double timeout_s, double tpch_sf,
-                         bool compare_perf) {
+                         bool compare_perf, const string &cases, bool require_success) {
 	try {
 		string sf_str = FormatSF(tpch_sf);
 		string qdir = queries_dir.empty() ? FindQueriesDir() : queries_dir;
@@ -1076,6 +1077,21 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 		}
 
 		auto query_files = CollectQueryFiles(qdir);
+		if (!cases.empty()) {
+			std::set<string> requested;
+			std::istringstream names(cases);
+			string name;
+			while (std::getline(names, name, ',')) {
+				requested.insert(name);
+			}
+			query_files.erase(std::remove_if(query_files.begin(), query_files.end(), [&](const string &path) {
+			                   return requested.erase(QueryName(path)) == 0;
+		                   }), query_files.end());
+			if (!requested.empty()) {
+				Log("ERROR: SQLStorm case not found: " + *requested.begin());
+				return 1;
+			}
+		}
 		if (query_files.empty()) {
 			Log("ERROR: No .sql files found in " + qdir);
 			return 1;
@@ -1170,6 +1186,10 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 		if (!WriteCSV(csv_path, query_files, summaries, compare_perf)) {
 			return 1;
 		}
+		if (require_success && stats.success != total) {
+			Log("ERROR: SQLStorm regression failed");
+			return 1;
+		}
 		return 0;
 	} catch (std::exception &ex) {
 		Log(string("Fatal error: ") + ex.what());
@@ -1188,6 +1208,8 @@ static void PrintUsage() {
 	          << "  --timeout <sec>    Per-query timeout in seconds (default: 10)\n"
 	          << "  --tpch_sf <float>  TPC-H scale factor (default: 1.0)\n"
 	          << "  --compare_perf     Compare DuckDB execution against generated LPTS SQL execution\n"
+	          << "  --cases <ids>      Run only these comma-separated SQLStorm case IDs\n"
+	          << "  --require-success  Exit nonzero unless every selected case succeeds\n"
 	          << "  -h, --help         Show this help message\n";
 }
 
@@ -1199,6 +1221,8 @@ int main(int argc, char **argv) {
 	double timeout_s = 10.0;
 	double tpch_sf = 1.0;
 	bool compare_perf = false;
+	bool require_success = false;
+	std::string cases;
 
 	for (int i = 1; i < argc; ++i) {
 		std::string arg = argv[i];
@@ -1215,6 +1239,10 @@ int main(int argc, char **argv) {
 			tpch_sf = std::stod(argv[++i]);
 		} else if (arg == "--compare_perf") {
 			compare_perf = true;
+		} else if (arg == "--cases" && i + 1 < argc) {
+			cases = argv[++i];
+		} else if (arg == "--require-success") {
+			require_success = true;
 		} else {
 			std::cerr << "Unknown option: " << arg << "\n";
 			PrintUsage();
@@ -1222,5 +1250,6 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, timeout_s, tpch_sf, compare_perf);
+	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, timeout_s, tpch_sf, compare_perf, cases,
+	                                    require_success);
 }
