@@ -1065,8 +1065,9 @@ static bool WriteCSV(const string &out_csv, const vector<string> &query_files,
 	return true;
 }
 
-int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, double timeout_s, double tpch_sf,
-                         bool compare_perf, const string &cases, bool require_success) {
+int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, const string &database_path,
+                         double timeout_s, double tpch_sf, bool compare_perf, const string &cases,
+                         bool require_success) {
 	try {
 		string sf_str = FormatSF(tpch_sf);
 		string qdir = queries_dir.empty() ? FindQueriesDir() : queries_dir;
@@ -1098,7 +1099,7 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 		}
 
 		string csv_path = out_csv.empty() ? ("benchmark/sqlstorm/lpts_sqlstorm_tpch_sf" + sf_str + ".csv") : out_csv;
-		string db_path = "tpch_sf" + sf_str + "_lpts_sqlstorm.db";
+		string db_path = database_path.empty() ? "tpch_sf" + sf_str + "_lpts_sqlstorm.db" : database_path;
 		bool db_exists = FileExists(db_path);
 
 		Log("LPTS SQLStorm TPC-H benchmark");
@@ -1205,6 +1206,7 @@ static void PrintUsage() {
 	          << "  --queries <dir>    SQLStorm TPC-H queries directory\n"
 	          << "                     (default: benchmark/sqlstorm/SQLStorm/v1.0/tpch/queries)\n"
 	          << "  --out <csv>        Output CSV path (default: benchmark/sqlstorm/lpts_sqlstorm_tpch_sf*.csv)\n"
+	          << "  --db <path>        Benchmark database path (default: tpch_sf*_lpts_sqlstorm.db)\n"
 	          << "  --timeout <sec>    Per-query timeout in seconds (default: 10)\n"
 	          << "  --tpch_sf <float>  TPC-H scale factor (default: 1.0)\n"
 	          << "  --compare_perf     Compare DuckDB execution against generated LPTS SQL execution\n"
@@ -1218,6 +1220,7 @@ int main(int argc, char **argv) {
 
 	std::string queries_dir;
 	std::string out_csv;
+	std::string database_path;
 	double timeout_s = 10.0;
 	double tpch_sf = 1.0;
 	bool compare_perf = false;
@@ -1233,6 +1236,8 @@ int main(int argc, char **argv) {
 			queries_dir = argv[++i];
 		} else if (arg == "--out" && i + 1 < argc) {
 			out_csv = argv[++i];
+		} else if (arg == "--db" && i + 1 < argc) {
+			database_path = argv[++i];
 		} else if (arg == "--timeout" && i + 1 < argc) {
 			timeout_s = std::stod(argv[++i]);
 		} else if (arg == "--tpch_sf" && i + 1 < argc) {
@@ -1250,6 +1255,6 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, timeout_s, tpch_sf, compare_perf, cases,
+	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, database_path, timeout_s, tpch_sf, compare_perf, cases,
 	                                    require_success);
 }

@@ -39,7 +39,12 @@ ifneq ($(OS),Windows_NT)
 sqlstorm-regressions: release
 	build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10 \
 		--cases 32742,33660,1137,20918,20200,21010,21797,4020,7445,30619 \
-		--require-success --out /tmp/lpts-sqlstorm-regressions.csv
+		--require-success --db /tmp/lpts-sqlstorm-regressions.db --out /tmp/lpts-sqlstorm-regressions.csv
 
+# Linux CI invokes test_release once in its build container and again on the
+# host, where extension-ci-tools skips tests. Keep the benchmark in the container
+# so the host does not reconfigure a build tree created at /duckdb_build_dir.
+ifneq ($(LINUX_CI_IN_DOCKER),0)
 test_release: sqlstorm-regressions
+endif
 endif

@@ -19,6 +19,9 @@ string VecToSeparatedList(const vector<string> &input_list, const string &separa
 /// Convert a join condition list to SQL, using TRUE for conditionless joins.
 string JoinConditionsToSQL(const vector<string> &conditions);
 
+/// True when a type or one of its nested children contains an aggregate state.
+bool TypeContainsAggregateState(const LogicalType &type);
+
 /// Quote an identifier for SQL output when needed.
 string QuoteIdentifier(const string &identifier);
 

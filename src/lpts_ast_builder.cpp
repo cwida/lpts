@@ -2152,7 +2152,12 @@ private:
 			// column_count is the binding contract seen by its consumers.
 			const idx_t physical_column_count = set_op.column_count;
 			if (lhs_bindings.size() < physical_column_count || union_bindings.size() < physical_column_count) {
-				throw InternalException("LPTS UNION: physical output arity exceeds available column bindings");
+				throw InternalException(
+				    "LPTS UNION: physical output arity %llu exceeds available column bindings (lhs %llu, output %llu; "
+				    "lhs types %llu, output types %llu)",
+				    (unsigned long long)physical_column_count, (unsigned long long)lhs_bindings.size(),
+				    (unsigned long long)union_bindings.size(), (unsigned long long)op->children[0]->types.size(),
+				    (unsigned long long)op->types.size());
 			}
 			// Two union output columns can derive from source columns with the same name (e.g.
 			// SELECT t1.a, t2.a ... UNION ...), which would emit a header like (t7_a, t7_a) — DuckDB

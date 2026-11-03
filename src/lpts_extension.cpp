@@ -207,30 +207,6 @@ static void LptsRunOptimizer(ClientContext &context, OptimizerType type, const s
 	callback();
 }
 
-static bool TypeContainsAggregateState(const LogicalType &type) {
-	if (type.id() == LogicalTypeId::LEGACY_AGGREGATE_STATE || type.IsAggregateState()) {
-		return true;
-	}
-	switch (type.id()) {
-	case LogicalTypeId::LIST:
-		return TypeContainsAggregateState(ListType::GetChildType(type));
-	case LogicalTypeId::ARRAY:
-		return TypeContainsAggregateState(ArrayType::GetChildType(type));
-	case LogicalTypeId::STRUCT:
-		for (const auto &child : StructType::GetChildTypes(type)) {
-			if (TypeContainsAggregateState(child.second)) {
-				return true;
-			}
-		}
-		return false;
-	case LogicalTypeId::MAP:
-		return TypeContainsAggregateState(MapType::KeyType(type)) ||
-		       TypeContainsAggregateState(MapType::ValueType(type));
-	default:
-		return false;
-	}
-}
-
 static bool PlanContainsAggregateState(LogicalOperator &op) {
 	for (const auto &type : op.types) {
 		if (TypeContainsAggregateState(type)) {
@@ -1407,12 +1383,6 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		return; // EXPLAIN (FORMAT SQL) is owned by the explain hook.
 	}
 	auto &client_config = ClientConfig::GetConfig(input.context);
-	if (client_config.enable_profiler) {
-		// The checker executes the original and rewritten plans side by side. Profiling that combined
-		// plan would duplicate scan/operator metrics and change the observable profiler output, so leave
-		// profiled queries untouched. The compiler is exercised when profiling is disabled.
-		return;
-	}
 	if (Settings::Get<DebugVerifyStatementSetting>(input.context) != DebugStatementVerification::NONE ||
 	    Settings::Get<DebugVerifySerializerSetting>(input.context) || client_config.verify_parallelism) {
 		// Statement verification (e.g. PRAGMA enable_verification / verify_parallelism, common in DuckDB's
@@ -1448,6 +1418,16 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		    lower_query.find("json_serialize_plan") != string::npos) {
 			return;
 		}
+	}
+	if (client_config.enable_profiler) {
+		// A combined check plan would distort the profiler. Make the unsupported combination explicit
+		// instead of silently treating a strict check as though it succeeded.
+		if (const char *log_path = LptsCheckLogPath()) {
+			LptsCheckAppendLog(log_path, ++mode.log_qnum, "UNSUPPORTED: profiling is enabled");
+			return;
+		}
+		throw InvalidInputException(
+		    "LPTS check cannot run while profiling is enabled; disable profiling or lpts_check");
 	}
 
 	struct RewriteGuard {
@@ -1608,6 +1588,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction check_verdict_function(LPTS_CHECK_VERDICT_FUNCTION, {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
 	                                      LptsCheckVerdictFunction);
 	check_verdict_function.SetStability(FunctionStability::VOLATILE);
+	check_verdict_function.SetFallible();
 	loader.RegisterFunction(check_verdict_function);
 
 	PlannerExtension planner_extension;
