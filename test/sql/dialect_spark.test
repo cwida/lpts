@@ -127,12 +127,12 @@ true
 
 # list_transform → transform
 query I
-SELECT sql LIKE '%transform(%' AS spark_list_transform FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(%' AS spark_list_transform FROM lpts_query('SELECT list_transform(vals, lambda x: x + 1) AS plus FROM events');
 ----
 true
 
 query I
-SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS spark_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS spark_lambda_arrow FROM lpts_query('SELECT list_transform(vals, lambda x: x + 1) AS plus FROM events');
 ----
 true
 
@@ -212,6 +212,15 @@ query II
 SELECT sql LIKE '%current_timestamp()%' AS current_timestamp_preserved,
        sql NOT LIKE '%TIMESTAMP WITH TIME ZONE%' AS no_duckdb_timestamp_cast
 FROM lpts_query('SELECT date_diff(''day'', ts, CURRENT_TIMESTAMP) FROM events');
+----
+true	true
+
+# Function aliases take the same non-folding path as SQL-value CURRENT_TIMESTAMP.
+query II
+SELECT now_sql.sql LIKE '%current_timestamp()%' AS now_preserved,
+       transaction_sql.sql LIKE '%current_timestamp()%' AS transaction_timestamp_preserved
+FROM lpts_query('SELECT date_diff(''day'', ts, now()) FROM events') now_sql,
+     lpts_query('SELECT date_diff(''day'', ts, transaction_timestamp()) FROM events') transaction_sql;
 ----
 true	true
 

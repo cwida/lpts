@@ -60,11 +60,28 @@ void RequireDuckDBDialect(SqlDialect dialect, const string &node_name, const str
 constexpr size_t MAX_WIDTH = 100;
 constexpr size_t INDENT_WIDTH = 4;
 
-/// An ORDER BY item whose expression is a bare integer literal (e.g. a substituted constant projection,
-/// `ORDER BY 10 ASC`) would be re-read as an ORDINAL position — and DuckDB constant-folds even `(10)`
-/// back to an ordinal, while non-integer literals are rejected outright. Ordering by a constant is a
-/// semantic no-op (every row compares equal), so such items are DROPPED.
-bool IsConstantIntegerOrderItem(const string &item) {
+static bool HasOnlyOrderModifiers(const string &item, size_t position) {
+	while (position < item.size() && item[position] == ' ') {
+		position++;
+	}
+	auto consume = [&](const string &modifier) {
+		if (item.compare(position, modifier.size(), modifier) != 0) {
+			return false;
+		}
+		position += modifier.size();
+		while (position < item.size() && item[position] == ' ') {
+			position++;
+		}
+		return true;
+	};
+	consume("ASC") || consume("DESC");
+	consume("NULLS FIRST") || consume("NULLS LAST");
+	return position == item.size();
+}
+
+/// A substituted constant projection in ORDER BY would be re-read as an ordinal (integer) or rejected
+/// as an ineffective non-integer literal. Ordering by a constant is a semantic no-op, so drop it.
+bool IsConstantOrderItem(const string &item) {
 	size_t p = 0;
 	if (p < item.size() && item[p] == '-') {
 		p++;
@@ -73,19 +90,37 @@ bool IsConstantIntegerOrderItem(const string &item) {
 	while (p < item.size() && isdigit(static_cast<unsigned char>(item[p]))) {
 		p++;
 	}
-	if (p == digits_start || (p != item.size() && item[p] != ' ')) {
-		return false; // not a bare leading integer
+	if (p != digits_start && HasOnlyOrderModifiers(item, p)) {
+		return true;
 	}
-	// The remainder must be only order modifiers, not an operator continuing the expression.
-	const string rest = item.substr(p);
-	return rest.empty() || rest.rfind(" ASC", 0) == 0 || rest.rfind(" DESC", 0) == 0 || rest.rfind(" NULLS", 0) == 0;
+	if (!item.empty() && item[0] == '\'') {
+		p = 1;
+		while (p < item.size()) {
+			if (item[p++] != '\'') {
+				continue;
+			}
+			if (p < item.size() && item[p] == '\'') {
+				p++;
+				continue;
+			}
+			return HasOnlyOrderModifiers(item, p);
+		}
+		return false;
+	}
+	for (const string &literal : {"true", "false", "NULL"}) {
+		if (item.size() >= literal.size() && StringUtil::CIEquals(item.substr(0, literal.size()), literal) &&
+		    HasOnlyOrderModifiers(item, literal.size())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 vector<string> GuardOrdinalOrderItems(const vector<string> &items) {
 	vector<string> out;
 	out.reserve(items.size());
 	for (const auto &it : items) {
-		if (!IsConstantIntegerOrderItem(it)) {
+		if (!IsConstantOrderItem(it)) {
 			out.push_back(it);
 		}
 	}
@@ -233,8 +268,12 @@ string RenderSelectPretty(const SelectParts &p, const vector<string> &out_names,
 	return s.str();
 }
 
-/// Pretty-print a CTE header: "<name> (<wrapped column list>) AS (".
-string RenderCteHeader(const string &name, const vector<string> &cols) {
+static bool SupportsMaterializedCte(SqlDialect dialect) {
+	return dialect == SqlDialect::DUCKDB || dialect == SqlDialect::POSTGRES;
+}
+
+/// Pretty-print a CTE header: "<name> (<wrapped column list>) AS [MATERIALIZED] (".
+string RenderCteHeader(const string &name, const vector<string> &cols, bool materialized, SqlDialect dialect) {
 	std::ostringstream s;
 	s << name;
 	if (!cols.empty()) {
@@ -250,7 +289,7 @@ string RenderCteHeader(const string &name, const vector<string> &cols) {
 		AppendWrapped(s, col, quoted, ", ", name.size() + 2);
 		s << ")";
 	}
-	s << " AS (";
+	s << (materialized && SupportsMaterializedCte(dialect) ? " AS MATERIALIZED (" : " AS (");
 	return s.str();
 }
 
@@ -276,6 +315,82 @@ void RenameParts(SelectParts &p, const unordered_map<string, string> &m) {
 	}
 	p.limit = SubstituteColumnTokens(p.limit, m);
 	p.offset = SubstituteColumnTokens(p.offset, m);
+}
+
+struct PreparedCte {
+	CteNode *node;
+	bool has_select_parts;
+	bool materialized;
+	SelectParts select_parts;
+	string body;
+	vector<string> dependencies;
+};
+
+string BuildReuseSignature(const CteNode &node, SelectParts parts, SqlDialect dialect) {
+	unordered_map<string, string> output_names;
+	for (idx_t i = 0; i < node.cte_column_list.size(); i++) {
+		output_names[node.cte_column_list[i]] = "__lpts_output_" + std::to_string(i);
+	}
+	RenameParts(parts, output_names);
+	return std::to_string(node.cte_column_list.size()) + "\n" + RenderSelectPretty(parts, {}, 0, dialect);
+}
+
+template <class CALLBACK>
+void VisitIdentifierTokens(const string &sql, CALLBACK &&callback) {
+	for (idx_t i = 0; i < sql.size();) {
+		if (sql[i] == '\'' || sql[i] == '"') {
+			const char quote = sql[i++];
+			while (i < sql.size()) {
+				if (sql[i++] != quote) {
+					continue;
+				}
+				if (i < sql.size() && sql[i] == quote) {
+					i++;
+					continue;
+				}
+				break;
+			}
+			continue;
+		}
+		const auto c = static_cast<unsigned char>(sql[i]);
+		if (!std::isalpha(c) && sql[i] != '_') {
+			i++;
+			continue;
+		}
+		const idx_t start = i++;
+		while (i < sql.size()) {
+			const auto next = static_cast<unsigned char>(sql[i]);
+			if (!std::isalnum(next) && sql[i] != '_') {
+				break;
+			}
+			i++;
+		}
+		callback(sql.substr(start, i - start));
+	}
+}
+
+vector<string> CollectCteDependencies(const string &sql, const unordered_set<string> &cte_names) {
+	vector<string> result;
+	unordered_set<string> seen;
+	VisitIdentifierTokens(sql, [&](const string &token) {
+		if (cte_names.find(token) != cte_names.end() && seen.insert(token).second) {
+			result.push_back(token);
+		}
+	});
+	return result;
+}
+
+void CountCteReferences(const string &sql, const unordered_set<string> &cte_names,
+                        unordered_map<string, idx_t> &references) {
+	VisitIdentifierTokens(sql, [&](const string &token) {
+		if (cte_names.find(token) != cte_names.end()) {
+			references[token]++;
+		}
+	});
+}
+
+string PreparedCteBody(const PreparedCte &entry, SqlDialect dialect) {
+	return entry.has_select_parts ? RenderSelectPretty(entry.select_parts, {}, 0, dialect) : entry.body;
 }
 
 } // namespace
@@ -356,7 +471,7 @@ string CteNode::ToCteQuery(SqlDialect dialect) {
 		cte_str << VecToSeparatedList(cte_column_list);
 		cte_str << ")";
 	}
-	cte_str << " AS (";
+	cte_str << (materialized && SupportsMaterializedCte(dialect) ? " AS MATERIALIZED (" : " AS (");
 	cte_str << this->ToQuery(dialect);
 	cte_str << ")";
 	return cte_str.str();
@@ -386,7 +501,7 @@ string GetNode::ToQuery(SqlDialect dialect) {
 	get_str << " FROM ";
 	if (!catalog.empty()) {
 		// Fully-qualified: catalog.schema.table (DuckDB / Spark dialect)
-		get_str << DialectQualifiedTableName(catalog, schema, table_name, dialect)
+		get_str << DialectQualifiedTableName(catalog, schema_path, table_name, dialect)
 		        << RenderSnapshotSuffix(snapshot.get(), dialect);
 	} else if (snapshot) {
 		get_str << DialectQuoteIdent(table_name, dialect) << RenderSnapshotSuffix(snapshot.get(), dialect);
@@ -443,7 +558,7 @@ bool GetNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 	}
 	out.select_exprs = RenderGetSelectColumns(column_names, column_is_expression, dialect);
 	out.from = catalog.empty() ? (snapshot ? DialectQuoteIdent(table_name, dialect) : table_name)
-	                           : DialectQualifiedTableName(catalog, schema, table_name, dialect);
+	                           : DialectQualifiedTableName(catalog, schema_path, table_name, dialect);
 	out.from += RenderSnapshotSuffix(snapshot.get(), dialect);
 	out.where_conds = table_filters; // already complete conditions; the renderer wraps each in parens
 	return true;
@@ -530,6 +645,19 @@ string JoinNode::ToQuery(SqlDialect dialect) {
 			throw NotImplementedException("LPTS_UNSUPPORTED_JOIN_TYPE: ASOF join type %s is not implemented",
 			                              EnumUtil::ToString(join_type));
 		}
+	}
+	// DuckDB exposes MARK joins directly. Preserve that operator instead of reconstructing its three-valued
+	// result from EXISTS/NULL tests: the reconstruction cannot observe nested NULLs in STRUCT/LIST comparison
+	// values and therefore changes DuckDB's native comparison semantics. Other dialects keep the portable
+	// lowering below because they do not have DuckDB's JOIN BY (TYPE MARK) syntax.
+	if (dialect == SqlDialect::DUCKDB && !mark_expression.empty() && native_mark_syntax_supported) {
+		vector<string> select_cols = select_expressions.empty() ? cte_column_list : select_expressions;
+		if (select_cols.empty()) {
+			throw InternalException("LPTS: MARK join has no output columns");
+		}
+		select_cols.back() = "__mark_join_marker";
+		return "SELECT " + VecToSeparatedList(select_cols) + " FROM " + left_cte_name + " JOIN BY (TYPE MARK) " +
+		       right_cte_name + " ON " + JoinConditionsToSQL(join_conditions);
 	}
 	// IN/ANY/ALL mark join, single NULL-propagating comparison (keys captured): render as a correlated
 	// EXISTS in the SELECT. This produces exactly one row per LHS row (a LEFT join on an inequality could
@@ -760,14 +888,26 @@ string ExceptNode::ToQuery(SqlDialect dialect) {
 }
 
 string CteSetOperationNode::ToQuery(SqlDialect dialect) {
+	vector<string> left_columns = left_select_columns;
+	vector<string> right_columns = right_select_columns;
+	if (dialect == SqlDialect::DUCKDB) {
+		for (idx_t i = 0; i < output_collations.size() && i < left_columns.size() && i < right_columns.size(); i++) {
+			if (output_collations[i].empty()) {
+				continue;
+			}
+			const string suffix = ") COLLATE " + QuoteIdentifier(output_collations[i]);
+			left_columns[i] = "(" + left_columns[i] + suffix;
+			right_columns[i] = "(" + right_columns[i] + suffix;
+		}
+	}
 	std::ostringstream setop_str;
-	setop_str << "SELECT " << VecToSeparatedList(left_select_columns) << " FROM ";
+	setop_str << "SELECT " << VecToSeparatedList(left_columns) << " FROM ";
 	setop_str << left_cte_name;
 	setop_str << " " << op_name;
 	if (is_all) {
 		setop_str << " ALL";
 	}
-	setop_str << " SELECT " << VecToSeparatedList(right_select_columns) << " FROM ";
+	setop_str << " SELECT " << VecToSeparatedList(right_columns) << " FROM ";
 	setop_str << right_cte_name;
 	return setop_str.str();
 }
@@ -899,7 +1039,8 @@ string MergedSelectNode::ToQuery(SqlDialect dialect) {
 
 string RecursiveCteNode::ToQuery(SqlDialect dialect) {
 	string union_kw = union_all ? "\nUNION ALL\n" : "\nUNION\n";
-	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + recursive_step_sql;
+	return "SELECT " + VecToSeparatedList(anchor_cols) + " FROM " + anchor_cte_name + union_kw + "(" +
+	       recursive_step_sql + ")";
 }
 
 /// Serialize the entire CTE list into a SQL string.
@@ -919,15 +1060,168 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 
 	(void)use_newlines; // output is always pretty-printed.
 
+	// DuckDB's common-subplan optimizer cannot currently compare some attached-catalog scan bind data. Finish the
+	// serialization-size compaction here, where generated CTE and column identities can be normalized positionally.
+	// This is deliberately gated by DuckDB's logical-plan repeatability classification: sharing must never change how
+	// often volatile expressions, sampling, unknown table functions, recursive plans, or writes are evaluated.
+	vector<PreparedCte> prepared;
+	prepared.reserve(nodes.size());
+	unordered_map<string, idx_t> signature_to_prepared;
+	unordered_map<string, string> canonical_replacements;
+	unordered_set<string> known_cte_names;
+	unordered_set<string> reused_ctes;
+	const bool deduplicate = dialect == SqlDialect::DUCKDB && plan_is_repeatable && !has_recursive_cte;
+	for (auto &node : nodes) {
+		SelectParts parts;
+		const bool has_select_parts = node->BuildSelectParts(dialect, parts);
+
+		const bool eligible = deduplicate && has_select_parts && !node->materialized;
+		if (eligible) {
+			SelectParts canonical_parts = parts;
+			RenameParts(canonical_parts, canonical_replacements);
+			const string signature = BuildReuseSignature(*node, std::move(canonical_parts), dialect);
+			auto match = signature_to_prepared.find(signature);
+			if (match != signature_to_prepared.end()) {
+				auto &representative = *prepared[match->second].node;
+				D_ASSERT(representative.cte_column_list.size() == node->cte_column_list.size());
+				canonical_replacements[node->cte_name] = representative.cte_name;
+				for (idx_t i = 0; i < node->cte_column_list.size(); i++) {
+					if (node->cte_column_list[i] != representative.cte_column_list[i]) {
+						canonical_replacements[node->cte_column_list[i]] = representative.cte_column_list[i];
+					}
+				}
+				reused_ctes.insert(representative.cte_name);
+				LPTS_DEBUG_PRINT("[LPTS-CTE] Reusing common subplan '" + representative.cte_name + "' for '" +
+				                 node->cte_name + "'");
+
+				// Keep the consumer-visible relation and column identities distinct. A positional alias CTE avoids
+				// turning a parent join into an ambiguous self-join while still sharing the expensive producer.
+				SelectParts alias_parts;
+				alias_parts.select_exprs = representative.cte_column_list;
+				alias_parts.from = representative.cte_name;
+				PreparedCte alias {
+				    node.get(), true, false, std::move(alias_parts), string(), {representative.cte_name}};
+				prepared.push_back(std::move(alias));
+				known_cte_names.insert(node->cte_name);
+				continue;
+			}
+			signature_to_prepared.emplace(signature, prepared.size());
+		}
+
+		PreparedCte entry {node.get(), has_select_parts, node->materialized, std::move(parts), string(), {}};
+		if (!has_select_parts) {
+			entry.body = node->ToQuery(dialect);
+		}
+		entry.dependencies = CollectCteDependencies(PreparedCteBody(entry, dialect), known_cte_names);
+		prepared.push_back(std::move(entry));
+		known_cte_names.insert(node->cte_name);
+
+		// A retained CTE gives these names a new positional definition. References after this boundary belong to that
+		// output, not to an earlier duplicate producer that happened to use the same generated column identity.
+		for (const auto &column : node->cte_column_list) {
+			canonical_replacements.erase(column);
+		}
+	}
+
+	auto *fr = dynamic_cast<FinalReadNode *>(final_node.get());
+	string final_child_name;
+	vector<string> final_child_columns;
+	string final_reference_sql;
+	if (fr) {
+		final_child_name = fr->ChildCteName();
+		final_child_columns.reserve(fr->ChildCteColumnList().size());
+		SelectParts final_parts;
+		for (const auto &column : fr->ChildCteColumnList()) {
+			final_child_columns.push_back(column);
+			final_parts.select_exprs.push_back(column);
+		}
+		final_parts.from = final_child_name;
+		final_reference_sql = RenderSelectPretty(final_parts, fr->final_column_list, 0, dialect);
+	} else {
+		final_reference_sql = final_node->ToQuery(dialect);
+	}
+
+	if (!reused_ctes.empty()) {
+		// A larger reused parent can make alias CTEs from an earlier, smaller match unreachable. Keep only nodes
+		// reachable from the final statement so nested matches do not leave dead SQL or redundant materialization
+		// boundaries.
+		const auto final_dependencies = CollectCteDependencies(final_reference_sql, known_cte_names);
+		unordered_set<string> required(final_dependencies.begin(), final_dependencies.end());
+		vector<bool> live(prepared.size(), false);
+		for (idx_t i = prepared.size(); i-- > 0;) {
+			if (required.find(prepared[i].node->cte_name) == required.end()) {
+				continue;
+			}
+			live[i] = true;
+			for (const auto &dependency : prepared[i].dependencies) {
+				required.insert(dependency);
+			}
+		}
+		vector<PreparedCte> reachable;
+		reachable.reserve(prepared.size());
+		for (idx_t i = 0; i < prepared.size(); i++) {
+			if (live[i]) {
+				reachable.push_back(std::move(prepared[i]));
+			}
+		}
+		prepared = std::move(reachable);
+	}
+	// Count references after pruning so a reused producer is materialized only
+	// when it remains shared, and a depth boundary is added only to a single-use
+	// node whose evaluation count cannot change. Short plans cannot reach the
+	// depth limit and need no extra SQL scan.
+	constexpr idx_t MAX_INLINE_CTE_DEPTH = 16;
+	const bool check_inline_depth =
+	    dialect == SqlDialect::DUCKDB && !has_recursive_cte && prepared.size() >= MAX_INLINE_CTE_DEPTH;
+	unordered_map<string, idx_t> reference_counts;
+	if (!reused_ctes.empty() || check_inline_depth) {
+		CountCteReferences(final_reference_sql, known_cte_names, reference_counts);
+		for (const auto &consumer : prepared) {
+			CountCteReferences(PreparedCteBody(consumer, dialect), known_cte_names, reference_counts);
+		}
+		for (auto &entry : prepared) {
+			if (reused_ctes.find(entry.node->cte_name) != reused_ctes.end()) {
+				entry.materialized = reference_counts[entry.node->cte_name] > 1;
+			}
+		}
+	}
+
+	// DuckDB inlines singly referenced CTEs during binding. A long chain can
+	// therefore become one deeply nested plan, overflowing the small stack of a
+	// query worker while decorrelating subqueries. Keep the inlined depth bounded
+	// with a few real CTE boundaries. Each generated CTE represents a logical
+	// operator, so materializing a single-use node preserves its bag result.
+	if (check_inline_depth) {
+		unordered_map<string, idx_t> inline_depth;
+		for (auto &entry : prepared) {
+			idx_t depth = 1;
+			for (const auto &dependency : entry.dependencies) {
+				auto predecessor = inline_depth.find(dependency);
+				if (predecessor != inline_depth.end()) {
+					depth = std::max(depth, predecessor->second + 1);
+				}
+			}
+			if (depth >= MAX_INLINE_CTE_DEPTH && reference_counts[entry.node->cte_name] == 1) {
+				entry.materialized = true;
+			}
+			inline_depth[entry.node->cte_name] = entry.materialized ? 0 : depth;
+		}
+	}
+
 	// Inline the last CTE as the final SELECT when possible: instead of emitting it as a CTE and
 	// then a redundant closing "SELECT ... FROM <last_cte>", turn its body into the result (with its
 	// output columns aliased to the user-facing names). Only when the final node is a FinalReadNode
 	// whose child is the last CTE and that CTE renders as a plain SELECT (BuildSelectParts succeeds).
-	auto *fr = dynamic_cast<FinalReadNode *>(final_node.get());
 	SelectParts last_parts;
-	const bool inline_last = fr && !nodes.empty() && nodes.back()->cte_name == fr->ChildCteName() &&
-	                         nodes.back()->BuildSelectParts(dialect, last_parts);
-	const size_t emit_count = inline_last ? nodes.size() - 1 : nodes.size();
+	const bool inline_last = fr && !prepared.empty() && !prepared.back().materialized &&
+	                         prepared.back().node->cte_name == final_child_name && prepared.back().has_select_parts;
+	if (inline_last) {
+		last_parts = prepared.back().select_parts;
+		if (last_parts.select_exprs.size() > fr->final_column_list.size()) {
+			last_parts.select_exprs.resize(fr->final_column_list.size());
+		}
+	}
+	const size_t emit_count = inline_last ? prepared.size() - 1 : prepared.size();
 
 	// Build a "de-prefix" rename map for column identifiers: a generated t{N}_{bare} column name
 	// collapses to its bare {bare} form when that bare is globally unique across all introduced
@@ -937,14 +1231,14 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	// (an inlined last CTE contributes no column definitions of its own).
 	unordered_set<string> cte_names;
 	for (size_t i = 0; i < emit_count; i++) {
-		cte_names.insert(nodes[i]->cte_name);
+		cte_names.insert(prepared[i].node->cte_name);
 	}
 	// Uniqueness is judged CASE-INSENSITIVELY: DuckDB resolves identifiers ignoring case, so de-prefixing
 	// both t0_hello and t1_HeLlO (distinct as strings) would make every later `hello` reference ambiguous.
 	unordered_map<string, int> bare_count;
 	unordered_set<string> seen_full;
 	for (size_t i = 0; i < emit_count; i++) {
-		for (const auto &col : nodes[i]->cte_column_list) {
+		for (const auto &col : prepared[i].node->cte_column_list) {
 			if (seen_full.insert(col).second) {
 				bare_count[StringUtil::Lower(StripGeneratedTablePrefix(col))]++;
 			}
@@ -969,24 +1263,25 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	if (emit_count > 0) {
 		out << (has_recursive_cte ? "WITH RECURSIVE" : "WITH") << "\n";
 		for (size_t i = 0; i < emit_count; ++i) {
+			auto &entry = prepared[i];
 			vector<string> cols;
-			cols.reserve(nodes[i]->cte_column_list.size());
-			for (const auto &c : nodes[i]->cte_column_list) {
+			cols.reserve(entry.node->cte_column_list.size());
+			for (const auto &c : entry.node->cte_column_list) {
 				cols.push_back(SubstituteColumnTokens(c, rename));
 			}
-			out << RenderCteHeader(nodes[i]->cte_name, cols) << "\n";
-			SelectParts p;
-			if (nodes[i]->BuildSelectParts(dialect, p)) {
+			out << RenderCteHeader(entry.node->cte_name, cols, entry.materialized, dialect) << "\n";
+			if (entry.has_select_parts) {
+				SelectParts p = entry.select_parts;
 				RenameParts(p, rename);
 				// DataFusion validates a projection's expression names before applying the
 				// enclosing CTE's positional column aliases. Name Feldera projection
 				// expressions inside the SELECT so duplicate inputs remain distinguishable.
 				const bool name_projection_outputs =
-				    dialect == SqlDialect::FELDERA && dynamic_cast<ProjectNode *>(nodes[i].get()) != nullptr;
+				    dialect == SqlDialect::FELDERA && dynamic_cast<ProjectNode *>(entry.node) != nullptr;
 				out << RenderSelectPretty(p, name_projection_outputs ? cols : vector<string>(), INDENT_WIDTH, dialect);
 			} else {
 				// Fallback (set ops, recursive CTE, table functions): the node's single-line body.
-				out << string(INDENT_WIDTH, ' ') << SubstituteColumnTokens(nodes[i]->ToQuery(dialect), rename);
+				out << string(INDENT_WIDTH, ' ') << SubstituteColumnTokens(entry.body, rename);
 			}
 			out << "\n)" << (i + 1 < emit_count ? ",\n" : "\n");
 		}
@@ -999,15 +1294,15 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	} else if (fr) {
 		// Closing "SELECT <child col> AS <user name> FROM <last cte>".
 		SelectParts p;
-		for (const auto &c : fr->ChildCteColumnList()) {
+		for (const auto &c : final_child_columns) {
 			p.select_exprs.push_back(SubstituteColumnTokens(c, rename));
 		}
-		p.from = fr->ChildCteName();
+		p.from = final_child_name;
 		out << RenderSelectPretty(p, fr->final_column_list, 0, dialect);
 	} else {
 		// Non-SELECT terminal (e.g. INSERT): keep its own rendering, but put the trailing
 		// "SELECT * FROM <cte>" source on its own line so it reads consistently below the CTEs.
-		string stmt = SubstituteColumnTokens(final_node->ToQuery(dialect), rename);
+		string stmt = SubstituteColumnTokens(final_reference_sql, rename);
 		const auto src = stmt.find(" SELECT * FROM ");
 		if (src != string::npos) {
 			stmt.replace(src, 1, "\n");
@@ -1017,7 +1312,14 @@ string CteList::ToQuery(const bool use_newlines, const vector<string> &output_na
 	out << ";";
 
 	// Drop any "x AS x" that the de-prefixing (or pass-through naming) produced.
-	return SwallowSelfAlias(out.str());
+	string sql = SwallowSelfAlias(out.str());
+	if (has_recursive_cte && dialect == SqlDialect::DUCKDB && fr) {
+		// A materialization boundary around the result keeps DuckDB 2.0's recursive
+		// pipeline state intact without eagerly evaluating an unneeded recursive branch.
+		sql.pop_back(); // terminal semicolon
+		return "WITH __lpts_result AS MATERIALIZED (\n" + sql + "\n) SELECT * FROM __lpts_result;";
+	}
+	return sql;
 }
 
 } // namespace duckdb

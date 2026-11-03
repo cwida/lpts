@@ -22,17 +22,33 @@
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/bound_expression_sql_exporter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/function/scalar/generic_common.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/parser.hpp"
 
 #include <limits>
 
 namespace duckdb {
 
-LptsExpressionRenderer::LptsExpressionRenderer(SqlDialect _dialect, BindingResolver _binding_resolver)
-    : dialect(_dialect), binding_resolver(std::move(_binding_resolver)) {
+LptsExpressionRenderer::LptsExpressionRenderer(ClientContext &_context, SqlDialect _dialect,
+                                               BindingResolver _binding_resolver)
+    : context(_context), dialect(_dialect), binding_resolver(std::move(_binding_resolver)) {
+}
+
+static const LogicalType &NestedSequenceChildType(const LogicalType &type) {
+	D_ASSERT(type.id() == LogicalTypeId::LIST || type.id() == LogicalTypeId::ARRAY);
+	return type.id() == LogicalTypeId::ARRAY ? ArrayType::GetChildType(type) : ListType::GetChildType(type);
+}
+
+static const vector<Value> &NestedSequenceChildren(const Value &value) {
+	D_ASSERT(value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY);
+	return value.type().id() == LogicalTypeId::ARRAY ? ArrayValue::GetChildren(value) : ListValue::GetChildren(value);
 }
 
 // A folded constant rendered bare (or via Value::ToSQLString's default) re-parses to a *different* type
@@ -48,7 +64,7 @@ static bool TypeContainsVariant(const LogicalType &type) {
 		return true;
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::ARRAY:
-		return TypeContainsVariant(ListType::GetChildType(type));
+		return TypeContainsVariant(NestedSequenceChildType(type));
 	case LogicalTypeId::STRUCT: {
 		for (const auto &child : StructType::GetChildTypes(type)) {
 			if (TypeContainsVariant(child.second)) {
@@ -64,6 +80,52 @@ static bool TypeContainsVariant(const LogicalType &type) {
 	}
 }
 
+static bool TypeContainsAggregateState(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::LEGACY_AGGREGATE_STATE || type.IsAggregateState()) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsAggregateState(NestedSequenceChildType(type));
+	case LogicalTypeId::STRUCT: {
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsAggregateState(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeContainsAggregateState(MapType::KeyType(type)) ||
+		       TypeContainsAggregateState(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+static bool TypeContainsEmptyEnum(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::ENUM && EnumType::GetSize(type) == 0) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsEmptyEnum(NestedSequenceChildType(type));
+	case LogicalTypeId::STRUCT:
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsEmptyEnum(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::MAP:
+		return TypeContainsEmptyEnum(MapType::KeyType(type)) || TypeContainsEmptyEnum(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
 // An UNNAMED struct type (a ROW value, e.g. produced by `(0, 0)` or list_zip's entries) cannot be written
 // in SQL — `STRUCT(INTEGER, INTEGER)` has no field names and does not parse — so neither a bare literal
 // nor a CAST('<text>' AS <type>) can express a constant containing one. Such values are rebuilt
@@ -72,7 +134,7 @@ static bool TypeContainsUnnamedStruct(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::ARRAY:
-		return TypeContainsUnnamedStruct(ListType::GetChildType(type));
+		return TypeContainsUnnamedStruct(NestedSequenceChildType(type));
 	case LogicalTypeId::STRUCT: {
 		if (StructType::IsUnnamed(type)) {
 			return true;
@@ -104,7 +166,7 @@ static bool TypesEqualIgnoringStructNames(const LogicalType &a, const LogicalTyp
 	switch (a.id()) {
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::ARRAY:
-		return TypesEqualIgnoringStructNames(ListType::GetChildType(a), ListType::GetChildType(b));
+		return TypesEqualIgnoringStructNames(NestedSequenceChildType(a), NestedSequenceChildType(b));
 	case LogicalTypeId::STRUCT: {
 		const auto &ac = StructType::GetChildTypes(a);
 		const auto &bc = StructType::GetChildTypes(b);
@@ -133,7 +195,7 @@ static bool TypeContainsNullType(const LogicalType &type) {
 		return true;
 	case LogicalTypeId::LIST:
 	case LogicalTypeId::ARRAY:
-		return TypeContainsNullType(ListType::GetChildType(type));
+		return TypeContainsNullType(NestedSequenceChildType(type));
 	case LogicalTypeId::STRUCT: {
 		for (const auto &child : StructType::GetChildTypes(type)) {
 			if (TypeContainsNullType(child.second)) {
@@ -147,88 +209,6 @@ static bool TypeContainsNullType(const LogicalType &type) {
 	default:
 		return false;
 	}
-}
-
-// Constants of these types cannot be expressed as a literal OR as a CAST from their text form: unnamed
-// structs have no writable type, and a UNION's text form does not cast back (VARCHAR is not implicitly
-// castable to the members). They are rebuilt structurally (RenderConstantContainingUnnamedStruct).
-static bool TypeNeedsStructuralRender(const LogicalType &type) {
-	if (TypeContainsUnnamedStruct(type)) {
-		return true;
-	}
-	switch (type.id()) {
-	case LogicalTypeId::UNION:
-	// An untyped-NULL element type renders as `"NULL"` inside the CAST target (e.g. `CAST('[]' AS
-	// "NULL"[])` for an empty list literal), which does not parse; the structural form (`[]`) does.
-	case LogicalTypeId::SQLNULL:
-		return true;
-	case LogicalTypeId::LIST:
-	case LogicalTypeId::ARRAY:
-		return TypeNeedsStructuralRender(ListType::GetChildType(type));
-	case LogicalTypeId::STRUCT: {
-		for (const auto &child : StructType::GetChildTypes(type)) {
-			if (TypeNeedsStructuralRender(child.second)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case LogicalTypeId::MAP:
-		return TypeNeedsStructuralRender(MapType::KeyType(type)) || TypeNeedsStructuralRender(MapType::ValueType(type));
-	default:
-		return false;
-	}
-}
-
-static bool ConstantNeedsExplicitCast(const LogicalType &type) {
-	// Extension / user types (GEOMETRY, INET, ...): their text form has no literal syntax of its own
-	// (bare WKT does not even parse); CAST('<text>' AS <alias>) re-enters through the type's VARCHAR cast.
-	if (type.HasAlias()) {
-		return true;
-	}
-	switch (type.id()) {
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::HUGEINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::UHUGEINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE: // a bare `2.0` re-parses as DECIMAL, not DOUBLE
-	case LogicalTypeId::DECIMAL:
-	case LogicalTypeId::BIT:
-	case LogicalTypeId::BIGNUM:
-	// ENUM: a folded enum value (e.g. `'happy'::mood`, or the ENUM('num','str') that union_tag(...) returns)
-	// renders bare as a plain VARCHAR string, losing the ENUM type. CAST('happy' AS ENUM('sad','ok','happy'))
-	// (type.ToString() inlines the full member list) restores the type so the type-sensitive bag-hash matches.
-	case LogicalTypeId::ENUM:
-	// GEOMETRY: ToSQLString has no case for it, so the value prints as bare WKT (not even a string
-	// literal); CAST('<wkt>' AS GEOMETRY) re-enters through the text cast.
-	case LogicalTypeId::GEOMETRY:
-	// Nested types whose element/field types are not preserved by the bare `[...]`/`{...}` literal
-	// (e.g. a DOUBLE[] prints as `[2.0, ...]` and re-parses as DECIMAL[]). CAST('<text>' AS <type>) casts
-	// the string form to the exact nested type. MAP values have NO bare literal at all — ToSQLString()
-	// yields the display form `{k=v}`, which only parses as a VARCHAR→MAP cast.
-	case LogicalTypeId::LIST:
-	case LogicalTypeId::ARRAY:
-	case LogicalTypeId::STRUCT:
-	case LogicalTypeId::MAP:
-		return true;
-	default:
-		return false;
-	}
-}
-
-// A bare INTEGER literal round-trips except its minimum value: `-2147483648` re-parses as BIGINT, because
-// `2147483648` overflows INT32 and is a BIGINT, then negated. (TINYINT/SMALLINT/BIGINT/HUGEINT are always
-// cast by ConstantNeedsExplicitCast, so INTEGER is the only signed width with this gap.) Value-conditional,
-// so ordinary INTEGER constants stay bare and readable.
-static bool IntegerConstantNeedsExplicitCast(const Value &value) {
-	return !value.IsNull() && value.type().id() == LogicalTypeId::INTEGER &&
-	       value.GetValue<int32_t>() == std::numeric_limits<int32_t>::min();
 }
 
 static bool IsDateFormatFunction(const string &function_name) {
@@ -267,8 +247,8 @@ static void ValidateFunctionForDialect(const BoundFunctionExpression &func_expr,
 	if (IsDuckDBDialect(dialect)) {
 		return;
 	}
-	const string &name = func_expr.function.name;
-	if (func_expr.function.bind_lambda != nullptr && !DialectSupportsLambdaFunction(dialect)) {
+	const string &name = func_expr.Function().GetName().GetIdentifierName();
+	if (func_expr.Function().GetCallbacks().bind_lambda != nullptr && !DialectSupportsLambdaFunction(dialect)) {
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", name, "BOUND_FUNCTION",
 		                        "no safe lambda syntax or list semantics for target dialect");
 	}
@@ -287,10 +267,10 @@ static bool TryRenderConvertedDateFormat(const unique_ptr<Expression> &expressio
 		return false;
 	}
 	const auto &constant = expression->Cast<BoundConstantExpression>();
-	if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
+	if (constant.GetValue().IsNull() || constant.GetValue().type().id() != LogicalTypeId::VARCHAR) {
 		return false;
 	}
-	string format = constant.value.GetValue<string>();
+	string format = constant.GetValue().GetValue<string>();
 	if (!TryConvertDuckDBDateFormatForDialect(format, dialect, format)) {
 		return false;
 	}
@@ -306,9 +286,13 @@ static string RenderCastTargetType(const LogicalType &type, SqlDialect dialect) 
 	// Types with no SQL syntax cannot be a cast target in ANY dialect: an unnamed struct
 	// (`STRUCT(INTEGER, INTEGER)`, from row(...) values — only reachable here when the cast is NOT a
 	// names-only no-op, see BOUND_CAST) and internal aggregate-state types (`AGGREGATE_STATE<sum(...)>`).
-	if (TypeContainsUnnamedStruct(type) || type.id() == LogicalTypeId::AGGREGATE_STATE) {
+	if (TypeContainsUnnamedStruct(type) || TypeContainsAggregateState(type)) {
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
 		                        "the cast target type cannot be written in SQL");
+	}
+	if (TypeContainsEmptyEnum(type)) {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", type.ToString(), "BOUND_CAST",
+		                        "an empty ENUM has no inline SQL type representation");
 	}
 	if (IsDuckDBDialect(dialect)) {
 		return type.ToString();
@@ -383,6 +367,10 @@ static bool SparkCanRepresentHugeintCastAsDecimal38(const LogicalType &source_ty
 }
 
 static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
+	if (TypeContainsAggregateState(value.type())) {
+		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", value.type().ToString(), "BOUND_CONSTANT",
+		                        "an aggregate-state constant does not retain the SQL aggregate needed to rebuild it");
+	}
 	if (value.IsNull()) {
 		// An untyped NULL literal (SQLNULL) has no target-dialect cast type; emit a
 		// bare NULL, which is valid in every non-DuckDB dialect. Casting it to its own
@@ -403,7 +391,7 @@ static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
 		if (dialect != SqlDialect::SPARK) {
 			return value.ToSQLString();
 		}
-		const auto &children = ListValue::GetChildren(value);
+		const auto &children = NestedSequenceChildren(value);
 		vector<string> elements;
 		elements.reserve(children.size());
 		for (const auto &child : children) {
@@ -469,9 +457,9 @@ static string RenderValueForDialect(const Value &value, SqlDialect dialect) {
 
 static string RenderConstantForDialect(const BoundConstantExpression &constant, SqlDialect dialect) {
 	if (IsDuckDBDialect(dialect)) {
-		return constant.ToString();
+		return ConstantExpression::FromValue(constant.GetValue())->ToString();
 	}
-	return RenderValueForDialect(constant.value, dialect);
+	return RenderValueForDialect(constant.GetValue(), dialect);
 }
 
 static string RenderComparisonForDialect(const string &lhs, const string &rhs, ExpressionType comparison,
@@ -500,18 +488,22 @@ static void ValidateTryCastForDialect(SqlDialect dialect) {
 // form of lambda parameters). Stops at nested lambda functions.
 //--------------------------------------------------------------------------
 static void CollectLambdaParamNames(const Expression &expr, std::map<idx_t, string> &names) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_LAMBDA) {
+		return;
+	}
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
-		if (names.find(ref.index) == names.end()) {
-			names[ref.index] = ref.alias.empty() ? ("p" + to_string(ref.index)) : ref.alias;
+		if (names.find(ref.Index()) == names.end()) {
+			names[ref.Index()] = ref.GetAlias().GetIdentifierName().empty() ? ("p" + to_string(ref.Index()))
+			                                                                : ref.GetAlias().GetIdentifierName();
 		}
 		return;
 	}
 	// For nested lambda functions, only recurse into children (not bind_info)
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 		auto &func = expr.Cast<BoundFunctionExpression>();
-		if (func.function.bind_lambda != nullptr) {
-			for (auto &child : func.children) {
+		if (func.Function().GetCallbacks().bind_lambda != nullptr) {
+			for (auto &child : func.GetChildren()) {
 				CollectLambdaParamNames(*child, names);
 			}
 			return;
@@ -535,82 +527,159 @@ bool LptsExpressionRenderer::ExpressionContainsColumnRef(const Expression &expr)
 }
 
 bool LptsExpressionRenderer::TableFilterToSql(const TableFilter &filter, const string &column_name,
-                                              string &result) const {
-	switch (filter.filter_type) {
-	case TableFilterType::DYNAMIC_FILTER:
-		return false;
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &optional_filter = filter.Cast<OptionalFilter>();
-		if (!optional_filter.child_filter) {
+                                              const LogicalType &column_type, string &result) const {
+	auto column = make_uniq<BoundReferenceExpression>(Identifier(column_name), column_type, 0);
+	auto expression = filter.ToExpression(*column);
+	return FilterExpressionToSql(*expression, result);
+}
+
+bool LptsExpressionRenderer::FilterExpressionToSql(const Expression &expression, string &result) const {
+	std::function<bool(const Expression &, string &)> render = [&](const Expression &expr, string &sql) {
+		if (ExpressionFilter::IsOptionalExpression(expr)) {
 			return false;
 		}
-		return TableFilterToSql(*optional_filter.child_filter, column_name, result);
-	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &and_filter = filter.Cast<ConjunctionAndFilter>();
-		vector<string> children;
-		for (auto &child_filter : and_filter.child_filters) {
-			string child_sql;
-			if (TableFilterToSql(*child_filter, column_name, child_sql)) {
-				// Parenthesize each child: a nested OR child must not lose grouping when joined with AND
-				// (AND binds tighter than OR, so `a AND b OR c` would mean `(a AND b) OR c`).
-				children.push_back("(" + std::move(child_sql) + ")");
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION) {
+			auto &conjunction = expr.Cast<BoundConjunctionExpression>();
+			vector<string> children;
+			for (auto &child : conjunction.GetChildren()) {
+				string child_sql;
+				if (render(*child, child_sql)) {
+					children.push_back("(" + child_sql + ")");
+				} else if (expr.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+					return false;
+				}
 			}
-		}
-		if (children.empty()) {
-			return false;
-		}
-		result = VecToSeparatedList(children, " AND ");
-		return true;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &or_filter = filter.Cast<ConjunctionOrFilter>();
-		vector<string> children;
-		for (auto &child_filter : or_filter.child_filters) {
-			string child_sql;
-			if (!TableFilterToSql(*child_filter, column_name, child_sql)) {
+			if (children.empty()) {
 				return false;
 			}
-			children.push_back("(" + std::move(child_sql) + ")");
-		}
-		if (children.empty()) {
-			return false;
-		}
-		result = VecToSeparatedList(children, " OR ");
-		return true;
-	}
-	case TableFilterType::CONSTANT_COMPARISON: {
-		// Only reroute through the expression renderer when the compared constant needs a type-preserving
-		// cast (BIT/ENUM/HUGEINT/INT_MIN/...); e.g. a BIT filter `b = '111'` must emit `CAST('111' AS BIT)`,
-		// not the bare `111` that DuckDB's TableFilter::ToString produces (which re-parses as the integer
-		// 111). For ordinary constants, keep the compact `col op const` rendering (readability + exact-SQL
-		// tests).
-		auto &constant_filter = filter.Cast<ConstantFilter>();
-		// A VARCHAR constant containing a NUL byte also reroutes: the expression renderer rebuilds it as
-		// `'part' || chr(0) || 'part'` (a NUL cannot appear in a SQL literal).
-		const bool varchar_with_nul = constant_filter.constant.type().id() == LogicalTypeId::VARCHAR &&
-		                              !constant_filter.constant.IsNull() &&
-		                              StringValue::Get(constant_filter.constant).find('\0') != string::npos;
-		if (ConstantNeedsExplicitCast(constant_filter.constant.type()) ||
-		    IntegerConstantNeedsExplicitCast(constant_filter.constant) || varchar_with_nul) {
-			auto column_expr = make_uniq<BoundReferenceExpression>(column_name, LogicalType::INVALID, 0);
-			auto filter_expr = filter.ToExpression(*column_expr);
-			result = ExpressionToAliasedString(filter_expr);
+			sql = VecToSeparatedList(children,
+			                         expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? " AND " : " OR ");
 			return true;
 		}
-		result = filter.ToString(column_name);
+		sql = ExpressionToAliasedString(expr);
 		return true;
+	};
+	return render(expression, result);
+}
+
+vector<string> LptsExpressionRenderer::ScanFiltersToSql(const LogicalGet &get, const string &qualifier) const {
+	vector<string> result;
+	auto base_column_sql = [&](const ColumnIndex &column) {
+		return qualifier + DialectQuoteIdent(get.GetColumnName(column).GetIdentifierName(), dialect);
+	};
+	auto column_sql = [&](ProjectionIndex index) {
+		const auto &column = get.GetColumnIndex(index);
+		const auto primary_index = column.GetPrimaryIndex();
+		string base_expression = base_column_sql(column);
+		if (!column.HasChildren() || primary_index >= get.returned_types.size()) {
+			return base_expression;
+		}
+		string extracted;
+		string leaf_name;
+		return RenderStructExtractPath(base_expression, get.returned_types[primary_index], column, extracted, leaf_name)
+		           ? extracted
+		           : base_expression;
+	};
+	for (auto &entry : get.table_filters) {
+		if (ExpressionFilter::IsOptionalFilter(entry.Filter())) {
+			continue;
+		}
+		const auto &column = get.GetColumnIndex(entry.GetIndex());
+		string filter_column = column_sql(entry.GetIndex());
+		LogicalType filter_type = get.GetColumnType(column);
+		if (entry.Filter().filter_type == TableFilterType::EXPRESSION_FILTER) {
+			const auto &expression_filter = ExpressionFilter::GetExpressionFilter(entry.Filter(), "LPTS scan");
+			bool expression_extracts_child = false;
+			if (column.HasChildren()) {
+				ExpressionIterator::VisitExpression<BoundFunctionExpression>(
+				    *expression_filter.expr, [&](const BoundFunctionExpression &function) {
+					    const auto &name = function.Function().GetName().GetIdentifierName();
+					    expression_extracts_child |= name == "struct_extract" || name == "struct_extract_at";
+				    });
+			}
+			if (column.HasChildren() && expression_extracts_child) {
+				const auto &base_type = get.returned_types[column.GetPrimaryIndex()];
+				filter_column = base_column_sql(column);
+				filter_type = base_type;
+			}
+		}
+		string sql;
+		if (TableFilterToSql(entry.Filter(), filter_column, filter_type, sql)) {
+			result.push_back(std::move(sql));
+		}
 	}
-	case TableFilterType::EXPRESSION_FILTER: {
-		auto column_expr = make_uniq<BoundReferenceExpression>(column_name, LogicalType::INVALID, 0);
-		auto filter_expr = filter.ToExpression(*column_expr);
-		result = ExpressionToAliasedString(filter_expr);
-		return true;
+	for (auto &filter : get.table_filters.GetMultiColumnFilters()) {
+		if (ExpressionFilter::IsOptionalFilter(*filter)) {
+			continue;
+		}
+		const auto &multi = ExpressionFilter::GetExpressionFilter(*filter, "LPTS scan");
+		auto expression = multi.expr->Copy();
+		std::function<void(unique_ptr<Expression> &)> resolve = [&](unique_ptr<Expression> &expr) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+				auto &ref = expr->Cast<BoundReferenceExpression>();
+				if (ref.Index() >= multi.column_indexes.size()) {
+					throw InternalException("Invalid multi-column scan filter reference");
+				}
+				const auto projection_index = multi.column_indexes[ref.Index()];
+				string resolved_column = column_sql(projection_index);
+				expr =
+				    make_uniq<BoundReferenceExpression>(Identifier(resolved_column), ref.GetReturnType(), ref.Index());
+			} else {
+				ExpressionIterator::EnumerateChildren(*expr, resolve);
+			}
+		};
+		resolve(expression);
+		string sql;
+		if (FilterExpressionToSql(*expression, sql)) {
+			result.push_back(std::move(sql));
+		}
 	}
-	default:
-		result = filter.ToString(column_name);
-		return true;
+	return result;
+}
+
+bool LptsExpressionRenderer::RenderStructExtractPath(const string &base_expression, const LogicalType &base_type,
+                                                     const ColumnIndex &index, string &result,
+                                                     string &leaf_name) const {
+	if (!index.HasChildren()) {
+		return false;
 	}
+	string expression = base_expression;
+	LogicalType current_type = base_type;
+	const ColumnIndex *node = &index;
+	while (node->HasChildren()) {
+		const ColumnIndex &child = node->GetChildIndex(0);
+		string field_name;
+		if (child.HasPrimaryIndex()) {
+			if (current_type.id() != LogicalTypeId::STRUCT) {
+				ThrowLptsNotImplemented("LPTS_STRUCT_EXTRACT_PUSHDOWN", dialect, "expression",
+				                        "struct field extraction", "LOGICAL_GET",
+				                        "field-extraction pushdown through a non-STRUCT type is not implemented");
+			}
+			const auto &child_types = StructType::GetChildTypes(current_type);
+			const idx_t field_position = child.GetPrimaryIndex();
+			if (field_position >= child_types.size()) {
+				ThrowLptsNotImplemented("LPTS_STRUCT_EXTRACT_PUSHDOWN", dialect, "expression",
+				                        "struct field extraction", "LOGICAL_GET",
+				                        "field-extraction pushdown references an out-of-range struct field");
+			}
+			field_name = StructType::GetChildName(current_type, field_position).GetIdentifierName();
+			current_type = child_types[field_position].second;
+			expression = "struct_extract(" + expression + ", '" + EscapeSingleQuotes(field_name) + "')";
+		} else {
+			field_name = child.GetFieldName();
+			expression += "['" + EscapeSingleQuotes(field_name) + "']";
+			current_type = LogicalType(LogicalTypeId::INVALID);
+		}
+		leaf_name = field_name;
+		node = &child;
+	}
+	if (index.IsPushdownExtract() && index.HasType() &&
+	    ((current_type.id() != LogicalTypeId::INVALID && index.GetScanType() != current_type) ||
+	     (current_type.id() == LogicalTypeId::INVALID && index.GetScanType().id() != LogicalTypeId::VARIANT))) {
+		expression = "CAST(" + expression + " AS " + index.GetScanType().ToString() + ")";
+	}
+	result = std::move(expression);
+	return true;
 }
 
 // DuckDB does not expose quantile arguments through the function children after binding — they live in
@@ -679,28 +748,37 @@ static string ReservoirQuantileArgumentsFromBindInfo(const FunctionData &bind_in
 }
 
 string LptsExpressionRenderer::QuantileArgument(const BoundAggregateExpression &aggregate) {
-	return QuantileArgumentFromBindInfo(*aggregate.bind_info);
+	return QuantileArgumentFromBindInfo(*aggregate.BindInfo());
 }
 
 bool LptsExpressionRenderer::QuantileDesc(const BoundAggregateExpression &aggregate) {
 	// The `desc` flag is set both for `WITHIN GROUP (ORDER BY x DESC)` and for negative quantile
 	// arguments (DuckDB normalizes `quantile_disc(x, -0.5)` to quantile 0.5 with desc=true).
-	if (!aggregate.bind_info) {
+	if (!aggregate.BindInfo()) {
 		return false;
 	}
-	return reinterpret_cast<const QuantileBindDataLayout *>(aggregate.bind_info.get())->desc;
+	return reinterpret_cast<const QuantileBindDataLayout *>(aggregate.BindInfo().get())->desc;
 }
 
 string LptsExpressionRenderer::ApproxQuantileArgument(const BoundAggregateExpression &aggregate) {
-	return ApproxQuantileArgumentFromBindInfo(*aggregate.bind_info);
+	return ApproxQuantileArgumentFromBindInfo(*aggregate.BindInfo());
 }
 
 string LptsExpressionRenderer::ReservoirQuantileArguments(const BoundAggregateExpression &aggregate) {
-	return ReservoirQuantileArgumentsFromBindInfo(*aggregate.bind_info);
+	return ReservoirQuantileArgumentsFromBindInfo(*aggregate.BindInfo());
 }
 
 bool LptsExpressionRenderer::IsQuantileAggregate(const string &agg_name) {
 	return agg_name == "quantile_cont" || agg_name == "quantile_disc";
+}
+
+string LptsExpressionRenderer::FunctionNameForDialect(const BoundSimpleFunction &function, const string &name,
+                                                      SqlDialect dialect) {
+	const auto &path = function.GetQualifiedName().Path();
+	if (dialect != SqlDialect::DUCKDB || path.size() <= 1) {
+		return name;
+	}
+	return function.GetQualifiedName().WithName(Identifier(name)).ToString();
 }
 
 string LptsExpressionRenderer::StripTablePrefix(const string &cte_column_name) {
@@ -712,7 +790,7 @@ string LptsExpressionRenderer::StripTablePrefix(const string &cte_column_name) {
 }
 
 string LptsExpressionRenderer::StringAggSeparator(const BoundAggregateExpression &aggregate) {
-	if (aggregate.function.name != "string_agg" || !aggregate.bind_info) {
+	if (aggregate.Function().GetName().GetIdentifierName() != "string_agg" || !aggregate.BindInfo()) {
 		return string();
 	}
 	// DuckDB stores the separator in string_agg bind data instead of aggregate children.
@@ -721,7 +799,7 @@ string LptsExpressionRenderer::StringAggSeparator(const BoundAggregateExpression
 		void *vtable;
 		string sep;
 	};
-	return reinterpret_cast<const StringAggBindDataLayout *>(aggregate.bind_info.get())->sep;
+	return reinterpret_cast<const StringAggBindDataLayout *>(aggregate.BindInfo().get())->sep;
 }
 
 string LptsExpressionRenderer::ListAggrStringAggSeparatorArg(const BoundFunctionExpression &func_expr) {
@@ -731,8 +809,14 @@ string LptsExpressionRenderer::ListAggrStringAggSeparatorArg(const BoundFunction
 	// `, '<sep>'` argument (list_aggregate forwards extra args to the sub-aggregate). Returns "" when this
 	// is not a string_agg-wrapping list_aggr. ListAggregatesBindData is defined in a .cpp, so mirror its
 	// layout (like StringAggSeparator); keep this the single place that depends on it.
-	if ((func_expr.function.name != "list_aggr" && func_expr.function.name != "list_aggregate") ||
-	    !func_expr.bind_info) {
+	if ((func_expr.Function().GetName().GetIdentifierName() != "list_aggr" &&
+	     func_expr.Function().GetName().GetIdentifierName() != "list_aggregate") ||
+	    !func_expr.BindInfo()) {
+		return string();
+	}
+	// DuckDB 2.0 preserves forwarded aggregate arguments as function children.
+	// Only recover bind-data arguments for older/two-child plan shapes.
+	if (func_expr.GetChildren().size() > 2) {
 		return string();
 	}
 	struct ListAggregatesBindDataLayout {
@@ -740,25 +824,25 @@ string LptsExpressionRenderer::ListAggrStringAggSeparatorArg(const BoundFunction
 		LogicalType stype;
 		unique_ptr<Expression> aggr_expr;
 	};
-	const auto &bind_data = *reinterpret_cast<const ListAggregatesBindDataLayout *>(func_expr.bind_info.get());
+	const auto &bind_data = *reinterpret_cast<const ListAggregatesBindDataLayout *>(func_expr.BindInfo().get());
 	if (!bind_data.aggr_expr || bind_data.aggr_expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 		return string();
 	}
 	const auto &aggregate = bind_data.aggr_expr->Cast<BoundAggregateExpression>();
-	if (aggregate.function.name == "string_agg") {
+	if (aggregate.Function().GetName().GetIdentifierName() == "string_agg") {
 		return ", '" + EscapeSingleQuotes(StringAggSeparator(aggregate)) + "'";
 	}
 	// Same recovery for quantile-family sub-aggregates (`list_aggr(l, 'quantile', 0.5)`): the quantile
 	// argument was consumed into the nested aggregate's bind data.
-	if (aggregate.bind_info) {
-		if (IsQuantileAggregate(aggregate.function.name)) {
-			return ", " + QuantileArgumentFromBindInfo(*aggregate.bind_info);
+	if (aggregate.BindInfo()) {
+		if (IsQuantileAggregate(aggregate.Function().GetName().GetIdentifierName())) {
+			return ", " + QuantileArgumentFromBindInfo(*aggregate.BindInfo());
 		}
-		if (aggregate.function.name == "approx_quantile") {
-			return ", " + ApproxQuantileArgumentFromBindInfo(*aggregate.bind_info);
+		if (aggregate.Function().GetName().GetIdentifierName() == "approx_quantile") {
+			return ", " + ApproxQuantileArgumentFromBindInfo(*aggregate.BindInfo());
 		}
-		if (aggregate.function.name == "reservoir_quantile") {
-			return ", " + ReservoirQuantileArgumentsFromBindInfo(*aggregate.bind_info);
+		if (aggregate.Function().GetName().GetIdentifierName() == "reservoir_quantile") {
+			return ", " + ReservoirQuantileArgumentsFromBindInfo(*aggregate.BindInfo());
 		}
 	}
 	return string();
@@ -802,72 +886,6 @@ string LptsExpressionRenderer::GroupingSetsToClause(const vector<string> &group_
 	return "GROUPING SETS (" + VecToSeparatedList(set_clauses) + ")";
 }
 
-string LptsExpressionRenderer::RenderConstantContainingUnnamedStruct(const Value &value) const {
-	const LogicalType &type = value.type();
-	if (value.IsNull()) {
-		// A typed NULL of an unwritable type cannot be expressed; a bare NULL keeps the value and lets the
-		// surrounding expression's other operands pin the type.
-		return "NULL";
-	}
-	switch (type.id()) {
-	case LogicalTypeId::STRUCT: {
-		const auto &children = StructValue::GetChildren(value);
-		std::ostringstream out;
-		if (StructType::IsUnnamed(type)) {
-			out << "row(";
-			for (idx_t i = 0; i < children.size(); i++) {
-				out << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(children[i]);
-			}
-			out << ")";
-		} else {
-			out << "struct_pack(";
-			for (idx_t i = 0; i < children.size(); i++) {
-				out << (i ? ", " : "") << "\"" << StructType::GetChildName(type, i)
-				    << "\" := " << RenderConstantContainingUnnamedStruct(children[i]);
-			}
-			out << ")";
-		}
-		return out.str();
-	}
-	case LogicalTypeId::LIST:
-	case LogicalTypeId::ARRAY: {
-		const auto &children = ListValue::GetChildren(value);
-		std::ostringstream out;
-		out << "[";
-		for (idx_t i = 0; i < children.size(); i++) {
-			out << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(children[i]);
-		}
-		out << "]";
-		return out.str();
-	}
-	case LogicalTypeId::MAP: {
-		// A MAP value is physically a LIST of (key, value) entry structs; rebuild map(keys, values).
-		const auto &entries = ListValue::GetChildren(value);
-		std::ostringstream keys, vals;
-		for (idx_t i = 0; i < entries.size(); i++) {
-			const auto &kv = StructValue::GetChildren(entries[i]);
-			keys << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(kv[0]);
-			vals << (i ? ", " : "") << RenderConstantContainingUnnamedStruct(kv[1]);
-		}
-		return "map([" + keys.str() + "], [" + vals.str() + "])";
-	}
-	case LogicalTypeId::UNION: {
-		// Rebuild via the union_value constructor, cast to the full union type so the other members —
-		// and hence the value's type — are preserved.
-		const Value &inner = UnionValue::GetValue(value);
-		const union_tag_t tag = UnionValue::GetTag(value);
-		const string &member = UnionType::GetMemberName(type, tag);
-		return "CAST(union_value(\"" + member + "\" := " + RenderConstantContainingUnnamedStruct(inner) + ") AS " +
-		       type.ToString() + ")";
-	}
-	default: {
-		// Leaf: go through the normal constant path so lossy types keep their type-fidelity CASTs.
-		unique_ptr<Expression> leaf = make_uniq<BoundConstantExpression>(value);
-		return ExpressionToAliasedString(leaf);
-	}
-	}
-}
-
 string LptsExpressionRenderer::OrderByToAliasedString(const BoundOrderByNode &order) const {
 	std::ostringstream result;
 	// A folded constant order key (e.g. `ORDER BY j` where j aliases the literal 10) would render as a
@@ -906,6 +924,10 @@ string LptsExpressionRenderer::OrderByToAliasedString(const BoundOrderByNode &or
 		                        "ORDER BY null ordering is not implemented by LPTS");
 	}
 	return result.str();
+}
+
+bool LptsExpressionRenderer::IsRemovableConstantOrderKey(const BoundOrderByNode &order) {
+	return order.expression->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
 }
 
 namespace {
@@ -953,13 +975,13 @@ string UnquotedDatetimeUnitLiteral(const unique_ptr<Expression> &arg) {
 		return string();
 	}
 	const auto &constant = arg->Cast<BoundConstantExpression>();
-	if (constant.value.IsNull() || constant.value.type().id() != LogicalTypeId::VARCHAR) {
+	if (constant.GetValue().IsNull() || constant.GetValue().type().id() != LogicalTypeId::VARCHAR) {
 		return string();
 	}
 	static const std::set<string> kDatetimeUnits = {"YEAR",   "QUARTER",     "MONTH",      "WEEK",
 	                                                "DAY",    "DAYOFYEAR",   "HOUR",       "MINUTE",
 	                                                "SECOND", "MILLISECOND", "MICROSECOND"};
-	string unit = StringUtil::Upper(constant.value.GetValue<string>());
+	string unit = StringUtil::Upper(constant.GetValue().GetValue<string>());
 	if (kDatetimeUnits.find(unit) == kDatetimeUnits.end()) {
 		return string();
 	}
@@ -969,15 +991,15 @@ string UnquotedDatetimeUnitLiteral(const unique_ptr<Expression> &arg) {
 } // namespace
 
 string LptsExpressionRenderer::WindowFunctionName(const BoundWindowExpression &window) const {
-	if (window.aggregate) {
-		string agg_name = window.aggregate->name;
+	if (window.AggregateFunction()) {
+		string agg_name = window.AggregateFunction()->GetName().GetIdentifierName();
 		if (agg_name == "sum_no_overflow") {
-			return "sum";
+			agg_name = "sum";
 		}
 		if (agg_name == "count_star") {
-			return "count";
+			agg_name = "count";
 		}
-		return agg_name;
+		return FunctionNameForDialect(*window.AggregateFunction(), agg_name, dialect);
 	}
 	switch (window.GetExpressionType()) {
 	case ExpressionType::WINDOW_ROW_NUMBER:
@@ -1033,28 +1055,42 @@ static string WindowFrameUnits(WindowBoundary boundary) {
 string LptsExpressionRenderer::WindowRangeFrameOffsetToAliasedString(const BoundWindowExpression &window,
                                                                      const unique_ptr<Expression> &expr,
                                                                      bool preceding) const {
-	// The plan stores a RANGE bound as `<order key> - <offset>` / `+ <offset>`; recover the bare offset.
+	// The plan stores a RANGE bound as `<order key> - <offset>` / `+ <offset>` for ascending order and
+	// reverses the arithmetic for descending order. Recover the bare offset.
 	// DuckDB may wrap the order key in casts inconsistently between the ORDER BY and the frame expression
 	// (e.g. `CAST(date AS TIMESTAMP)` for interval arithmetic) — compare the two modulo casts, or falling
 	// back to rendering the whole bound expression would re-bind the SUBTRACTION as the offset (a
 	// TIMESTAMP), which cannot be added to the order key.
 	auto peel_casts = [](const Expression *e) {
-		while (e && e->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-			e = e->Cast<BoundCastExpression>().child.get();
+		while (e && BoundCastExpression::IsCast(*e)) {
+			e = &BoundCastExpression::Child(e->Cast<BoundFunctionExpression>());
 		}
 		return e;
 	};
-	if (!window.orders.empty() && expr && expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+	if (!window.OrderBy().empty() && expr) {
+		const Expression *order_peeled = peel_casts(window.OrderBy()[0].expression.get());
+		const Expression *endpoint_peeled = peel_casts(expr.get());
+		if (order_peeled && endpoint_peeled) {
+			unique_ptr<Expression> order_copy = order_peeled->Copy();
+			unique_ptr<Expression> endpoint_copy = endpoint_peeled->Copy();
+			if (ExpressionToAliasedString(endpoint_copy) == ExpressionToAliasedString(order_copy)) {
+				return "0";
+			}
+		}
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+			return ExpressionToAliasedString(expr);
+		}
 		const auto &func_expr = expr->Cast<BoundFunctionExpression>();
-		const string &func_name = func_expr.function.name;
-		if (func_expr.children.size() == 2 && ((preceding && func_name == "-") || (!preceding && func_name == "+"))) {
-			const Expression *order_peeled = peel_casts(window.orders[0].expression.get());
-			const Expression *left_peeled = peel_casts(func_expr.children[0].get());
+		const string &func_name = func_expr.Function().GetName().GetIdentifierName();
+		const bool descending = window.OrderBy()[0].type == OrderType::DESCENDING;
+		const string expected_function = preceding != descending ? "-" : "+";
+		if (func_expr.GetChildren().size() == 2 && func_name == expected_function) {
+			const Expression *left_peeled = peel_casts(func_expr.GetChildren()[0].get());
 			if (order_peeled && left_peeled) {
 				unique_ptr<Expression> order_copy = order_peeled->Copy();
 				unique_ptr<Expression> left_copy = left_peeled->Copy();
 				if (ExpressionToAliasedString(left_copy) == ExpressionToAliasedString(order_copy)) {
-					return ExpressionToAliasedString(func_expr.children[1]);
+					return ExpressionToAliasedString(func_expr.GetChildren()[1]);
 				}
 			}
 		}
@@ -1064,51 +1100,52 @@ string LptsExpressionRenderer::WindowRangeFrameOffsetToAliasedString(const Bound
 
 string LptsExpressionRenderer::WindowFrameStartToAliasedString(const BoundWindowExpression &window,
                                                                string &units) const {
-	switch (window.start) {
+	switch (window.WindowStart()) {
 	case WindowBoundary::CURRENT_ROW_RANGE:
 	case WindowBoundary::CURRENT_ROW_ROWS:
 	case WindowBoundary::CURRENT_ROW_GROUPS:
-		units = WindowFrameUnits(window.start);
+		units = WindowFrameUnits(window.WindowStart());
 		return "CURRENT ROW";
 	case WindowBoundary::UNBOUNDED_PRECEDING:
-		if (window.end != WindowBoundary::CURRENT_ROW_RANGE) {
+		if (window.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE) {
 			return "UNBOUNDED PRECEDING";
 		}
 		return "";
 	case WindowBoundary::EXPR_PRECEDING_ROWS:
 	case WindowBoundary::EXPR_PRECEDING_GROUPS:
-		units = WindowFrameUnits(window.start);
-		return ExpressionToAliasedString(window.start_expr) + " PRECEDING";
+		units = WindowFrameUnits(window.WindowStart());
+		return ExpressionToAliasedString(window.StartExpr()) + " PRECEDING";
 	case WindowBoundary::EXPR_PRECEDING_RANGE:
-		units = WindowFrameUnits(window.start);
-		return WindowRangeFrameOffsetToAliasedString(window, window.start_expr, true) + " PRECEDING";
+		units = WindowFrameUnits(window.WindowStart());
+		return WindowRangeFrameOffsetToAliasedString(window, window.StartExpr(), true) + " PRECEDING";
 	case WindowBoundary::EXPR_FOLLOWING_ROWS:
 	case WindowBoundary::EXPR_FOLLOWING_GROUPS:
-		units = WindowFrameUnits(window.start);
-		return ExpressionToAliasedString(window.start_expr) + " FOLLOWING";
+		units = WindowFrameUnits(window.WindowStart());
+		return ExpressionToAliasedString(window.StartExpr()) + " FOLLOWING";
 	case WindowBoundary::EXPR_FOLLOWING_RANGE:
-		units = WindowFrameUnits(window.start);
-		return WindowRangeFrameOffsetToAliasedString(window, window.start_expr, false) + " FOLLOWING";
+		units = WindowFrameUnits(window.WindowStart());
+		return WindowRangeFrameOffsetToAliasedString(window, window.StartExpr(), false) + " FOLLOWING";
 	case WindowBoundary::INVALID:
 		return "";
 	default:
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_frame_start",
-		                        std::to_string(static_cast<int>(window.start)), "BOUND_WINDOW",
+		                        std::to_string(static_cast<int>(window.WindowStart())), "BOUND_WINDOW",
 		                        "window frame start is not implemented by LPTS");
 	}
 }
 
 string LptsExpressionRenderer::WindowFrameEndToAliasedString(const BoundWindowExpression &window, string &units) const {
-	switch (window.end) {
+	switch (window.WindowEnd()) {
 	case WindowBoundary::CURRENT_ROW_RANGE:
-		if (window.start != WindowBoundary::UNBOUNDED_PRECEDING && window.start != WindowBoundary::INVALID) {
+		if (window.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING &&
+		    window.WindowStart() != WindowBoundary::INVALID) {
 			units = "RANGE";
 			return "CURRENT ROW";
 		}
 		return "";
 	case WindowBoundary::CURRENT_ROW_ROWS:
 	case WindowBoundary::CURRENT_ROW_GROUPS:
-		units = WindowFrameUnits(window.end);
+		units = WindowFrameUnits(window.WindowEnd());
 		return "CURRENT ROW";
 	case WindowBoundary::UNBOUNDED_PRECEDING:
 		return "UNBOUNDED PRECEDING";
@@ -1116,23 +1153,23 @@ string LptsExpressionRenderer::WindowFrameEndToAliasedString(const BoundWindowEx
 		return "UNBOUNDED FOLLOWING";
 	case WindowBoundary::EXPR_PRECEDING_ROWS:
 	case WindowBoundary::EXPR_PRECEDING_GROUPS:
-		units = WindowFrameUnits(window.end);
-		return ExpressionToAliasedString(window.end_expr) + " PRECEDING";
+		units = WindowFrameUnits(window.WindowEnd());
+		return ExpressionToAliasedString(window.EndExpr()) + " PRECEDING";
 	case WindowBoundary::EXPR_PRECEDING_RANGE:
-		units = WindowFrameUnits(window.end);
-		return WindowRangeFrameOffsetToAliasedString(window, window.end_expr, true) + " PRECEDING";
+		units = WindowFrameUnits(window.WindowEnd());
+		return WindowRangeFrameOffsetToAliasedString(window, window.EndExpr(), true) + " PRECEDING";
 	case WindowBoundary::EXPR_FOLLOWING_ROWS:
 	case WindowBoundary::EXPR_FOLLOWING_GROUPS:
-		units = WindowFrameUnits(window.end);
-		return ExpressionToAliasedString(window.end_expr) + " FOLLOWING";
+		units = WindowFrameUnits(window.WindowEnd());
+		return ExpressionToAliasedString(window.EndExpr()) + " FOLLOWING";
 	case WindowBoundary::EXPR_FOLLOWING_RANGE:
-		units = WindowFrameUnits(window.end);
-		return WindowRangeFrameOffsetToAliasedString(window, window.end_expr, false) + " FOLLOWING";
+		units = WindowFrameUnits(window.WindowEnd());
+		return WindowRangeFrameOffsetToAliasedString(window, window.EndExpr(), false) + " FOLLOWING";
 	case WindowBoundary::INVALID:
 		return "";
 	default:
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_frame_end",
-		                        std::to_string(static_cast<int>(window.end)), "BOUND_WINDOW",
+		                        std::to_string(static_cast<int>(window.WindowEnd())), "BOUND_WINDOW",
 		                        "window frame end is not implemented by LPTS");
 	}
 }
@@ -1140,97 +1177,100 @@ string LptsExpressionRenderer::WindowFrameEndToAliasedString(const BoundWindowEx
 string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindowExpression &window) const {
 	// `WITH ORDINALITY` compiles to a distinctive `row_number() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND
 	// CURRENT ROW)` — no PARTITION BY, no ORDER BY, and a ROWS frame (end = CURRENT_ROW_ROWS). The numbering
-	// follows an unspecified scan order, so the rewrite cannot reproduce it. Refuse. This is narrowed to the
-	// ROWS-frame signature so a plain `row_number() OVER ()` (which DuckDB gives a RANGE frame,
-	// end = CURRENT_ROW_RANGE) is not affected.
-	if (window.GetExpressionType() == ExpressionType::WINDOW_ROW_NUMBER && window.orders.empty() &&
-	    window.partitions.empty() && window.start == WindowBoundary::UNBOUNDED_PRECEDING &&
-	    window.end == WindowBoundary::CURRENT_ROW_ROWS) {
+	// follows an unspecified scan order, so the rewrite cannot reproduce it. DuckDB's correlated-LIMIT
+	// decorrelator uses the same frame but names its private column limit_rownum; that row number implements
+	// the original LIMIT and can be emitted. A plain row_number() OVER () has a RANGE frame.
+	if (window.GetExpressionType() == ExpressionType::WINDOW_ROW_NUMBER && window.OrderBy().empty() &&
+	    window.Partitions().empty() && window.WindowStart() == WindowBoundary::UNBOUNDED_PRECEDING &&
+	    window.WindowEnd() == WindowBoundary::CURRENT_ROW_ROWS &&
+	    window.GetAlias().GetIdentifierName() != "limit_rownum") {
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_WINDOW", dialect, "window_function", "row_number", "BOUND_WINDOW",
 		                        "WITH ORDINALITY (row_number over an unspecified row order) cannot be reproduced");
 	}
 	std::ostringstream result;
 	result << WindowFunctionName(window) << "(";
-	if (window.aggregate && window.aggregate->name == "count_star" && window.children.empty()) {
+	if (window.AggregateFunction() && window.AggregateFunction()->GetName().GetIdentifierName() == "count_star" &&
+	    window.GetChildren().empty()) {
 		result << "*";
 	}
-	for (idx_t i = 0; i < window.children.size(); i++) {
+	for (idx_t i = 0; i < window.GetChildren().size(); i++) {
 		if (i > 0) {
 			result << ", ";
 		}
-		if (window.distinct && i == 0) {
+		if (window.Distinct() && i == 0) {
 			result << "DISTINCT ";
 		}
-		result << ExpressionToAliasedString(window.children[i]);
+		result << ExpressionToAliasedString(window.GetChildren()[i]);
 	}
-	// Quantile-family aggregates used as window functions: the quantile argument was consumed into the
-	// bind data at bind time (the children hold only the input), so it must be re-appended — same recovery
-	// as the aggregate path.
-	if (window.aggregate && window.bind_info && !window.children.empty()) {
-		const string &agg_name = window.aggregate->name;
-		if (IsQuantileAggregate(agg_name)) {
-			result << ", " << QuantileArgumentFromBindInfo(*window.bind_info);
-		} else if (agg_name == "approx_quantile") {
-			result << ", " << ApproxQuantileArgumentFromBindInfo(*window.bind_info);
-		} else if (agg_name == "reservoir_quantile") {
-			result << ", " << ReservoirQuantileArgumentsFromBindInfo(*window.bind_info);
+	// Older plan shapes consumed quantile arguments into bind data, leaving only the input child. DuckDB 2.0
+	// keeps those arguments as children, so recover bind-data arguments only for the one-child shape.
+	if (window.AggregateFunction() && window.BindInfo() && !window.GetChildren().empty()) {
+		const string &agg_name = window.AggregateFunction()->GetName().GetIdentifierName();
+		if (IsQuantileAggregate(agg_name) && window.GetChildren().size() == 1) {
+			result << ", " << QuantileArgumentFromBindInfo(*window.BindInfo());
+		} else if (agg_name == "approx_quantile" && window.GetChildren().size() == 1) {
+			result << ", " << ApproxQuantileArgumentFromBindInfo(*window.BindInfo());
+		} else if (agg_name == "reservoir_quantile" && window.GetChildren().size() == 1) {
+			result << ", " << ReservoirQuantileArgumentsFromBindInfo(*window.BindInfo());
 		}
 	}
-	if (window.offset_expr) {
-		if (!window.children.empty()) {
-			result << ", ";
-		}
-		result << ExpressionToAliasedString(window.offset_expr);
-	}
-	if (window.default_expr) {
-		if (!window.children.empty() || window.offset_expr) {
-			result << ", ";
-		}
-		result << ExpressionToAliasedString(window.default_expr);
-	}
-	if (!window.arg_orders.empty()) {
-		result << " ORDER BY ";
-		for (idx_t i = 0; i < window.arg_orders.size(); i++) {
-			if (i > 0) {
+	if (!window.ArgOrders().empty()) {
+		string separator;
+		for (const auto &order : window.ArgOrders()) {
+			if (IsRemovableConstantOrderKey(order)) {
+				continue;
+			}
+			if (separator.empty()) {
+				result << " ORDER BY ";
+			} else {
 				result << ", ";
 			}
-			result << OrderByToAliasedString(window.arg_orders[i]);
+			result << OrderByToAliasedString(order);
+			separator = ", ";
 		}
 	}
-	if (window.ignore_nulls) {
+	if (window.IgnoreNulls()) {
 		result << " IGNORE NULLS";
 	}
-	if (window.filter_expr) {
-		result << ") FILTER (WHERE " << ExpressionToAliasedString(window.filter_expr);
+	if (window.Filter()) {
+		result << ") FILTER (WHERE " << ExpressionToAliasedString(window.Filter());
 	}
 
 	result << ") OVER (";
 	string separator;
-	if (!window.partitions.empty()) {
+	if (!window.Partitions().empty()) {
 		result << "PARTITION BY ";
-		for (idx_t i = 0; i < window.partitions.size(); i++) {
+		for (idx_t i = 0; i < window.Partitions().size(); i++) {
 			if (i > 0) {
 				result << ", ";
 			}
-			result << ExpressionToAliasedString(window.partitions[i]);
+			result << ExpressionToAliasedString(window.Partitions()[i]);
 		}
 		separator = " ";
 	}
-	if (!window.orders.empty()) {
-		result << separator << "ORDER BY ";
-		for (idx_t i = 0; i < window.orders.size(); i++) {
-			if (i > 0) {
+	if (!window.OrderBy().empty()) {
+		bool emitted_order = false;
+		for (const auto &order : window.OrderBy()) {
+			if (IsRemovableConstantOrderKey(order)) {
+				continue;
+			}
+			if (!emitted_order) {
+				result << separator << "ORDER BY ";
+			} else {
 				result << ", ";
 			}
-			result << OrderByToAliasedString(window.orders[i]);
+			result << OrderByToAliasedString(order);
+			emitted_order = true;
 		}
-		separator = " ";
+		if (emitted_order) {
+			separator = " ";
+		}
 	}
 
 	string units = "ROWS";
 	string frame_start = WindowFrameStartToAliasedString(window, units);
 	string frame_end = WindowFrameEndToAliasedString(window, units);
-	if (window.exclude_clause != WindowExcludeMode::NO_OTHER) {
+	if (window.WindowExclude() != WindowExcludeMode::NO_OTHER) {
 		if (frame_start.empty()) {
 			frame_start = "UNBOUNDED PRECEDING";
 		}
@@ -1254,12 +1294,12 @@ string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindow
 		}
 		separator = " ";
 	}
-	if (dialect == SqlDialect::SPARK && window.exclude_clause != WindowExcludeMode::NO_OTHER) {
+	if (dialect == SqlDialect::SPARK && window.WindowExclude() != WindowExcludeMode::NO_OTHER) {
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_exclude_clause",
-		                        std::to_string(static_cast<int>(window.exclude_clause)), "BOUND_WINDOW",
+		                        std::to_string(static_cast<int>(window.WindowExclude())), "BOUND_WINDOW",
 		                        "Spark SQL does not support window EXCLUDE clauses");
 	}
-	switch (window.exclude_clause) {
+	switch (window.WindowExclude()) {
 	case WindowExcludeMode::NO_OTHER:
 		break;
 	case WindowExcludeMode::CURRENT_ROW:
@@ -1273,7 +1313,7 @@ string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindow
 		break;
 	default:
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "window_exclude_clause",
-		                        std::to_string(static_cast<int>(window.exclude_clause)), "BOUND_WINDOW",
+		                        std::to_string(static_cast<int>(window.WindowExclude())), "BOUND_WINDOW",
 		                        "window exclude mode is not implemented by LPTS");
 	}
 	result << ")";
@@ -1288,10 +1328,15 @@ string LptsExpressionRenderer::WindowExpressionToAliasedString(const BoundWindow
 // Converts a bound Expression into a SQL string.
 //--------------------------------------------------------------------------
 string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expression> &expression) const {
+	return ExpressionToAliasedString(*expression);
+}
+
+string LptsExpressionRenderer::ExpressionToAliasedString(const Expression &expr) const {
+	auto expression = &expr;
 	// VARIANT has no faithful, re-parseable SQL literal (Value::ToSQLString emits a `VARIANT(...)` form that
 	// does not round-trip), so any expression whose type contains VARIANT (directly or nested in a
 	// list/struct/map) is untranslatable — fail rather than emit a value that differs from the original.
-	if (TypeContainsVariant(expression->return_type)) {
+	if (TypeContainsVariant(expression->GetReturnType())) {
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", "VARIANT", "expression",
 		                        "VARIANT values have no faithful SQL literal");
 	}
@@ -1300,11 +1345,15 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	switch (e_class) {
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		const BoundColumnRefExpression &bcr = expression->Cast<BoundColumnRefExpression>();
-		expr_str << binding_resolver(bcr.binding, "expression");
+		expr_str << binding_resolver(bcr.Binding(), "expression");
 		break;
 	}
 	case ExpressionClass::BOUND_CONSTANT: {
 		const BoundConstantExpression &constant = expression->Cast<BoundConstantExpression>();
+		if (TypeContainsEmptyEnum(constant.GetValue().type())) {
+			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", constant.GetValue().type().ToString(),
+			                        "BOUND_CONSTANT", "an empty ENUM constant has no inline SQL representation");
+		}
 		// Non-DuckDB dialects render constants through the dialect-aware path (target-specific
 		// literal/cast forms, bare NULL for untyped SQLNULL). The faithful, re-parseable rendering
 		// below is DuckDB-specific.
@@ -1312,116 +1361,9 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			expr_str << RenderConstantForDialect(constant, dialect);
 			break;
 		}
-		// Render the constant as a re-parseable, type-faithful SQL literal. Value::ToSQLString() quotes and
-		// self-types the common cases (BLOB, DATE/TIME/TIMESTAMP, VARCHAR, STRUCT, LIST, VARIANT, ...). For the
-		// types it leaves bare and that would re-parse to a different type (TINYINT/HUGEINT/FLOAT/DECIMAL/BIT/
-		// BIGNUM/unsigned ints), emit CAST('<text>' AS <type>): the string form casts correctly for all of them
-		// (e.g. CAST('00000001' AS BIT) keeps the bitstring, unlike the bare 00000001 which is the integer 1).
-		if (constant.value.IsNull()) {
-			// A bare NULL re-parses as the untyped SQLNULL; a typed NULL (e.g. NULL::INTEGER, common in
-			// view definitions) must keep its type so the result column type — and the type-sensitive
-			// bag-hash — match the original.
-			if (constant.value.type().id() == LogicalTypeId::SQLNULL) {
-				expr_str << "NULL";
-			} else {
-				expr_str << "CAST(NULL AS " << constant.value.type().ToString() << ")";
-			}
-		} else if (constant.value.type().id() == LogicalTypeId::TYPE) {
-			// A TYPE-typed value (from get_type()/make_type()) has no literal and no VARCHAR cast;
-			// reconstruct it as get_type(CAST(NULL AS <the type>)).
-			const string type_name = constant.value.ToString();
-			if (type_name == "NULL" || type_name == "\"NULL\"") {
-				expr_str << "get_type(NULL)";
-			} else {
-				expr_str << "get_type(CAST(NULL AS " << type_name << "))";
-			}
-		} else if (TypeNeedsStructuralRender(constant.value.type())) {
-			// A value containing an unnamed struct (ROW) or a UNION anywhere in its type (e.g.
-			// `(0, 0) < ANY(...)`, list_zip's STRUCT(DATE)[], `true::UNION(...)`) — no literal or
-			// text-cast form exists, so rebuild the value structurally.
-			expr_str << RenderConstantContainingUnnamedStruct(constant.value);
-		} else if (ConstantNeedsExplicitCast(constant.value.type()) ||
-		           IntegerConstantNeedsExplicitCast(constant.value)) {
-			expr_str << "CAST('" << EscapeSingleQuotes(constant.value.ToString()) << "' AS "
-			         << constant.value.type().ToString() << ")";
-		} else if (constant.value.type().id() == LogicalTypeId::VARCHAR &&
-		           StringValue::Get(constant.value).find('\0') != string::npos) {
-			// A NUL byte cannot appear inside a SQL string literal (the parser stops at it). Rebuild the
-			// value as a concatenation with chr(0) for each NUL: 'goo' || chr(0) || 'se'.
-			const string &s = StringValue::Get(constant.value);
-			expr_str << "(";
-			bool first_part = true;
-			size_t start = 0;
-			while (start <= s.size()) {
-				size_t nul = s.find('\0', start);
-				const string part = s.substr(start, (nul == string::npos ? s.size() : nul) - start);
-				if (!first_part) {
-					expr_str << " || ";
-				}
-				expr_str << "'" << EscapeSingleQuotes(part) << "'";
-				first_part = false;
-				if (nul == string::npos) {
-					break;
-				}
-				expr_str << " || chr(0)";
-				start = nul + 1;
-			}
-			expr_str << ")";
-		} else {
-			expr_str << constant.value.ToSQLString();
-		}
-		break;
-	}
-	case ExpressionClass::BOUND_COMPARISON: {
-		const BoundComparisonExpression &cmp = expression->Cast<BoundComparisonExpression>();
-		expr_str << RenderComparisonForDialect(ExpressionToAliasedString(cmp.left),
-		                                       ExpressionToAliasedString(cmp.right), cmp.GetExpressionType(), dialect);
-		break;
-	}
-	case ExpressionClass::BOUND_BETWEEN: {
-		const BoundBetweenExpression &between_expr = expression->Cast<BoundBetweenExpression>();
-		string input = ExpressionToAliasedString(between_expr.input);
-		string lower_op = ExpressionTypeToOperator(between_expr.LowerComparisonType());
-		string upper_op = ExpressionTypeToOperator(between_expr.UpperComparisonType());
-		expr_str << "((" << input << ") " << lower_op << " (" << ExpressionToAliasedString(between_expr.lower)
-		         << ")) AND ((" << input << ") " << upper_op << " (" << ExpressionToAliasedString(between_expr.upper)
-		         << "))";
-		break;
-	}
-	case ExpressionClass::BOUND_CAST: {
-		const BoundCastExpression &cast_expr = expression->Cast<BoundCastExpression>();
-		if (cast_expr.try_cast) {
-			ValidateTryCastForDialect(dialect);
-		}
-		// A cast to a type containing an UNNAMED struct (e.g. aligning row(...) values, or feeding
-		// map_from_entries) cannot be written — the type has no SQL syntax. When the cast only strips
-		// field names (same structure and child types), it is a no-op for re-binding: render the child
-		// bare and let the binder re-derive whatever internal cast it needs.
-		if (TypeContainsUnnamedStruct(cast_expr.return_type) &&
-		    TypesEqualIgnoringStructNames(cast_expr.child->return_type, cast_expr.return_type)) {
-			expr_str << ExpressionToAliasedString(cast_expr.child);
-			break;
-		}
-		// A cast whose target is (or contains) the untyped-NULL type is a binder-internal artifact of a
-		// fully-folded expression (e.g. a lambda body over an empty list): `CAST(x AS "NULL")` does not
-		// parse, and dropping it lets the re-bind derive its own typing.
-		if (TypeContainsNullType(cast_expr.return_type)) {
-			expr_str << ExpressionToAliasedString(cast_expr.child);
-			break;
-		}
-		expr_str << (cast_expr.try_cast ? "TRY_CAST(" : "CAST(");
-		expr_str << ExpressionToAliasedString(cast_expr.child);
-		if (dialect == SqlDialect::SPARK && cast_expr.return_type.id() == LogicalTypeId::HUGEINT &&
-		    SparkCanRepresentHugeintCastAsDecimal38(cast_expr.child->return_type)) {
-			expr_str << " AS DECIMAL(38,0))";
-		} else if (dialect == SqlDialect::SPARK && cast_expr.return_type.id() == LogicalTypeId::HUGEINT) {
-			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", cast_expr.return_type.ToString(),
-			                        "BOUND_CAST",
-			                        "source type " + cast_expr.child->return_type.ToString() +
-			                            " may use DuckDB HUGEINT's 39-digit range, beyond Spark DECIMAL(38,0)");
-		} else {
-			expr_str << " AS " + RenderCastTargetType(cast_expr.return_type, dialect) + ")";
-		}
+		// DuckDB owns the lossless SQL representation of its values. Its native exporter preserves
+		// nested type witnesses, aliases, collations, aggregate-state signatures, and typed NULLs.
+		expr_str << RenderConstantForDialect(constant, dialect);
 		break;
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
@@ -1430,31 +1372,193 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		// Serialize as: (child[0]) OP (child[1]) OP ... OP (child[N-1]).
 		string op = ExpressionTypeToOperator(conj.GetExpressionType());
 		expr_str << "(";
-		expr_str << ExpressionToAliasedString(conj.children[0]);
+		expr_str << ExpressionToAliasedString(conj.GetChildren()[0]);
 		expr_str << ")";
-		for (size_t ci = 1; ci < conj.children.size(); ci++) {
+		for (size_t ci = 1; ci < conj.GetChildren().size(); ci++) {
 			expr_str << " " << op << " (";
-			expr_str << ExpressionToAliasedString(conj.children[ci]);
+			expr_str << ExpressionToAliasedString(conj.GetChildren()[ci]);
 			expr_str << ")";
 		}
 		break;
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
+		if (BoundComparisonExpression::IsComparison(*expression)) {
+			const BoundFunctionExpression &cmp = expression->Cast<BoundFunctionExpression>();
+			const auto &left = BoundComparisonExpression::Left(cmp);
+			const auto &right = BoundComparisonExpression::Right(cmp);
+			const bool mismatched_varchar_collations =
+			    left.GetReturnType().id() == LogicalTypeId::VARCHAR &&
+			    right.GetReturnType().id() == LogicalTypeId::VARCHAR &&
+			    !left.GetReturnType().EqualsIncludingCollation(right.GetReturnType());
+			if (IsDuckDBDialect(dialect) && mismatched_varchar_collations) {
+				auto is_constant_operand = [](const Expression &operand) {
+					const Expression *current = &operand;
+					while (BoundCastExpression::IsCast(*current)) {
+						current = &BoundCastExpression::Child(current->Cast<BoundFunctionExpression>());
+					}
+					return current->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
+				};
+				const string &left_collation = StringType::GetCollation(left.GetReturnType());
+				const string &right_collation = StringType::GetCollation(right.GetReturnType());
+				string comparison_collation;
+				if (left_collation.empty() != right_collation.empty()) {
+					comparison_collation = left_collation.empty() ? right_collation : left_collation;
+				} else if (is_constant_operand(left) != is_constant_operand(right)) {
+					comparison_collation = is_constant_operand(left) ? left_collation : right_collation;
+				}
+				if (comparison_collation.empty()) {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_COLLATION", dialect, "comparison_collations",
+					                        left_collation + "," + right_collation, "BOUND_FUNCTION",
+					                        "an optimizer-typed comparison between two non-constant values has no "
+					                        "unambiguous SQL collation");
+				}
+				auto render_collated = [&](const Expression &operand) {
+					return "(" + ExpressionToAliasedString(operand) + ") COLLATE " +
+					       SQLIdentifier(comparison_collation);
+				};
+				expr_str << RenderComparisonForDialect(render_collated(left), render_collated(right),
+				                                       cmp.GetExpressionType(), dialect);
+				break;
+			}
+			const bool requires_native_export = (left.GetReturnType().id() == LogicalTypeId::VARCHAR &&
+			                                     right.GetReturnType().id() == LogicalTypeId::BLOB) ||
+			                                    (left.GetReturnType().id() == LogicalTypeId::BLOB &&
+			                                     right.GetReturnType().id() == LogicalTypeId::VARCHAR);
+			if (IsDuckDBDialect(dialect) && requires_native_export) {
+				vector<pair<ColumnBinding, ResolvedSQLColumnReference>> bindings;
+				ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
+				    *expression, [&](const BoundColumnRefExpression &column) {
+					    bindings.push_back(
+					        {column.Binding(),
+					         {{Identifier(binding_resolver(column.Binding(), "comparison"))}, column.GetReturnType()}});
+				    });
+				BoundExpressionSQLExportContext export_context;
+				export_context.client_context = context;
+				export_context.discard_optimizer_metadata = true;
+				export_context.resolve_binding =
+				    [bindings =
+				         std::move(bindings)](const ColumnBinding &binding) -> optional<ResolvedSQLColumnReference> {
+					for (const auto &entry : bindings) {
+						if (entry.first == binding) {
+							return entry.second;
+						}
+					}
+					return {};
+				};
+				auto exported = BoundExpressionSQLExporter::Export(*expression, export_context);
+				if (exported.HasError()) {
+					const auto &issues = exported.GetIssues();
+					throw InternalException("DuckDB could not export an optimizer-typed comparison: %s",
+					                        issues.empty() ? "unknown export failure" : issues[0].message);
+				}
+				expr_str << exported.GetValue()->ToString();
+				break;
+			}
+			auto render_operand = [&](const Expression &operand, const Expression &peer) {
+				if (operand.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+				    operand.GetReturnType().IsNumeric() && operand.GetReturnType() == peer.GetReturnType()) {
+					return operand.Cast<BoundConstantExpression>().GetValue().ToSQLString();
+				}
+				if (BoundCastExpression::IsCast(operand)) {
+					const auto &cast = operand.Cast<BoundFunctionExpression>();
+					const auto &child = BoundCastExpression::Child(cast);
+					if (!BoundCastExpression::IsTryCast(cast) && BoundCastExpression::IsDefaultCast(cast) &&
+					    child.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+					    child.GetReturnType().IsNumeric() && operand.GetReturnType().IsNumeric() &&
+					    operand.GetReturnType() == peer.GetReturnType()) {
+						return ExpressionToAliasedString(child);
+					}
+				}
+				return ExpressionToAliasedString(operand);
+			};
+			expr_str << RenderComparisonForDialect(render_operand(left, right), render_operand(right, left),
+			                                       cmp.GetExpressionType(), dialect);
+			break;
+		}
+		if (expression->GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			const auto &between_expr = expression->Cast<BoundFunctionExpression>();
+			string input = ExpressionToAliasedString(BoundBetweenExpression::Input(between_expr));
+			string lower_op = ExpressionTypeToOperator(BoundBetweenExpression::LowerComparisonType(between_expr));
+			string upper_op = ExpressionTypeToOperator(BoundBetweenExpression::UpperComparisonType(between_expr));
+			expr_str << "((" << input << ") " << lower_op << " ("
+			         << ExpressionToAliasedString(BoundBetweenExpression::LowerBound(between_expr)) << ")) AND (("
+			         << input << ") " << upper_op << " ("
+			         << ExpressionToAliasedString(BoundBetweenExpression::UpperBound(between_expr)) << "))";
+			break;
+		}
+		if (BoundCastExpression::IsCast(*expression)) {
+			const BoundFunctionExpression &cast_expr = expression->Cast<BoundFunctionExpression>();
+			const auto &cast_child = BoundCastExpression::Child(cast_expr);
+			if (BoundCastExpression::IsTryCast(cast_expr)) {
+				ValidateTryCastForDialect(dialect);
+			}
+			if (cast_expr.GetReturnType().IsAggregateState()) {
+				if (!IsDuckDBDialect(dialect) || BoundCastExpression::IsTryCast(cast_expr)) {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type",
+					                        cast_expr.GetReturnType().ToString(), "BOUND_CAST",
+					                        "aggregate-state casts require DuckDB's state reconstruction syntax");
+				}
+				auto parser = Parser::GetBuiltinParser();
+				auto child =
+				    parser.ParseSingleExpression(ExpressionToAliasedString(BoundCastExpression::Child(cast_expr)));
+				auto state = ExportAggregateFunction::StateToSQL(cast_expr.GetReturnType(), std::move(child));
+				if (!state) {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type",
+					                        cast_expr.GetReturnType().ToString(), "BOUND_CAST",
+					                        "aggregate-state metadata is insufficient to reconstruct SQL");
+				}
+				expr_str << state->ToString();
+				break;
+			}
+			// A cast to a type containing an UNNAMED struct (e.g. aligning row(...) values, or feeding
+			// map_from_entries) cannot be written — the type has no SQL syntax. When the cast only strips
+			// field names (same structure and child types), it is a no-op for re-binding: render the child
+			// bare and let the binder re-derive whatever internal cast it needs.
+			if (TypeContainsUnnamedStruct(cast_expr.GetReturnType()) &&
+			    TypesEqualIgnoringStructNames(BoundCastExpression::Child(cast_expr).GetReturnType(),
+			                                  cast_expr.GetReturnType())) {
+				expr_str << ExpressionToAliasedString(BoundCastExpression::Child(cast_expr));
+				break;
+			}
+			// A scalar cast to the untyped-NULL type is a binder-internal artifact of a fully-folded
+			// expression (e.g. a lambda body over an empty list): `CAST(x AS "NULL")` does not parse, and
+			// dropping it lets the re-bind derive its own typing. Nested NULL types are different:
+			// DuckDB accepts e.g. MAP("NULL", "NULL"), and TRY_CAST to that target has observable semantics.
+			if (cast_expr.GetReturnType().id() == LogicalTypeId::SQLNULL) {
+				expr_str << ExpressionToAliasedString(BoundCastExpression::Child(cast_expr));
+				break;
+			}
+			expr_str << (BoundCastExpression::IsTryCast(cast_expr) ? "TRY_CAST(" : "CAST(");
+			expr_str << ExpressionToAliasedString(cast_child);
+			if (dialect == SqlDialect::SPARK && cast_expr.GetReturnType().id() == LogicalTypeId::HUGEINT &&
+			    SparkCanRepresentHugeintCastAsDecimal38(cast_child.GetReturnType())) {
+				expr_str << " AS DECIMAL(38,0))";
+			} else if (dialect == SqlDialect::SPARK && cast_expr.GetReturnType().id() == LogicalTypeId::HUGEINT) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", cast_expr.GetReturnType().ToString(),
+				                        "BOUND_CAST",
+				                        "source type " + cast_child.GetReturnType().ToString() +
+				                            " may use DuckDB HUGEINT's 39-digit range, beyond Spark DECIMAL(38,0)");
+			} else {
+				expr_str << " AS " + RenderCastTargetType(cast_expr.GetReturnType(), dialect) + ")";
+			}
+			break;
+		}
 		const BoundFunctionExpression &func_expr = expression->Cast<BoundFunctionExpression>();
 		// Strip internal compress/decompress wrappers injected by COMPRESSED_MATERIALIZATION.
 		// For non-BOUND_COLUMN_REF GROUP BY keys (e.g. COALESCE), the optimizer inlines
 		// __internal_compress_* directly into the aggregate's group expression instead of
 		// creating a separate projection. Render the first argument (the original expression)
 		// so the generated SQL stays valid and binder-accepted.
-		if (!func_expr.children.empty() && (func_expr.function.name.rfind("__internal_compress_", 0) == 0 ||
-		                                    func_expr.function.name.rfind("__internal_decompress_", 0) == 0)) {
-			expr_str << ExpressionToAliasedString(func_expr.children[0]);
+		if (!func_expr.GetChildren().empty() &&
+		    (func_expr.Function().GetName().GetIdentifierName().rfind("__internal_compress_", 0) == 0 ||
+		     func_expr.Function().GetName().GetIdentifierName().rfind("__internal_decompress_", 0) == 0)) {
+			expr_str << ExpressionToAliasedString(func_expr.GetChildren()[0]);
 			break;
 		}
 		// `alias(expr)` returns the *name* of its argument as a string. LPTS rewrites columns to its own
 		// names (t0_*) and re-renders expressions, so the name alias() observes — and therefore its value —
 		// cannot match the original. It is untranslatable; fail rather than emit a different value.
-		if (func_expr.function.name == "alias") {
+		if (func_expr.Function().GetName().GetIdentifierName() == "alias") {
 			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", "alias", "BOUND_FUNCTION",
 			                        "alias() reflects column names that LPTS rewrites");
 		}
@@ -1463,38 +1567,40 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		// list value). `array_slice(s, <list>, ...)` does not bind — "bounds must be a BIGINT" — and no
 		// function-call form can express the omission; only the bracket syntax can. Render brackets,
 		// leaving sentinel sides empty.
-		if ((func_expr.function.name == "array_slice" || func_expr.function.name == "list_slice") &&
-		    (func_expr.children.size() == 3 || func_expr.children.size() == 4)) {
+		if ((func_expr.Function().GetName().GetIdentifierName() == "array_slice" ||
+		     func_expr.Function().GetName().GetIdentifierName() == "list_slice") &&
+		    (func_expr.GetChildren().size() == 3 || func_expr.GetChildren().size() == 4)) {
 			auto is_omitted_bound = [](const unique_ptr<Expression> &e) {
 				return e->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
-				       (e->return_type.id() == LogicalTypeId::LIST || e->return_type.id() == LogicalTypeId::ARRAY);
+				       (e->GetReturnType().id() == LogicalTypeId::LIST ||
+				        e->GetReturnType().id() == LogicalTypeId::ARRAY);
 			};
 			// Full-range step -1 slice is how list_reverse compiles; `[::-1]` itself does not parse.
-			if (func_expr.children.size() == 4 && is_omitted_bound(func_expr.children[1]) &&
-			    is_omitted_bound(func_expr.children[2]) &&
-			    func_expr.children[3]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-				const auto &step_val = func_expr.children[3]->Cast<BoundConstantExpression>().value;
+			if (func_expr.GetChildren().size() == 4 && is_omitted_bound(func_expr.GetChildren()[1]) &&
+			    is_omitted_bound(func_expr.GetChildren()[2]) &&
+			    func_expr.GetChildren()[3]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+				const auto &step_val = func_expr.GetChildren()[3]->Cast<BoundConstantExpression>().GetValue();
 				if (!step_val.IsNull() && step_val.type().IsIntegral() && step_val.GetValue<int64_t>() == -1) {
-					expr_str << "list_reverse(" << ExpressionToAliasedString(func_expr.children[0]) << ")";
+					expr_str << "list_reverse(" << ExpressionToAliasedString(func_expr.GetChildren()[0]) << ")";
 					break;
 				}
 			}
-			if (is_omitted_bound(func_expr.children[1]) || is_omitted_bound(func_expr.children[2])) {
-				const bool has_step = func_expr.children.size() == 4;
-				expr_str << "(" << ExpressionToAliasedString(func_expr.children[0]) << ")[";
-				if (!is_omitted_bound(func_expr.children[1])) {
-					expr_str << ExpressionToAliasedString(func_expr.children[1]);
+			if (is_omitted_bound(func_expr.GetChildren()[1]) || is_omitted_bound(func_expr.GetChildren()[2])) {
+				const bool has_step = func_expr.GetChildren().size() == 4;
+				expr_str << "(" << ExpressionToAliasedString(func_expr.GetChildren()[0]) << ")[";
+				if (!is_omitted_bound(func_expr.GetChildren()[1])) {
+					expr_str << ExpressionToAliasedString(func_expr.GetChildren()[1]);
 				}
 				expr_str << ":";
-				if (!is_omitted_bound(func_expr.children[2])) {
-					expr_str << ExpressionToAliasedString(func_expr.children[2]);
+				if (!is_omitted_bound(func_expr.GetChildren()[2])) {
+					expr_str << ExpressionToAliasedString(func_expr.GetChildren()[2]);
 				} else if (has_step) {
 					// With a step, an omitted end is written as the `-` end marker (`a[start:-:step]`);
 					// a bare `start::step` does not parse.
 					expr_str << "-";
 				}
 				if (has_step) {
-					expr_str << ":" << ExpressionToAliasedString(func_expr.children[3]);
+					expr_str << ":" << ExpressionToAliasedString(func_expr.GetChildren()[3]);
 				}
 				expr_str << "]";
 				break;
@@ -1504,23 +1610,28 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		// time (Function::EraseArgument) — only the date child remains, so a plain rendering emits
 		// `date_part(d)`, which does not bind. The part names live on as the STRUCT return type's field
 		// names (in order); rebuild the list literal from them.
-		if ((func_expr.function.name == "date_part" || func_expr.function.name == "datepart") &&
-		    func_expr.return_type.id() == LogicalTypeId::STRUCT && func_expr.children.size() == 1) {
-			expr_str << func_expr.function.name << "([";
-			for (idx_t i = 0; i < StructType::GetChildCount(func_expr.return_type); i++) {
+		if ((func_expr.Function().GetName().GetIdentifierName() == "date_part" ||
+		     func_expr.Function().GetName().GetIdentifierName() == "datepart") &&
+		    func_expr.GetReturnType().id() == LogicalTypeId::STRUCT && func_expr.GetChildren().size() == 1) {
+			expr_str << func_expr.Function().GetName().GetIdentifierName() << "([";
+			for (idx_t i = 0; i < StructType::GetChildCount(func_expr.GetReturnType()); i++) {
 				if (i > 0) {
 					expr_str << ", ";
 				}
-				expr_str << "'" << EscapeSingleQuotes(StructType::GetChildName(func_expr.return_type, i)) << "'";
+				expr_str << "'"
+				         << EscapeSingleQuotes(
+				                StructType::GetChildName(func_expr.GetReturnType(), i).GetIdentifierName())
+				         << "'";
 			}
-			expr_str << "], " << ExpressionToAliasedString(func_expr.children[0]) << ")";
+			expr_str << "], " << ExpressionToAliasedString(func_expr.GetChildren()[0]) << ")";
 			break;
 		}
 		ValidateFunctionForDialect(func_expr, dialect);
-		if (dialect == SqlDialect::FELDERA && func_expr.children.size() == 1 &&
-		    (func_expr.function.name == "year" || func_expr.function.name == "month")) {
-			expr_str << "EXTRACT(" << StringUtil::Upper(func_expr.function.name) << " FROM "
-			         << ExpressionToAliasedString(func_expr.children[0]) << ")";
+		if (dialect == SqlDialect::FELDERA && func_expr.GetChildren().size() == 1 &&
+		    (func_expr.Function().GetName().GetIdentifierName() == "year" ||
+		     func_expr.Function().GetName().GetIdentifierName() == "month")) {
+			expr_str << "EXTRACT(" << StringUtil::Upper(func_expr.Function().GetName().GetIdentifierName()) << " FROM "
+			         << ExpressionToAliasedString(func_expr.GetChildren()[0]) << ")";
 			break;
 		}
 		// PostgreSQL has no year()/month()/dayofweek()/... date-part shorthands;
@@ -1530,49 +1641,49 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		// translation one. Only the fields whose DuckDB and SQL-standard
 		// meanings coincide are mapped; anything else falls through to the
 		// generic path and is reported honestly by the target.
-		if (dialect == SqlDialect::POSTGRES && func_expr.children.size() == 1) {
-			const char *extract_field = PostgresExtractField(func_expr.function.name);
+		if (dialect == SqlDialect::POSTGRES && func_expr.GetChildren().size() == 1) {
+			const char *extract_field = PostgresExtractField(func_expr.Function().GetName().GetIdentifierName());
 			if (extract_field != nullptr) {
-				expr_str << "EXTRACT(" << extract_field << " FROM " << ExpressionToAliasedString(func_expr.children[0])
-				         << ")";
+				expr_str << "EXTRACT(" << extract_field << " FROM "
+				         << ExpressionToAliasedString(func_expr.GetChildren()[0]) << ")";
 				break;
 			}
 		}
 		// DuckDB's contains(haystack, needle) -> boolean has no PostgreSQL
 		// equivalent under that name, but strpos() is exactly it once compared
 		// against zero.
-		if (dialect == SqlDialect::POSTGRES && func_expr.function.name == "contains" &&
-		    func_expr.children.size() == 2) {
-			expr_str << "(strpos(" << ExpressionToAliasedString(func_expr.children[0]) << ", "
-			         << ExpressionToAliasedString(func_expr.children[1]) << ") > 0)";
+		if (dialect == SqlDialect::POSTGRES && func_expr.Function().GetName().GetIdentifierName() == "contains" &&
+		    func_expr.GetChildren().size() == 2) {
+			expr_str << "(strpos(" << ExpressionToAliasedString(func_expr.GetChildren()[0]) << ", "
+			         << ExpressionToAliasedString(func_expr.GetChildren()[1]) << ") > 0)";
 			break;
 		}
 		// Dialect-specific function name remapping (see dialect_function_map.hpp).
-		string func_name = RemapFunctionNameForDialect(func_expr.function.name, dialect);
-		// For lambda functions, only serialize non-lambda, non-capture children
-		idx_t child_count = func_expr.children.size();
-		if (func_expr.function.bind_lambda != nullptr) {
-			child_count = 0;
-			for (auto &arg_type : func_expr.function.arguments) {
-				if (arg_type.id() != LogicalTypeId::LAMBDA) {
-					child_count++;
-				}
-			}
-			if (child_count > func_expr.children.size()) {
-				child_count = func_expr.children.size();
+		string func_name = RemapFunctionNameForDialect(func_expr.Function().GetName().GetIdentifierName(), dialect);
+		// Lambda children remain in the 2.0 expression tree; captures follow the
+		// declared arguments. Use the native parameter count, including unused parameters.
+		idx_t child_count = func_expr.GetChildren().size();
+		const BoundLambdaExpression *bound_lambda = nullptr;
+		idx_t native_lambda_pos = child_count;
+		for (idx_t i = 0; i < func_expr.GetChildren().size(); i++) {
+			if (func_expr.GetChildren()[i]->GetExpressionClass() == ExpressionClass::BOUND_LAMBDA) {
+				bound_lambda = &func_expr.GetChildren()[i]->Cast<BoundLambdaExpression>();
+				native_lambda_pos = i;
+				child_count = MinValue<idx_t>(child_count, func_expr.Function().GetArguments().size());
+				break;
 			}
 		}
 		// Operators: use infix notation (e.g. "a + b").
 		// Some plan rewrites (like AVG decomposition) create operator functions
 		// without setting is_operator. Fall back to name-based detection.
 		bool is_infix =
-		    func_expr.is_operator || (child_count == 2 && (func_name == "/" || func_name == "+" || func_name == "-" ||
-		                                                   func_name == "*" || func_name == "%" || func_name == "||"));
+		    func_expr.IsOperator() || (child_count == 2 && (func_name == "/" || func_name == "+" || func_name == "-" ||
+		                                                    func_name == "*" || func_name == "%" || func_name == "||"));
 		if (is_infix && child_count == 2) {
 			expr_str << "(";
-			expr_str << ExpressionToAliasedString(func_expr.children[0]);
+			expr_str << ExpressionToAliasedString(func_expr.GetChildren()[0]);
 			expr_str << " " << func_name << " ";
-			expr_str << ExpressionToAliasedString(func_expr.children[1]);
+			expr_str << ExpressionToAliasedString(func_expr.GetChildren()[1]);
 			expr_str << ")";
 		} else {
 			// struct_pack uses `field := expr` syntax; field names live in the
@@ -1580,8 +1691,8 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			// names — the re-binder then uses each child's column alias (e.g.
 			// "t0_I_NAME") as the struct field name.
 			const bool is_struct_pack = (func_name == "struct_pack" || func_name == "row") &&
-			                            func_expr.return_type.id() == LogicalTypeId::STRUCT &&
-			                            !StructType::IsUnnamed(func_expr.return_type);
+			                            func_expr.GetReturnType().id() == LogicalTypeId::STRUCT &&
+			                            !StructType::IsUnnamed(func_expr.GetReturnType());
 			// Some function names collide with SQL keywords (POSITION, SUBSTRING,
 			// OVERLAY, TRIM). DuckDB's parser rejects them as plain identifiers and
 			// expects the keyword-separator syntax (`POSITION(x IN y)`), but it
@@ -1593,16 +1704,23 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			                                 func_name == "overlay" || func_name == "trim")) {
 				emit_name = "\"" + func_name + "\"";
 			}
+			if (IsDuckDBDialect(dialect) && func_expr.Function().GetQualifiedName().Path().size() > 1) {
+				emit_name = FunctionNameForDialect(func_expr.Function(), func_name, dialect);
+			}
 			if (dialect == SqlDialect::SPARK &&
-			    (func_expr.function.name == "struct_pack" || func_expr.function.name == "row") &&
-			    func_expr.return_type.id() == LogicalTypeId::STRUCT && !StructType::IsUnnamed(func_expr.return_type)) {
+			    (func_expr.Function().GetName().GetIdentifierName() == "struct_pack" ||
+			     func_expr.Function().GetName().GetIdentifierName() == "row") &&
+			    func_expr.GetReturnType().id() == LogicalTypeId::STRUCT &&
+			    !StructType::IsUnnamed(func_expr.GetReturnType())) {
 				expr_str << "named_struct(";
 				for (idx_t i = 0; i < child_count; i++) {
 					if (i > 0) {
 						expr_str << ", ";
 					}
-					expr_str << "'" << EscapeSingleQuotes(StructType::GetChildName(func_expr.return_type, i)) << "', "
-					         << ExpressionToAliasedString(func_expr.children[i]);
+					expr_str << "'"
+					         << EscapeSingleQuotes(
+					                StructType::GetChildName(func_expr.GetReturnType(), i).GetIdentifierName())
+					         << "', " << ExpressionToAliasedString(func_expr.GetChildren()[i]);
 				}
 				expr_str << ")";
 				break;
@@ -1612,37 +1730,38 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 			// refuse other units until they have a verified Spark equivalent.
 			if (dialect == SqlDialect::SPARK && (func_name == "datediff" || func_name == "date_diff") &&
 			    child_count == 3) {
-				string unit = UnquotedDatetimeUnitLiteral(func_expr.children[0]);
+				string unit = UnquotedDatetimeUnitLiteral(func_expr.GetChildren()[0]);
 				if (unit != "DAY") {
 					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", func_name,
 					                        "BOUND_FUNCTION",
 					                        "Spark 3.5 only has a verified date_diff mapping for DAY");
 				}
-				expr_str << "datediff(" << ExpressionToAliasedString(func_expr.children[2]) << ", "
-				         << ExpressionToAliasedString(func_expr.children[1]) << ")";
+				expr_str << "datediff(" << ExpressionToAliasedString(func_expr.GetChildren()[2]) << ", "
+				         << ExpressionToAliasedString(func_expr.GetChildren()[1]) << ")";
 				break;
 			}
 			// Feldera takes the three-argument datediff unit as a bare keyword.
 			if (dialect == SqlDialect::FELDERA && (func_name == "datediff" || func_name == "date_diff") &&
 			    child_count >= 1) {
-				string unit = UnquotedDatetimeUnitLiteral(func_expr.children[0]);
+				string unit = UnquotedDatetimeUnitLiteral(func_expr.GetChildren()[0]);
 				if (!unit.empty()) {
 					expr_str << emit_name << "(" << unit;
 					for (idx_t i = 1; i < child_count; i++) {
-						expr_str << ", " << ExpressionToAliasedString(func_expr.children[i]);
+						expr_str << ", " << ExpressionToAliasedString(func_expr.GetChildren()[i]);
 					}
 					expr_str << ")";
 					break;
 				}
 			}
 			expr_str << emit_name << "(";
-			if (UsesFormatFirstDateFunctionArgumentOrder(func_expr.function.name, dialect) && child_count >= 2) {
-				expr_str << ExpressionToAliasedString(func_expr.children[1]);
+			if (UsesFormatFirstDateFunctionArgumentOrder(func_expr.Function().GetName().GetIdentifierName(), dialect) &&
+			    child_count >= 2) {
+				expr_str << ExpressionToAliasedString(func_expr.GetChildren()[1]);
 				expr_str << ", ";
-				expr_str << ExpressionToAliasedString(func_expr.children[0]);
+				expr_str << ExpressionToAliasedString(func_expr.GetChildren()[0]);
 				for (idx_t i = 2; i < child_count; i++) {
 					expr_str << ", ";
-					expr_str << ExpressionToAliasedString(func_expr.children[i]);
+					expr_str << ExpressionToAliasedString(func_expr.GetChildren()[i]);
 				}
 			} else {
 				// Functions with NAMED arguments (`struct_insert(s, a := x)`, `write_log(msg, level := 'x')`):
@@ -1654,18 +1773,12 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 				// appending the lambda after the children would swap the arguments.
 				string lambda_text;
 				idx_t lambda_arg_pos = child_count; // default: append after all children
-				if (func_expr.function.bind_lambda != nullptr && func_expr.bind_info) {
-					auto &bind_data = func_expr.bind_info->Cast<ListLambdaBindData>();
-					if (bind_data.lambda_expr) {
-						for (idx_t ai = 0; ai < func_expr.function.arguments.size(); ai++) {
-							if (func_expr.function.arguments[ai].id() == LogicalTypeId::LAMBDA) {
-								lambda_arg_pos = ai;
-								break;
-							}
-						}
+				if (bound_lambda) {
+					if (bound_lambda->LambdaExpr()) {
+						lambda_arg_pos = native_lambda_pos;
 						std::ostringstream lam;
 						std::map<idx_t, string> param_map;
-						CollectLambdaParamNames(*bind_data.lambda_expr, param_map);
+						CollectLambdaParamNames(*bound_lambda->LambdaExpr(), param_map);
 						idx_t total_refs = param_map.empty() ? 0 : param_map.rbegin()->first + 1;
 						// A lambda that closes over outer columns binds them as trailing "parameters": the real
 						// lambda parameters occupy body indices [0, real_count) (reverse declaration order) and the
@@ -1673,21 +1786,10 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 						// (child_count..). Only the real parameters go in the lambda's parameter list; captures are
 						// rendered as the outer expression (so LPTS's column renaming applies), else e.g.
 						// `x -> x + n` would render `lambda n, x: x + n` and shadow the outer column.
-						idx_t capture_count =
-						    func_expr.children.size() > child_count ? func_expr.children.size() - child_count : 0;
-						idx_t real_count = total_refs > capture_count ? total_refs - capture_count : total_refs;
-						// A fully constant-folded body (e.g. reducing an empty list) references no parameters,
-						// but the emitted lambda must still declare the arity the function requires —
-						// `lambda : body` does not parse. Pad with unused placeholders (only when no captures
-						// shift the body indices).
-						const idx_t min_params =
-						    (func_expr.function.name == "list_reduce" || func_expr.function.name == "array_reduce" ||
-						     func_expr.function.name == "reduce")
-						        ? 2
-						        : 1;
-						if ((capture_count == 0 || total_refs == 0) && real_count < min_params) {
-							real_count = min_params;
-						}
+						idx_t capture_count = func_expr.GetChildren().size() > child_count
+						                          ? func_expr.GetChildren().size() - child_count
+						                          : 0;
+						const idx_t real_count = bound_lambda->ParameterCount();
 						vector<string> param_names(real_count);
 						for (idx_t idx = 0; idx < real_count; idx++) {
 							auto it = param_map.find(idx);
@@ -1701,8 +1803,8 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 						std::map<idx_t, string> captures;
 						for (idx_t idx = real_count; idx < total_refs; idx++) {
 							const idx_t cap_child = child_count + (idx - real_count);
-							if (cap_child < func_expr.children.size()) {
-								captures[idx] = ExpressionToAliasedString(func_expr.children[cap_child]);
+							if (cap_child < func_expr.GetChildren().size()) {
+								captures[idx] = ExpressionToAliasedString(func_expr.GetChildren()[cap_child]);
 							}
 						}
 						// A lambda parameter must not SHADOW a captured outer column: the capture renders as
@@ -1757,7 +1859,7 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 						auto saved_params = lambda_param_names;
 						lambda_captures = std::move(captures);
 						lambda_param_names = std::move(body_param_names);
-						lam << ExpressionToAliasedString(bind_data.lambda_expr);
+						lam << ExpressionToAliasedString(bound_lambda->LambdaExpr());
 						lambda_captures = std::move(saved_captures);
 						lambda_param_names = std::move(saved_params);
 						lambda_text = lam.str();
@@ -1765,6 +1867,13 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 				}
 				const bool uses_named_arguments =
 				    func_name == "struct_insert" || func_name == "struct_update" || func_name == "write_log";
+				const auto &native_named_arguments = func_expr.Function().GetNamedArguments();
+				const idx_t positional_argument_count = func_expr.Function().GetPositionalArgumentCount();
+				if (!native_named_arguments.empty() &&
+				    positional_argument_count + native_named_arguments.size() != child_count) {
+					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_FUNCTION", dialect, "function", func_name,
+					                        "BOUND_FUNCTION", "the bound function retained incomplete named arguments");
+				}
 				idx_t emitted = 0;
 				for (idx_t i = 0; i < child_count; i++) {
 					if (!lambda_text.empty() && i == lambda_arg_pos) {
@@ -1772,29 +1881,32 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 							expr_str << ", ";
 						}
 						expr_str << lambda_text;
+						continue;
 					}
 					if (emitted++ > 0) {
 						expr_str << ", ";
 					}
-					if (is_struct_pack && i < StructType::GetChildCount(func_expr.return_type)) {
-						expr_str << "\"" << StructType::GetChildName(func_expr.return_type, i) << "\" := ";
-					} else if (uses_named_arguments && i > 0 && func_expr.children[i]->HasAlias() &&
-					           func_expr.children[i]->GetAlias().find('(') == string::npos) {
-						expr_str << "\"" << func_expr.children[i]->GetAlias() << "\" := ";
+					if (is_struct_pack && i < StructType::GetChildCount(func_expr.GetReturnType())) {
+						expr_str << "\"" << StructType::GetChildName(func_expr.GetReturnType(), i) << "\" := ";
+					} else if (!native_named_arguments.empty() && i >= positional_argument_count) {
+						expr_str << SQLIdentifier(native_named_arguments[i - positional_argument_count]) << " := ";
+					} else if (uses_named_arguments && i > 0 && func_expr.GetChildren()[i]->HasAlias() &&
+					           func_expr.GetChildren()[i]->GetAlias().GetIdentifierName().find('(') == string::npos) {
+						expr_str << "\"" << func_expr.GetChildren()[i]->GetAlias().GetIdentifierName() << "\" := ";
 					}
 					string converted_date_format;
-					if (i == 1 && IsDateFormatFunction(func_expr.function.name) &&
-					    TryRenderConvertedDateFormat(func_expr.children[i], dialect, converted_date_format)) {
+					if (i == 1 && IsDateFormatFunction(func_expr.Function().GetName().GetIdentifierName()) &&
+					    TryRenderConvertedDateFormat(func_expr.GetChildren()[i], dialect, converted_date_format)) {
 						expr_str << converted_date_format;
 					} else if (func_name == "equi_width_bins" &&
-					           func_expr.children[i]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
-					           func_expr.children[i]->return_type.id() == LogicalTypeId::VARCHAR) {
+					           func_expr.GetChildren()[i]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+					           func_expr.GetChildren()[i]->GetReturnType().id() == LogicalTypeId::VARCHAR) {
 						// equi_width_bins is overloaded on VARCHAR vs numeric/timestamp; a bare string
 						// literal re-binds as STRING_LITERAL (castable to all) — "could not choose a best
 						// candidate". Pin the VARCHAR overload with an explicit cast.
-						expr_str << "CAST(" << ExpressionToAliasedString(func_expr.children[i]) << " AS VARCHAR)";
+						expr_str << "CAST(" << ExpressionToAliasedString(func_expr.GetChildren()[i]) << " AS VARCHAR)";
 					} else {
-						expr_str << ExpressionToAliasedString(func_expr.children[i]);
+						expr_str << ExpressionToAliasedString(func_expr.GetChildren()[i]);
 					}
 				}
 				if (!lambda_text.empty() && lambda_arg_pos >= child_count) {
@@ -1815,11 +1927,11 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		// Inside a lambda body, a captured outer column is a trailing BoundReferenceExpression — render it as
 		// the captured outer expression (see the lambda rendering), not as a lambda parameter name.
 		const auto &ref = expression->Cast<BoundReferenceExpression>();
-		auto cap = lambda_captures.find(ref.index);
+		auto cap = lambda_captures.find(ref.Index());
 		if (cap != lambda_captures.end()) {
 			expr_str << cap->second;
 		} else {
-			auto par = lambda_param_names.find(ref.index);
+			auto par = lambda_param_names.find(ref.Index());
 			if (par != lambda_param_names.end()) {
 				expr_str << par->second;
 			} else {
@@ -1835,12 +1947,12 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	case ExpressionClass::BOUND_CASE: {
 		const BoundCaseExpression &case_expr = expression->Cast<BoundCaseExpression>();
 		expr_str << "CASE";
-		for (auto &check : case_expr.case_checks) {
+		for (auto &check : case_expr.CaseChecks()) {
 			expr_str << " WHEN " << ExpressionToAliasedString(check.when_expr);
 			expr_str << " THEN " << ExpressionToAliasedString(check.then_expr);
 		}
-		if (case_expr.else_expr) {
-			expr_str << " ELSE " << ExpressionToAliasedString(case_expr.else_expr);
+		if (case_expr.ElseExpression()) {
+			expr_str << " ELSE " << ExpressionToAliasedString(case_expr.ElseExpression());
 		}
 		expr_str << " END";
 		break;
@@ -1849,49 +1961,49 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 		const BoundOperatorExpression &op_expr = expression->Cast<BoundOperatorExpression>();
 		switch (op_expr.GetExpressionType()) {
 		case ExpressionType::OPERATOR_IS_NULL:
-			expr_str << "(" << ExpressionToAliasedString(op_expr.children[0]) << ") IS NULL";
+			expr_str << "(" << ExpressionToAliasedString(op_expr.GetChildren()[0]) << ") IS NULL";
 			break;
 		case ExpressionType::OPERATOR_IS_NOT_NULL:
-			expr_str << "(" << ExpressionToAliasedString(op_expr.children[0]) << ") IS NOT NULL";
+			expr_str << "(" << ExpressionToAliasedString(op_expr.GetChildren()[0]) << ") IS NOT NULL";
 			break;
 		case ExpressionType::OPERATOR_NOT:
-			expr_str << "NOT (" << ExpressionToAliasedString(op_expr.children[0]) << ")";
+			expr_str << "NOT (" << ExpressionToAliasedString(op_expr.GetChildren()[0]) << ")";
 			break;
 		case ExpressionType::COMPARE_IN:
 		case ExpressionType::COMPARE_NOT_IN: {
 			const bool is_not_in = op_expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN;
-			expr_str << "(" << ExpressionToAliasedString(op_expr.children[0]) << ")";
+			expr_str << "(" << ExpressionToAliasedString(op_expr.GetChildren()[0]) << ")";
 			expr_str << (is_not_in ? " NOT IN (" : " IN (");
-			for (idx_t i = 1; i < op_expr.children.size(); i++) {
+			for (idx_t i = 1; i < op_expr.GetChildren().size(); i++) {
 				if (i > 1) {
 					expr_str << ", ";
 				}
-				expr_str << ExpressionToAliasedString(op_expr.children[i]);
+				expr_str << ExpressionToAliasedString(op_expr.GetChildren()[i]);
 			}
 			expr_str << ")";
 			break;
 		}
 		case ExpressionType::OPERATOR_COALESCE: {
 			expr_str << "COALESCE(";
-			for (idx_t i = 0; i < op_expr.children.size(); i++) {
+			for (idx_t i = 0; i < op_expr.GetChildren().size(); i++) {
 				if (i > 0) {
 					expr_str << ", ";
 				}
-				expr_str << ExpressionToAliasedString(op_expr.children[i]);
+				expr_str << ExpressionToAliasedString(op_expr.GetChildren()[i]);
 			}
 			expr_str << ")";
 			break;
 		}
 		case ExpressionType::OPERATOR_NULLIF:
-			expr_str << "NULLIF(" << ExpressionToAliasedString(op_expr.children[0]) << ", "
-			         << ExpressionToAliasedString(op_expr.children[1]) << ")";
+			expr_str << "NULLIF(" << ExpressionToAliasedString(op_expr.GetChildren()[0]) << ", "
+			         << ExpressionToAliasedString(op_expr.GetChildren()[1]) << ")";
 			break;
 		case ExpressionType::OPERATOR_TRY:
 			if (!IsDuckDBDialect(dialect)) {
 				ThrowLptsNotImplemented("LPTS_DIALECT_SEMANTIC_RISK", dialect, "operator", "TRY", "BOUND_OPERATOR",
 				                        "TRY expression has dialect-specific semantics");
 			}
-			expr_str << "TRY(" << ExpressionToAliasedString(op_expr.children[0]) << ")";
+			expr_str << "TRY(" << ExpressionToAliasedString(op_expr.GetChildren()[0]) << ")";
 			break;
 		default:
 			ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "expression_operator",
@@ -1903,7 +2015,7 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	case ExpressionClass::BOUND_UNNEST: {
 		const BoundUnnestExpression &unnest_expr = expression->Cast<BoundUnnestExpression>();
 		expr_str << (dialect == SqlDialect::SPARK ? "explode(" : "UNNEST(")
-		         << ExpressionToAliasedString(unnest_expr.child) << ")";
+		         << ExpressionToAliasedString(unnest_expr.Child()) << ")";
 		break;
 	}
 	case ExpressionClass::BOUND_WINDOW: {
@@ -1913,8 +2025,27 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 	}
 	default:
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "expression_class",
-		                        ExpressionTypeToString(expression->type), "ExpressionToAliasedString",
+		                        ExpressionTypeToString(expression->GetExpressionType()), "ExpressionToAliasedString",
 		                        "expression class is not implemented by LPTS");
+	}
+	// A bound column's collation is already supplied by its source expression/table. Re-applying the
+	// planner's return-type collation here is not only redundant: DuckDB can unify nested expression types
+	// across sibling aggregates/set operations, so that annotation may belong to a sibling rather than this
+	// column. Preserve collations only on expressions that actually construct a new VARCHAR value.
+	if (IsDuckDBDialect(dialect) && e_class != ExpressionClass::BOUND_CONSTANT &&
+	    e_class != ExpressionClass::BOUND_COLUMN_REF && expression->GetReturnType().id() == LogicalTypeId::VARCHAR) {
+		const auto &collation = StringType::GetCollation(expression->GetReturnType());
+		if (!collation.empty()) {
+			string rendered = expr_str.str();
+			if (e_class == ExpressionClass::BOUND_FUNCTION) {
+				const auto &function = expression->Cast<BoundFunctionExpression>().Function();
+				const auto &definition = function.GetDefinition();
+				if (definition && definition->GetSignature().GetReturnType().id() != LogicalTypeId::VARCHAR) {
+					rendered = "CAST(" + rendered + " AS VARCHAR)";
+				}
+			}
+			return "(" + rendered + ") COLLATE " + SQLIdentifier(collation);
+		}
 	}
 	return expr_str.str();
 }

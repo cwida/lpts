@@ -17,6 +17,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/simplified_token.hpp"
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -31,6 +33,8 @@
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context_state.hpp"
@@ -47,12 +51,13 @@
 #include "duckdb/parser/parsed_data/create_pragma_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/planner_extension.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/common/enums/optimizer_type.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/build_probe_side_optimizer.hpp"
 #include "duckdb/optimizer/column_lifetime_analyzer.hpp"
 #include "duckdb/optimizer/common_aggregate_optimizer.hpp"
-#include "duckdb/optimizer/common_subplan_optimizer.hpp"
 #include "duckdb/optimizer/cse_optimizer.hpp"
 #include "duckdb/optimizer/cte_filter_pusher.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
@@ -73,16 +78,72 @@
 #include "duckdb/optimizer/row_group_pruner.hpp"
 #include "duckdb/optimizer/sampling_pushdown.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
-#include "duckdb/optimizer/sum_rewriter.hpp"
+#include "duckdb/optimizer/aggregate_function_rewriter.hpp"
 #include "duckdb/optimizer/topn_optimizer.hpp"
 #include "duckdb/optimizer/topn_window_elimination.hpp"
 #include "duckdb/optimizer/unnest_rewriter.hpp"
 #include "duckdb/optimizer/window_self_join.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/common/enums/debug_statement_verification.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 
 namespace duckdb {
+
+static constexpr const char *LPTS_CURRENT_TIMESTAMP_FUNCTION = "lpts_internal_current_timestamp";
+static constexpr const char *LPTS_CHECK_VERDICT_FUNCTION = "lpts_internal_check_verdict";
+static thread_local idx_t lpts_planning_depth = 0;
+
+class LptsPlanningScope {
+public:
+	LptsPlanningScope() {
+		lpts_planning_depth++;
+	}
+
+	~LptsPlanningScope() {
+		D_ASSERT(lpts_planning_depth > 0);
+		lpts_planning_depth--;
+	}
+};
+
+static void LptsCurrentTimestampFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+	D_ASSERT(input.ColumnCount() == 0);
+	auto timestamp = MetaTransaction::Get(state.GetContext()).start_timestamp;
+	result.Reference(Value::TIMESTAMPTZ(timestamp_tz_t(timestamp)), count_t(input.size()));
+}
+
+static GetSQLValueFunctionReturnType LptsGetSQLValueFunction(PlannerExtensionInput &, const string &column_name,
+                                                             unique_ptr<ParsedExpression> &result) {
+	if (lpts_planning_depth == 0 || !StringUtil::CIEquals(column_name, "current_timestamp")) {
+		return GetSQLValueFunctionReturnType::CONTINUE_BINDING;
+	}
+	result = make_uniq<FunctionExpression>(Identifier(LPTS_CURRENT_TIMESTAMP_FUNCTION),
+	                                       vector<unique_ptr<ParsedExpression>>());
+	return GetSQLValueFunctionReturnType::FINISH_BINDING;
+}
+
+static void PreserveCurrentTimestampCalls(ParsedExpression &expression) {
+	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression.Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+		if (function.GetQualifiedName().Path().size() == 1 &&
+		    (name == "now" || name == "get_current_timestamp" || name == "transaction_timestamp")) {
+			function.SetFunctionName(LPTS_CURRENT_TIMESTAMP_FUNCTION);
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(expression,
+	                                            [](ParsedExpression &child) { PreserveCurrentTimestampCalls(child); });
+}
+
+static void PreserveCurrentTimestampCalls(SQLStatement &statement) {
+	if (statement.type != StatementType::SELECT_STATEMENT) {
+		return;
+	}
+	auto &select = statement.Cast<SelectStatement>();
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    *select.node, [](unique_ptr<ParsedExpression> &expression) { PreserveCurrentTimestampCalls(*expression); });
+}
 
 //------------------------------------------------------------------------------
 // Helper: read lpts_dialect from the session settings.
@@ -90,7 +151,7 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 static SqlDialect ReadDialect(ClientContext &context) {
 	Value dialect_val;
-	if (context.TryGetCurrentSetting("lpts_dialect", dialect_val)) {
+	if (context.TryGetCurrentSetting(Identifier("lpts_dialect"), dialect_val)) {
 		return ParseSqlDialect(dialect_val.GetValue<string>());
 	}
 	return SqlDialect::DUCKDB;
@@ -99,7 +160,7 @@ static SqlDialect ReadDialect(ClientContext &context) {
 // Helper: read lpts_merge_pipeline from the session settings (defaults to true).
 static bool ReadMergePipeline(ClientContext &context) {
 	Value setting;
-	if (context.TryGetCurrentSetting("lpts_merge_pipeline", setting)) {
+	if (context.TryGetCurrentSetting(Identifier("lpts_merge_pipeline"), setting)) {
 		return setting.GetValue<bool>();
 	}
 	return true;
@@ -107,7 +168,7 @@ static bool ReadMergePipeline(ClientContext &context) {
 
 static bool EnableDataDependentOptimizers(ClientContext &context) {
 	Value setting;
-	if (context.TryGetCurrentSetting("lpts_enable_data_dependent_optimizers", setting)) {
+	if (context.TryGetCurrentSetting(Identifier("lpts_enable_data_dependent_optimizers"), setting)) {
 		return setting.GetValue<bool>();
 	}
 	return false;
@@ -146,6 +207,61 @@ static void LptsRunOptimizer(ClientContext &context, OptimizerType type, const s
 	callback();
 }
 
+static bool TypeContainsAggregateState(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::LEGACY_AGGREGATE_STATE || type.IsAggregateState()) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+		return TypeContainsAggregateState(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return TypeContainsAggregateState(ArrayType::GetChildType(type));
+	case LogicalTypeId::STRUCT:
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsAggregateState(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::MAP:
+		return TypeContainsAggregateState(MapType::KeyType(type)) ||
+		       TypeContainsAggregateState(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+static bool PlanContainsAggregateState(LogicalOperator &op) {
+	for (const auto &type : op.types) {
+		if (TypeContainsAggregateState(type)) {
+			return true;
+		}
+	}
+	for (auto &expression : op.expressions) {
+		bool found = false;
+		ExpressionIterator::EnumerateExpression(
+		    expression, [&](Expression &child) { found = found || TypeContainsAggregateState(child.GetReturnType()); });
+		if (found) {
+			return true;
+		}
+	}
+	for (auto &child : op.children) {
+		if (PlanContainsAggregateState(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void ClearStaleProjectionMaps(LogicalOperator &op) {
+	for (idx_t child_index = 0; child_index < op.children.size(); child_index++) {
+		if (auto projection_map = LogicalOperatorVisitor::GetProjectionMap(op, child_index)) {
+			projection_map->clear();
+		}
+		ClearStaleProjectionMaps(*op.children[child_index]);
+	}
+}
+
 static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &context, Binder &binder,
                                                             unique_ptr<LogicalOperator> plan,
                                                             bool preserve_wall_clock) {
@@ -166,6 +282,7 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 	}
 
 	Optimizer optimizer(binder, context);
+	const bool preserve_aggregate_state = PlanContainsAggregateState(*plan);
 	if (!preserve_wall_clock) {
 		LptsRunOptimizer(context, OptimizerType::EXPRESSION_REWRITER,
 		                 [&]() { optimizer.rewriter.VisitOperator(*plan); });
@@ -176,8 +293,8 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 		plan = cte_inlining.Optimize(std::move(plan));
 	});
 
-	LptsRunOptimizer(context, OptimizerType::SUM_REWRITER, [&]() {
-		SumRewriterOptimizer sum_rewriter(optimizer);
+	LptsRunOptimizer(context, OptimizerType::AGGREGATE_FUNCTION_REWRITER, [&]() {
+		AggregateFunctionRewriter sum_rewriter(optimizer);
 		sum_rewriter.Optimize(plan);
 	});
 
@@ -186,12 +303,17 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 		plan = filter_pullup.Rewrite(std::move(plan));
 	});
 
-	LptsRunOptimizer(context, OptimizerType::FILTER_PUSHDOWN, [&]() {
-		FilterPushdown filter_pushdown(optimizer);
-		unordered_set<idx_t> top_bindings;
-		filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
-		plan = filter_pushdown.Rewrite(std::move(plan));
-	});
+	// DuckDB 2.0's filter pushdown turns a provably-empty scan into an EmptyResult whose output type is the
+	// legacy AGGREGATE_STATE placeholder. That placeholder has already lost the function/signature metadata
+	// needed to emit to_aggregate_state(...), so keep the original filter and state-bearing scan intact.
+	if (!preserve_aggregate_state) {
+		LptsRunOptimizer(context, OptimizerType::FILTER_PUSHDOWN, [&]() {
+			FilterPushdown filter_pushdown(optimizer);
+			unordered_set<TableIndex> top_bindings;
+			filter_pushdown.CheckMarkToSemi(*plan, top_bindings);
+			plan = filter_pushdown.Rewrite(std::move(plan));
+		});
+	}
 
 	LptsRunOptimizer(context, OptimizerType::CTE_FILTER_PUSHER, [&]() {
 		CTEFilterPusher cte_filter_pusher(optimizer);
@@ -209,7 +331,7 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 	});
 
 	LptsRunOptimizer(context, OptimizerType::DELIMINATOR, [&]() {
-		Deliminator deliminator;
+		Deliminator deliminator(context);
 		plan = deliminator.Optimize(std::move(plan));
 	});
 
@@ -239,17 +361,21 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 	});
 
 	LptsRunOptimizer(context, OptimizerType::UNNEST_REWRITER, [&]() {
-		UnnestRewriter unnest_rewriter;
+		UnnestRewriter unnest_rewriter(context);
 		plan = unnest_rewriter.Optimize(std::move(plan));
 	});
 
 	LptsRunOptimizer(context, OptimizerType::UNUSED_COLUMNS, [&]() {
+		// DuckDB 2.0's column pruner renumbers bindings. Projection maps left by
+		// earlier rewrites can then point past the child; native DuckDB clears them
+		// before re-pruning for the same reason. COLUMN_LIFETIME recreates them below.
+		ClearStaleProjectionMaps(*plan);
 		RemoveUnusedColumns unused(optimizer);
-		unused.VisitOperator(*plan);
+		unused.VisitOperator(plan);
 	});
 
 	LptsRunOptimizer(context, OptimizerType::DUPLICATE_GROUPS, [&]() {
-		RemoveDuplicateGroups duplicate_groups;
+		RemoveDuplicateGroups duplicate_groups(optimizer);
 		duplicate_groups.VisitOperator(*plan);
 	});
 
@@ -269,8 +395,7 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 	});
 
 	LptsRunOptimizer(context, OptimizerType::COMMON_SUBPLAN, [&]() {
-		CommonSubplanOptimizer common_subplan(optimizer);
-		plan = common_subplan.Optimize(std::move(plan));
+		plan = CompactCommonSubplans(context, binder, std::move(plan), CommonSubplanCompactionMode::SERIALIZATION_SIZE);
 	});
 
 	LptsRunOptimizer(context, OptimizerType::LIMIT_PUSHDOWN, [&]() {
@@ -284,7 +409,7 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 	});
 
 	LptsRunOptimizer(context, OptimizerType::SAMPLING_PUSHDOWN, [&]() {
-		SamplingPushdown sampling_pushdown;
+		SamplingPushdown sampling_pushdown(context);
 		plan = sampling_pushdown.Optimize(std::move(plan));
 	});
 
@@ -300,7 +425,7 @@ static unique_ptr<LogicalOperator> LptsOptimizeConservative(ClientContext &conte
 
 	column_binding_map_t<unique_ptr<BaseStatistics>> statistics_map;
 	LptsRunOptimizer(context, OptimizerType::STATISTICS_PROPAGATION, [&]() {
-		StatisticsPropagator propagator(optimizer, *plan);
+		StatisticsPropagator propagator(optimizer, plan);
 		propagator.PropagateStatistics(plan);
 		statistics_map = propagator.GetStatisticsMap();
 	});
@@ -368,19 +493,28 @@ static unique_ptr<LogicalOperator> LptsOptimizePlan(ClientContext &context, Bind
 ///   - REORDER_FILTER: only reorders expressions inside LogicalFilter nodes — safe.
 ///   - JOIN_FILTER_PUSHDOWN: attaches runtime dynamic filters to join/scan nodes; disabled
 ///     by default because LPTS serializes a static SQL string.
-static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query) {
+static unique_ptr<LogicalOperator> PlanQuery(ClientContext &context, const string &query,
+                                             bool native_optimizer = false) {
 	SqlDialect input_dialect = ReadInputDialect(context);
 	string normalized = NormalizeInputSqlToDuckDB(query, input_dialect);
-	Parser parser(context.GetParserOptions());
+	Parser parser(context);
 	parser.ParseQuery(normalized);
 	if (parser.statements.empty()) {
 		throw ParserException("Failed to parse query: %s", normalized);
 	}
+	PreserveCurrentTimestampCalls(*parser.statements[0]);
+	LptsPlanningScope planning_scope;
 	Planner planner(context);
 	planner.CreatePlan(parser.statements[0]->Copy());
 
-	auto result =
-	    LptsOptimizePlan(context, *planner.binder, std::move(planner.plan), HasWallClockFunctionSQL(normalized));
+	unique_ptr<LogicalOperator> result;
+	if (native_optimizer) {
+		Optimizer optimizer(*planner.binder, context);
+		result = optimizer.Optimize(std::move(planner.plan));
+	} else {
+		result =
+		    LptsOptimizePlan(context, *planner.binder, std::move(planner.plan), HasWallClockFunctionSQL(normalized));
+	}
 
 #if LPTS_DEBUG
 	LPTS_DEBUG_PRINT("[LPTS] ===== Optimized logical plan =====");
@@ -435,7 +569,7 @@ struct LptsGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> BindSingleSqlResult(string result_sql, vector<LogicalType> &return_types,
-                                                    vector<string> &names) {
+                                                    vector<Identifier> &names) {
 	auto result = make_uniq<LptsBindData>();
 	result->result_sql = std::move(result_sql);
 
@@ -446,7 +580,7 @@ static unique_ptr<FunctionData> BindSingleSqlResult(string result_sql, vector<Lo
 }
 
 static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto query = StringValue::Get(input.inputs[0]);
 	auto plan = PlanQuery(context, query);
 
@@ -463,7 +597,7 @@ static unique_ptr<FunctionData> LptsTableBind(ClientContext &context, TableFunct
 }
 
 static unique_ptr<FunctionData> LptsNormalizeTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto query = StringValue::Get(input.inputs[0]);
 	SqlDialect input_dialect = ReadInputDialect(context);
 
@@ -507,7 +641,7 @@ struct PrintAstBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> PrintAstTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto query = StringValue::Get(input.inputs[0]);
 	auto plan = PlanQuery(context, query);
 
@@ -699,14 +833,14 @@ static bool FindLptsExplainSentinel(LogicalOperator &op, string &inner_out) {
 	bool found = false;
 	for (auto &expr : op.expressions) {
 		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
-			if (found || child.type != ExpressionType::VALUE_CONSTANT) {
+			if (found || child.GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 				return;
 			}
 			auto &constant = child.Cast<BoundConstantExpression>();
-			if (constant.value.type().id() != LogicalTypeId::VARCHAR || constant.value.IsNull()) {
+			if (constant.GetValue().type().id() != LogicalTypeId::VARCHAR || constant.GetValue().IsNull()) {
 				return;
 			}
-			auto str = StringValue::Get(constant.value);
+			auto str = StringValue::Get(constant.GetValue());
 			if (StringUtil::StartsWith(str, sentinel)) {
 				inner_out = str.substr(sentinel.size());
 				found = true;
@@ -757,7 +891,7 @@ static void LptsExplainSqlOptimize(OptimizerExtensionInput &input, unique_ptr<Lo
 	chunk.SetCardinality(1);
 	collection->Append(chunk);
 
-	idx_t table_index = input.optimizer.binder.GenerateTableIndex();
+	TableIndex table_index = input.optimizer.binder.GenerateTableIndex();
 	plan = make_uniq<LogicalColumnDataGet>(table_index, std::move(types), std::move(collection));
 }
 
@@ -803,6 +937,26 @@ static void LptsCheckAppendLog(const string &path, idx_t qnum, const string &sta
 	if (f) {
 		f << qnum << " " << status << "\n";
 	}
+}
+
+static bool IsIntentionalLptsRefusal(const string &error_text) {
+	idx_t position = error_text.find("LPTS_");
+	while (position != string::npos) {
+		idx_t code_end = position + 5;
+		while (code_end < error_text.size()) {
+			const char current = error_text[code_end];
+			if ((current >= 'A' && current <= 'Z') || (current >= '0' && current <= '9') || current == '_') {
+				code_end++;
+				continue;
+			}
+			break;
+		}
+		if (code_end > position + 5 && code_end < error_text.size() && error_text[code_end] == ':') {
+			return true;
+		}
+		position = error_text.find("LPTS_", position + 5);
+	}
+	return false;
 }
 
 class LptsCheckModeState : public ClientContextState {
@@ -853,17 +1007,15 @@ public:
 	// the outcome for a rewritten query: "OK" (bags matched), "WRONG" (bags differed), or
 	// "NONDETERMINISTIC: <reason>" (query is nondeterministic, so the comparison is not trusted; the reason
 	// is the heuristic's explanation, e.g. an order-sensitive aggregate or ORDER BY with LIMIT).
-	void ActOnVerdict() {
-		bool hashes_equal = (hash_sum.load() == cmp_sum.load());
+	void ActOnMatch(bool hashes_equal, const string &detail = string()) {
 		// A conditional-nondeterminism excuse only applies when the sides actually diverged.
 		bool mismatch_excused = !hashes_equal && suppress_on_mismatch;
 		bool match = hashes_equal || suppress || mismatch_excused;
 		if (behavior == LptsCheckVerdict::STRICT) {
 			if (!match) {
 				throw InvalidInputException(
-				    "LPTS check failed: the LPTS-rewritten query returned a different bag of rows than the "
-				    "original (hash %llu vs %llu)",
-				    static_cast<unsigned long long>(hash_sum.load()), static_cast<unsigned long long>(cmp_sum.load()));
+				    "LPTS check failed: the LPTS-rewritten query returned a different bag of rows than the original%s",
+				    detail.c_str());
 			}
 		} else if (suppress) {
 			string status = suppress_reason.empty() ? "NONDETERMINISTIC" : "NONDETERMINISTIC: " + suppress_reason;
@@ -877,6 +1029,12 @@ public:
 		} else {
 			LptsCheckAppendLog(log_path, qnum, "WRONG");
 		}
+	}
+
+	void ActOnVerdict() {
+		ActOnMatch(hash_sum.load() == cmp_sum.load(),
+		           StringUtil::Format(" (hash %llu vs %llu)", static_cast<unsigned long long>(hash_sum.load()),
+		                              static_cast<unsigned long long>(cmp_sum.load())));
 	}
 
 	// "Last one out switches off the lights": each side calls this when fully done. The last caller
@@ -894,6 +1052,13 @@ static LptsCheckModeState &GetCheckMode(ClientContext &context) {
 
 static LptsCheckRunState &GetCheckRunState(ClientContext &context) {
 	return *context.registered_state->GetOrCreate<LptsCheckRunState>("lpts_check_run_state");
+}
+
+static void LptsCheckVerdictFunction(DataChunk &input, ExpressionState &state, Vector &result) {
+	for (idx_t row = 0; row < input.size(); row++) {
+		GetCheckRunState(state.GetContext()).ActOnMatch(input.data[0].GetValue(row).GetValue<bool>());
+		result.SetValue(row, Value::BOOLEAN(true));
+	}
 }
 
 static void LptsCheckSetCallback(ClientContext &context, SetScope scope, Value &parameter) {
@@ -1078,7 +1243,7 @@ public:
 // are already expanded.
 static bool ExpressionUsesSequenceFunction(const Expression &expr) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-		const auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+		const auto &name = expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
 		if (name == "nextval" || name == "currval" || name == "lastval") {
 			return true;
 		}
@@ -1100,6 +1265,43 @@ static bool PlanUsesSequenceFunction(const LogicalOperator &op) {
 	}
 	for (const auto &child : op.children) {
 		if (PlanUsesSequenceFunction(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The checker executes a plan twice. DuckDB marks operators with actual side effects/non-repeatability;
+// additionally, a few system table functions expose mutable process/database counters but predate the
+// repeatability callback. Neither category can be compared by executing two copies back-to-back.
+static bool PlanReadsMutableRuntimeState(LogicalOperator &op) {
+	if (op.HasSideEffects()) {
+		return true;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		const auto &get = op.Cast<LogicalGet>();
+		const auto &name = get.function.GetName().GetIdentifierName();
+		if (name == "duckdb_memory" || name == "pragma_database_size" || name == "create_external_resource") {
+			return true;
+		}
+	}
+	for (auto &child : op.children) {
+		if (PlanReadsMutableRuntimeState(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool PlanCanThrowDuringExecution(const LogicalOperator &op) {
+	bool can_throw = false;
+	LogicalOperatorVisitor::EnumerateExpressions(
+	    op, [&](const unique_ptr<Expression> *expression) { can_throw = can_throw || (*expression)->CanThrow(); });
+	if (can_throw) {
+		return true;
+	}
+	for (const auto &child : op.children) {
+		if (PlanCanThrowDuringExecution(*child)) {
 			return true;
 		}
 	}
@@ -1161,8 +1363,32 @@ static bool PlanHasMultiRowSingleJoin(const LogicalOperator &op) {
 	return false;
 }
 
-// Optimizer hook (post-optimize): when lpts_check mode is on, replace a top-level SELECT's plan
-// with UNION ALL(LptsCheckHash(original), LptsCheckCmp(LPTS(original))).
+static bool PlanHasRecursiveCte(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+		return true;
+	}
+	for (const auto &child : op.children) {
+		if (PlanHasRecursiveCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool AstHasRecursiveCte(const AstNode &node) {
+	if (node.NodeType() == "RecursiveCte") {
+		return true;
+	}
+	for (const auto &child : node.children) {
+		if (AstHasRecursiveCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Optimizer hook (post-optimize): compare the original and LPTS-rewritten results.
+// Recursive plans use separate materialized executions within one statement; other plans use a fused UNION.
 static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto &mode = GetCheckMode(input.context);
 	if (mode.in_rewrite) {
@@ -1171,37 +1397,37 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 	if (!mode.enabled) {
 		return;
 	}
+	if (plan->type == LogicalOperatorType::LOGICAL_EXECUTE) {
+		// A prepared physical plan can be executed repeatedly, while the checker's per-query hash state is
+		// initialized during optimization. Injecting the checker here would cache and reuse that state across
+		// EXECUTE calls, so verify the equivalent direct SQL elsewhere and leave prepared execution untouched.
+		return;
+	}
 	if (plan->type == LogicalOperatorType::LOGICAL_EXPLAIN) {
 		return; // EXPLAIN (FORMAT SQL) is owned by the explain hook.
 	}
 	auto &client_config = ClientConfig::GetConfig(input.context);
-	if (client_config.AnyVerification() || client_config.verify_parallelism) {
+	if (client_config.enable_profiler) {
+		// The checker executes the original and rewritten plans side by side. Profiling that combined
+		// plan would duplicate scan/operator metrics and change the observable profiler output, so leave
+		// profiled queries untouched. The compiler is exercised when profiling is disabled.
+		return;
+	}
+	if (Settings::Get<DebugVerifyStatementSetting>(input.context) != DebugStatementVerification::NONE ||
+	    Settings::Get<DebugVerifySerializerSetting>(input.context) || client_config.verify_parallelism) {
 		// Statement verification (e.g. PRAGMA enable_verification / verify_parallelism, common in DuckDB's
 		// own test corpus) re-runs the plan multiple times (serialization round-trip, parallel re-execution).
 		// Our injected extension operators (lpts_check_hash / lpts_check_sink) have no deserialization method,
 		// and repeated execution would double-count into the hash accumulators — so we cannot check a query
-		// while any verification is active.
-		//
-		// In LOG mode (the suite driver) more than half of DuckDB's .test files self-enable verification,
-		// which would otherwise leave them entirely unchecked. Since LOG mode never alters a query's
-		// result and we only read LPTS's own log, neutralize verification on this connection so that every
-		// *subsequent* query in the file is checkable. We still skip the current query (it may already be
-		// mid-verification), so a file loses at most its first post-PRAGMA query from coverage. Strict mode
-		// (interactive / SQLStorm) keeps the conservative skip and never touches the user's config.
-		if (LptsCheckLogPath()) {
-			client_config.query_verification_enabled = false;
-			client_config.verify_external = false;
-			client_config.verify_serializer = false;
-			client_config.verify_fetch_row = false;
-			client_config.verify_parallelism = false;
-		}
+		// while any verification is active. Never reset those settings here: verification is observable session
+		// state, and callers may intentionally test or rely on its strict error behavior.
 		return;
 	}
 
 	// Only intercept a single top-level SELECT. CREATE/INSERT/UPDATE/PRAGMA/... pass through untouched.
 	const string &query = input.context.GetCurrentQuery();
 	{
-		Parser parser(input.context.GetParserOptions());
+		Parser parser(input.context);
 		try {
 			parser.ParseQuery(query);
 		} catch (...) {
@@ -1211,12 +1437,15 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 			return;
 		}
 	}
-	// Don't check queries that read LPTS's own inspector table functions (lpts_query / print_ast_query /
-	// lpts_normalize_query): they wrap LPTS output and can't themselves be round-tripped — let them run as-is.
+	// Don't check queries that inspect logical plans. LPTS's own inspector functions wrap its output, while
+	// json_serialize_plan recursively invokes DuckDB's planner for the SQL passed to it. That nested planner
+	// shares the outer ClientContext/current-query text, so treating its inner plan as the outer SELECT would
+	// compare unrelated queries.
 	{
 		string lower_query = StringUtil::Lower(query);
 		if (lower_query.find("lpts_query") != string::npos || lower_query.find("print_ast_query") != string::npos ||
-		    lower_query.find("lpts_normalize_query") != string::npos) {
+		    lower_query.find("lpts_normalize_query") != string::npos ||
+		    lower_query.find("json_serialize_plan") != string::npos) {
 			return;
 		}
 	}
@@ -1245,12 +1474,30 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 
 	SqlDialect dialect = ReadDialect(input.context);
 	unique_ptr<LogicalOperator> original = std::move(plan);
+	// DuckDB may optimize a recursive branch away in the original plan while LPTS's
+	// data-independent planning retains it. Inspect both plans, since WITH RECURSIVE
+	// can also be written around CTEs that are not recursive.
+	bool has_recursive_cte = dialect == SqlDialect::DUCKDB && PlanHasRecursiveCte(*original);
+	const bool original_can_throw = PlanCanThrowDuringExecution(*original);
 
-	// Plan-level nondeterminism: a sequence function (nextval/currval/lastval) may be hidden inside a macro
-	// that the text heuristic can't see. Macros are expanded in the bound plan, so scan it here.
-	if (!run.suppress && PlanUsesSequenceFunction(*original)) {
-		run.suppress = true;
-		run.suppress_reason = "sequence function (nextval/currval/lastval) advances/reads sequence state";
+	// A sequence function may be hidden inside a macro that the text heuristic cannot see. Running the
+	// rewritten side would advance mutable sequence state a second time, so bypass checking entirely instead
+	// of merely suppressing a mismatch after both sides have executed.
+	if (PlanUsesSequenceFunction(*original)) {
+		if (behavior == LptsCheckVerdict::LOG) {
+			LptsCheckAppendLog(run.log_path, run.qnum,
+			                   "NONDETERMINISTIC: sequence function (nextval/currval/lastval) changes sequence state");
+		}
+		plan = std::move(original);
+		return;
+	}
+	if (PlanReadsMutableRuntimeState(*original)) {
+		if (behavior == LptsCheckVerdict::LOG) {
+			LptsCheckAppendLog(run.log_path, run.qnum,
+			                   "NONDETERMINISTIC: plan has side effects or reads mutable runtime state");
+		}
+		plan = std::move(original);
+		return;
 	}
 
 	// A scalar-subquery SINGLE join over a subquery that can return >1 row is nondeterministic when
@@ -1263,32 +1510,66 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		run.suppress_on_mismatch_reason = "scalar subquery may return >1 row (arbitrary row / error semantics)";
 	}
 
-	// Build UNION(hash pass-through, cmp sink). The original rows stream through unbuffered; both sides
-	// signal done (hash via OperatorFinalize, cmp via sink Finalize) and the last one out takes the
-	// verdict. If LPTS cannot rewrite the query: LOG logs UNSUPPORTED (a deliberate LPTS_<CODE> refusal)
-	// or FAIL (any other error — a translation bug) and runs it unchecked; STRICT raises a
-	// single, matchable "unsupported" error.
+	// For non-recursive plans, build UNION(hash pass-through, cmp sink). The original rows stream through
+	// unbuffered; both sides signal done (hash via OperatorFinalize, cmp via sink Finalize) and the last
+	// one out takes the verdict. If LPTS cannot rewrite the query: LOG logs UNSUPPORTED (a deliberate LPTS_<CODE>
+	// refusal) or FAIL (any other error — a translation bug) and runs it unchecked; STRICT raises a single, matchable
+	// "unsupported" error.
+	enum class CheckRewriteStage : uint8_t { ORIGINAL_REPLAN, LPTS_TRANSLATION, REWRITTEN_REPLAN };
+	CheckRewriteStage rewrite_stage = CheckRewriteStage::ORIGINAL_REPLAN;
+	string rewritten_sql;
 	try {
 		original->ResolveOperatorTypes();
 		auto target_types = original->types;
 		idx_t col_count = target_types.size();
+		for (const auto &type : target_types) {
+			if (TypeContainsAggregateState(type)) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_CHECK_TYPE", dialect, "type", type.ToString(), "lpts_check",
+				                        "aggregate-state values have representation-dependent state and cannot be "
+				                        "compared by the round-trip checker");
+			}
+		}
 
 		auto orig_for_lpts = PlanQuery(input.context, query);
+		rewrite_stage = CheckRewriteStage::LPTS_TRANSLATION;
 		auto ast = LogicalPlanToAst(input.context, orig_for_lpts, dialect);
+		has_recursive_cte = has_recursive_cte || (dialect == SqlDialect::DUCKDB && AstHasRecursiveCte(*ast));
 		auto cte_list = AstToCteList(*ast, dialect);
-		string sql = cte_list->ToQuery(true);
-		auto rewritten = PlanQuery(input.context, sql);
+		rewritten_sql = cte_list->ToQuery(true);
+		rewrite_stage = CheckRewriteStage::REWRITTEN_REPLAN;
+		auto rewritten = PlanQuery(input.context, rewritten_sql);
 		rewritten->ResolveOperatorTypes();
 		if (rewritten->types.size() != col_count) {
 			throw InvalidInputException("LPTS check: rewritten query has %llu columns but the original has %llu",
 			                            static_cast<unsigned long long>(rewritten->types.size()),
 			                            static_cast<unsigned long long>(col_count));
 		}
+		if (has_recursive_cte) {
+			// Keep both results within one statement/snapshot, but make each query a separate
+			// materialized execution. A fused logical UNION can eagerly evaluate an otherwise
+			// skipped unbounded recursive branch, or combine incompatible recursive pipelines.
+			Parser original_parser(input.context);
+			original_parser.ParseQuery(query);
+			string original_sql = original_parser.statements[0]->ToString();
+			if (!original_sql.empty() && original_sql.back() == ';') {
+				original_sql.pop_back();
+			}
+			if (!rewritten_sql.empty() && rewritten_sql.back() == ';') {
+				rewritten_sql.pop_back();
+			}
+			string check_sql = "WITH __lpts_orig AS MATERIALIZED (" + original_sql + "), __lpts_rew AS MATERIALIZED (" +
+			                   rewritten_sql + "), __lpts_chk AS MATERIALIZED (SELECT " + LPTS_CHECK_VERDICT_FUNCTION +
+			                   "(NOT EXISTS (SELECT * FROM __lpts_orig EXCEPT ALL SELECT * FROM __lpts_rew) AND "
+			                   "NOT EXISTS (SELECT * FROM __lpts_rew EXCEPT ALL SELECT * FROM __lpts_orig)) AS ok) "
+			                   "SELECT o.* FROM __lpts_orig o CROSS JOIN __lpts_chk c";
+			plan = PlanQuery(input.context, check_sql, /*native_optimizer=*/true);
+			return;
+		}
 
 		vector<unique_ptr<LogicalOperator>> children;
 		children.push_back(make_uniq<LogicalLptsCheckHash>(std::move(original), /*last_one_out=*/true));
 		children.push_back(make_uniq<LogicalLptsCheckSink>(std::move(rewritten), target_types));
-		idx_t union_index = input.optimizer.binder.GenerateTableIndex();
+		auto union_index = input.optimizer.binder.GenerateTableIndex();
 		auto union_op = make_uniq<LogicalSetOperation>(union_index, col_count, std::move(children),
 		                                               LogicalOperatorType::LOGICAL_UNION,
 		                                               /*setop_all=*/true, /*allow_out_of_order=*/false);
@@ -1303,8 +1584,12 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 		// "LPTS_<CODE>: ...") — logged as UNSUPPORTED. Any other error means LPTS emitted SQL that did not
 		// parse/bind — a translation BUG — logged as FAIL so the coverage gate treats it like WRONG.
 		const string error_text = e.what();
-		const bool intentional_lpts_refusal = error_text.find("\"exception_message\":\"LPTS_") != string::npos;
-		LptsCheckAppendLog(run.log_path, run.qnum, intentional_lpts_refusal ? "UNSUPPORTED" : "FAIL");
+		const ErrorData error(e);
+		const bool equivalent_execution_error = rewrite_stage == CheckRewriteStage::REWRITTEN_REPLAN &&
+		                                        original_can_throw && Exception::IsExecutionError(error.Type());
+		const bool unsupported = rewrite_stage == CheckRewriteStage::ORIGINAL_REPLAN ||
+		                         IsIntentionalLptsRefusal(error_text) || equivalent_execution_error;
+		LptsCheckAppendLog(run.log_path, run.qnum, unsupported ? "UNSUPPORTED" : "FAIL");
 		if (!plan) {
 			plan = std::move(original);
 		}
@@ -1316,6 +1601,19 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 //------------------------------------------------------------------------------
 
 static void LoadInternal(ExtensionLoader &loader) {
+	ScalarFunction current_timestamp_function(LPTS_CURRENT_TIMESTAMP_FUNCTION, {}, LogicalType::TIMESTAMP_TZ,
+	                                          LptsCurrentTimestampFunction);
+	current_timestamp_function.SetStability(FunctionStability::VOLATILE);
+	loader.RegisterFunction(current_timestamp_function);
+	ScalarFunction check_verdict_function(LPTS_CHECK_VERDICT_FUNCTION, {LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
+	                                      LptsCheckVerdictFunction);
+	check_verdict_function.SetStability(FunctionStability::VOLATILE);
+	loader.RegisterFunction(check_verdict_function);
+
+	PlannerExtension planner_extension;
+	planner_extension.get_sql_value_function = LptsGetSQLValueFunction;
+	PlannerExtension::Register(DBConfig::GetConfig(loader.GetDatabaseInstance()), std::move(planner_extension));
+
 	// Register Spark-compatible scalar functions (e.g. add_months) that DuckDB
 	// lacks natively but that appear in Spark SQL translated through lpts.
 	RegisterSparkScalarFunctions(loader);
@@ -1388,7 +1686,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterTableFunctionWithDescription(
 	    loader, std::move(normalize_table_func),
 	    "Normalize SQL from lpts_input_dialect into DuckDB SQL without planning it.",
-	    {"SET lpts_input_dialect = 'mysql'; SELECT sql FROM lpts_normalize_query('SELECT `order` FROM users LIMIT 1, "
+	    {"SET lpts_input_dialect = 'mysql'; SELECT sql FROM lpts_normalize_query('SELECT `order` FROM users LIMIT "
+	     "1, "
 	     "2')"});
 
 	// Register PRAGMA print_ast('query')

@@ -89,7 +89,7 @@ SELECT x FROM (SELECT a + b AS x FROM t) WHERE x > 5;
 
 # --- scan WITH a pushed-down predicate stays a separate scan CTE; the fused block is inlined ---
 query I
-SELECT sql LIKE '%t0_scan%' AND sql LIKE '%WHERE%a>0%' AND sql LIKE '%GROUP BY%'
+SELECT sql LIKE '%t0_scan%' AND sql LIKE '%WHERE%a%>%0%' AND sql LIKE '%GROUP BY%'
 FROM lpts_query('SELECT d, sum(a) AS s FROM t WHERE a > 0 GROUP BY d ORDER BY s');
 ----
 true

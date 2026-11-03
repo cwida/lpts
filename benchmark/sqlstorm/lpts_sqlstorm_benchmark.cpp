@@ -268,7 +268,7 @@ static bool IsCrashError(const string &error) {
 static bool IsNotImplementedError(const string &error) {
 	return error.find("Not implemented Error:") != string::npos || error.find("not implemented") != string::npos ||
 	       error.find("not yet implemented") != string::npos || error.find("not (yet) supported") != string::npos ||
-	       error.find("Unsupported expression") != string::npos;
+	       error.find("Unsupported expression") != string::npos || error.find("LPTS_UNSUPPORTED_") != string::npos;
 }
 
 static string EscapeSQLLiteral(const string &input) {
@@ -425,7 +425,7 @@ static void ConfigureConnection(Connection &con) {
 
 			WritePhase(write_fd, "duckdb");
 			auto duckdb_start = std::chrono::steady_clock::now();
-			unique_ptr<MaterializedQueryResult> duckdb_result;
+			unique_ptr<QueryResult> duckdb_result;
 			try {
 				duckdb_result = con.Query(sql);
 			} catch (std::exception &ex) {
@@ -449,7 +449,7 @@ static void ConfigureConnection(Connection &con) {
 				if (compare_perf) {
 					string lpts_query_sql = "SELECT sql FROM lpts_query('" + EscapeSQLLiteral(sql) + "')";
 					WritePhase(write_fd, "lpts_generate");
-					unique_ptr<MaterializedQueryResult> lpts_query_result;
+					unique_ptr<QueryResult> lpts_query_result;
 					try {
 						lpts_query_result = con.Query(lpts_query_sql);
 					} catch (std::exception &ex) {
@@ -475,10 +475,10 @@ static void ConfigureConnection(Connection &con) {
 							summary.state = QueryState::LPTS_ERROR;
 						}
 					} else {
-						string lpts_sql = lpts_query_result->GetValue(0, 0).ToString();
+						string lpts_sql = lpts_query_result->Collection().GetValue(0, 0).ToString();
 						WritePhase(write_fd, "lpts_exec");
 						auto lpts_exec_start = std::chrono::steady_clock::now();
-						unique_ptr<MaterializedQueryResult> lpts_exec_result;
+						unique_ptr<QueryResult> lpts_exec_result;
 						try {
 							lpts_exec_result = con.Query(lpts_sql);
 						} catch (std::exception &ex) {
@@ -518,7 +518,7 @@ static void ConfigureConnection(Connection &con) {
 				if (summary.state == QueryState::SUCCESS) {
 					WritePhase(write_fd, "lpts_check");
 					con.Query("SET lpts_check=true");
-					unique_ptr<MaterializedQueryResult> check_result;
+					unique_ptr<QueryResult> check_result;
 					try {
 						check_result = con.Query(sql);
 					} catch (std::exception &ex) {
@@ -724,8 +724,14 @@ struct ForkWorker {
 					return SR_CHILD_DIED;
 				}
 				if (message_type == static_cast<uint8_t>(WorkerMessage::PHASE)) {
-					if (!ReadString(from_child_fd, active_phase)) {
+					string next_phase;
+					if (!ReadString(from_child_fd, next_phase)) {
 						return SR_CHILD_DIED;
+					}
+					// The child may have finished DuckDB just after the deadline. Attribute that
+					// timeout to the phase that consumed the budget, not the one it entered next.
+					if (std::chrono::steady_clock::now() < deadline) {
+						active_phase = std::move(next_phase);
 					}
 					continue;
 				}
@@ -1136,7 +1142,11 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 			}
 
 			if (summary.state == QueryState::TIMEOUT || summary.state == QueryState::DUCKDB_TIMEOUT ||
-			    summary.state == QueryState::LPTS_TIMEOUT || summary.state == QueryState::CRASH) {
+			    summary.state == QueryState::LPTS_TIMEOUT || summary.state == QueryState::CRASH ||
+			    (summary.state == QueryState::DUCKDB_ERROR &&
+			     summary.error.find("INTERNAL Error:") != string::npos)) {
+				// DuckDB invalidates its connection after an INTERNAL error. Reopen it so
+				// the next query is judged independently.
 				worker.Stop();
 			}
 

@@ -13,7 +13,7 @@ namespace duckdb {
 
 SqlDialect ReadInputDialect(ClientContext &context) {
 	Value dialect_val;
-	if (context.TryGetCurrentSetting("lpts_input_dialect", dialect_val)) {
+	if (context.TryGetCurrentSetting(Identifier("lpts_input_dialect"), dialect_val)) {
 		return ParseSqlDialectSetting(dialect_val.GetValue<string>(), "lpts_input_dialect");
 	}
 	return SqlDialect::DUCKDB;

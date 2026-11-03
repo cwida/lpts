@@ -8,8 +8,24 @@ require lpts
 
 require parquet
 
+require icu
+
+require json
+
 statement ok
 SET lpts_check = true;
+
+# --- DISTINCT aggregates over collated values retain their semantic collation through UNNEST. DuckDB 2.0
+# can leave the source collation on the optimized column while carrying an explicit comparison collation on
+# a folded constant; render that comparison under one common collation rather than emitting incompatible
+# operand types. ---
+query I
+SELECT count(*)
+FROM (SELECT unnest(list(DISTINCT s COLLATE de)) AS s
+      FROM (VALUES ('ä'), ('ä'), ('Z')) t(s)) result
+WHERE s COLLATE "binary" IN ('ä', 'ä', 'Z');
+----
+2
 
 # --- Dummy-scan column naming: an uncorrelated IN/ANY/ALL over constants passes the dummy binding
 # through the mark join; its registered name must match the CTE header (t0_dummy, not t0_1). ---
@@ -17,6 +33,16 @@ query I
 SELECT (1 = ANY(SELECT 1));
 ----
 true
+
+# A nested SQLNULL type is valid DuckDB cast syntax and is not a no-op: TRY_CAST to a map with NULL
+# key/value types converts non-empty maps to NULL while retaining the empty map.
+query I
+SELECT TRY_CAST(x AS MAP("NULL", "NULL"))
+FROM (VALUES ('{1=1}'), ('{}'), (NULL)) t(x);
+----
+NULL
+{}
+NULL
 
 statement ok
 CREATE TABLE strings(v VARCHAR);
@@ -51,7 +77,19 @@ true
 query I
 SELECT list_zip(['2021-08-20'::DATE]);
 ----
-[(2021-08-20)]
+[(2021-08-20,)]
+
+# Fixed-size ARRAY values have distinct type/value accessors from LIST in DuckDB 2.0. Exercise both a
+# direct constructor and a nested array so type inspection and structural constant rendering round-trip.
+query I
+SELECT array_value(1, 2, 3);
+----
+[1, 2, 3]
+
+query I
+SELECT array_value(array_value(1, 2), array_value(3, 4));
+----
+[[1, 2], [3, 4]]
 
 # --- date_part struct variant: the constant part-list argument is erased at bind time and must be
 # rebuilt from the STRUCT return type's field names. ---
@@ -84,6 +122,39 @@ query I
 SELECT s[2:-:2] FROM lists;
 ----
 [2, 4]
+
+# --- DuckDB 2.0 nested schemas: preserve every schema-path component instead of retaining only the leaf. ---
+statement ok
+CREATE SCHEMA outer_schema;
+
+statement ok
+CREATE SCHEMA outer_schema.inner_schema;
+
+statement ok
+CREATE TABLE outer_schema.inner_schema.nested_values(i INTEGER);
+
+statement ok
+INSERT INTO outer_schema.inner_schema.nested_values VALUES (11), (22);
+
+query I rowsort
+SELECT i FROM outer_schema.inner_schema.nested_values;
+----
+11
+22
+
+# --- lpts_check must not execute sequence reads/writes twice while comparing a rewritten query. ---
+statement ok
+CREATE SEQUENCE checker_sequence START 41;
+
+query I
+SELECT nextval('checker_sequence');
+----
+41
+
+query I
+SELECT currval('checker_sequence');
+----
+41
 
 query II
 SELECT array_pop_back(s), list_reverse(s) FROM lists;
@@ -130,7 +201,7 @@ SELECT struct_update(col, i := 99) FROM stbl;
 # --- EXPORT_STATE aggregates: the internal aggregate_state_export_<f> name is re-emitted as
 # `(<f>(args) EXPORT_STATE)` — parenthesized so it survives inside function argument lists. ---
 query I
-SELECT (SUM(42) EXPORT_STATE)::BLOB IS NOT NULL;
+SELECT (SUM(42) EXPORT_STATE) IS NOT NULL;
 ----
 true
 
@@ -141,6 +212,96 @@ query I
 SELECT FINALIZE(COMBINE(SUM(d) EXPORT_STATE, SUM(d) EXPORT_STATE)) FROM dummy;
 ----
 84.0
+
+statement ok
+CREATE TABLE avg_states AS SELECT AVG(d) EXPORT_STATE state FROM dummy;
+
+# Filter pushdown must not replace an empty state-bearing scan with DuckDB's metadata-free legacy
+# AGGREGATE_STATE placeholder; without the signature, no valid SQL cast can reconstruct the state.
+query I
+SELECT FINALIZE(COMBINE_AGGR(state)) FROM avg_states WHERE false;
+----
+NULL
+
+# Raw aggregate-state values have representation-dependent payloads, so lpts_check cannot compare them.
+# Folded aggregate-state constants remain serializable because DuckDB retains the aggregate signature in type metadata.
+statement error
+SELECT SUM(d) EXPORT_STATE FROM dummy;
+----
+LPTS_UNSUPPORTED_CHECK_TYPE
+
+query I
+SELECT FINALIZE(COMBINE_AGGR(TO_AGGREGATE_STATE(NULL::BIGINT, 'count', ['ANY'])));
+----
+0
+
+# --- OpenIVM-shaped aggregate-state plan: a deep projected expression feeds a collated aggregate with
+# FILTER/EXPORT_STATE, then crosses CTE boundaries and is rebound from its TYPE[] signature. The macros
+# double the retained expression at each level, producing 64 nested calls without a generated SQL fixture.
+statement ok
+SET max_expression_depth = 1000;
+
+statement ok
+CREATE MACRO ivm_deep_1(x) AS concat('[', x, ']');
+
+statement ok
+CREATE MACRO ivm_deep_2(x) AS ivm_deep_1(ivm_deep_1(x));
+
+statement ok
+CREATE MACRO ivm_deep_3(x) AS ivm_deep_2(ivm_deep_2(x));
+
+statement ok
+CREATE MACRO ivm_deep_4(x) AS ivm_deep_3(ivm_deep_3(x));
+
+statement ok
+CREATE MACRO ivm_deep_5(x) AS ivm_deep_4(ivm_deep_4(x));
+
+statement ok
+CREATE MACRO ivm_deep_6(x) AS ivm_deep_5(ivm_deep_5(x));
+
+statement ok
+CREATE MACRO ivm_deep_7(x) AS ivm_deep_6(ivm_deep_6(x));
+
+statement ok
+CREATE TABLE ivm_state_input(g INTEGER, s VARCHAR, openivm_multiplicity INTEGER);
+
+statement ok
+INSERT INTO ivm_state_input VALUES (1, 'a', 1), (1, 'Z', 1), (1, 'ignored', -1), (2, 'b', 1);
+
+query III rowsort
+WITH ivm_delta AS (
+    SELECT g, ivm_deep_7(s) COLLATE NOCASE AS normalized, openivm_multiplicity
+    FROM ivm_state_input
+), ivm_state AS (
+    SELECT g, max(normalized COLLATE NOCASE)
+                  FILTER (WHERE openivm_multiplicity > 0) EXPORT_STATE AS state
+    FROM ivm_delta
+    GROUP BY g
+), ivm_rebound AS (
+    SELECT g, state, to_aggregate_state(state, 'arg_max',
+        [get_type(NULL::VARCHAR COLLATE NOCASE), get_type(NULL::VARCHAR COLLATE NOCASE)]) AS rebound
+    FROM ivm_state
+)
+SELECT g,
+       length(finalize(combine(state, rebound))),
+       contains(finalize(combine(state, rebound)), CASE WHEN g = 1 THEN 'Z' ELSE 'b' END)
+FROM ivm_rebound
+ORDER BY g;
+----
+1	129	true
+2	129	true
+
+# Exported collated aggregate states retain the function's logical argument types even when the value
+# argument is a bare column whose source table itself is uncollated.
+query TI
+SELECT finalize(combine(state, rebound)), finalize(combine(state, rebound)) = 'z'
+FROM (
+    SELECT state, to_aggregate_state(state, 'arg_max',
+        [get_type(NULL::VARCHAR COLLATE NOCASE), get_type(NULL::VARCHAR COLLATE NOCASE)]) AS rebound
+    FROM (SELECT max(s COLLATE NOCASE) EXPORT_STATE AS state FROM ivm_state_input)
+);
+----
+Z	true
 
 # --- rowid: a filter on the virtual rowid column is keyed by the virtual column id (not an index into
 # the scan's names) and round-trips faithfully over the same base table. ---
@@ -220,12 +381,79 @@ SELECT 10 AS j, i FROM oint ORDER BY j, i NULLS LAST;
 10	2
 10	3
 
+# A user-written cast can fold to a non-integer constant in the optimized ORDER BY. The key has no
+# ordering effect and must be removed rather than rebound as a rejected bare literal.
+query I
+SELECT i FROM oint ORDER BY CAST('a' AS VARCHAR), i;
+----
+1
+2
+3
+
 # --- UNION-typed constants rebuild via union_value(tag := v) cast to the full union type. ---
 query I
 SELECT [true::UNION(a integer, c bool)] AS u FROM range(2);
 ----
 [true]
 [true]
+
+# DuckDB 2.0 retains function-level named arguments independently of child aliases.
+query I rowsort
+SELECT union_extract(union_value("Member" := i), 'Member') FROM oint;
+----
+1
+2
+3
+
+# Context-polymorphic error() branches in a scalar-subquery cardinality check need their VARCHAR cast
+# before COLLATE is reapplied.
+statement ok
+CREATE TABLE collated_scalar(v VARCHAR);
+
+statement ok
+INSERT INTO collated_scalar VALUES ('XXX');
+
+query I
+SELECT (SELECT v FROM collated_scalar) COLLATE NOCASE;
+----
+XXX
+
+# Empty ENUMs are valid named catalog types but have no inline ENUM() spelling. Refuse the folded
+# constant with a coded unsupported result instead of emitting SQL that fails in the binder.
+statement ok
+CREATE TYPE lpts_empty_enum AS ENUM ();
+
+statement error
+SELECT * FROM lpts_query('SELECT NULL::lpts_empty_enum');
+----
+LPTS_UNSUPPORTED_TYPE
+
+# Keep a projection boundary around fallible expressions. Folding the constant-producing CTE into
+# json_extract changes DuckDB's dynamic-path runtime error into a binder error.
+query I
+SELECT sql LIKE '%projection_%' AND sql LIKE '%json_extract(%'
+FROM lpts_query($$
+WITH tbl AS (
+    SELECT '[{"duck":42},{"duck":43}]' j, '$[*].duck' p
+)
+SELECT json_extract(j, p) FROM tbl
+$$);
+----
+true
+
+statement ok
+SET lpts_check = true;
+
+statement error
+WITH tbl AS (
+    SELECT '[{"duck":42},{"duck":43}]' j, '$[*].duck' p
+)
+SELECT json_extract(j, p) FROM tbl;
+----
+Invalid Input Error
+
+statement ok
+SET lpts_check = false;
 
 # --- TYPE-typed constants (get_type/make_type) reconstruct as get_type(CAST(NULL AS <type>)). ---
 query II
@@ -363,6 +591,20 @@ Clark
 Coleman
 Franklin
 
+# A COUNT(*) scan may retain only DuckDB's synthetic rowid binding, while a pushed-down filter still
+# names a real table-function output through the user's positional aliases. Keep the complete function
+# alias instead of replacing it with `_tf(rowid)`.
+statement ok
+COPY (SELECT * FROM (VALUES (1, 7), (2, 9), (3, 7)) t(id, part))
+TO '{TEST_DIR}/lpts_filter_alias.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*)
+FROM read_parquet('{TEST_DIR}/lpts_filter_alias.parquet') AS t(a, b)
+WHERE b = 7;
+----
+2
+
 # --- LATERAL <table function> WITH ORDINALITY: the ordinality column is part of the scan output, and
 # the correlated passthrough columns are the child's own bindings. ---
 statement ok
@@ -414,6 +656,149 @@ SELECT * FROM (SELECT plant, date, avg(mwh) OVER (PARTITION BY plant ORDER BY da
 ----
 a	2020-01-08	30.0
 b	2020-01-01	5.0
+
+# --- Preserve DuckDB's native MARK semantics for nested comparison values. A whole STRUCT can be
+# non-NULL while one of its fields still makes an inequality comparison indeterminate. ---
+query I
+SELECT __mark_join_marker FROM (VALUES (row(1,2))) p(c) JOIN BY(TYPE MARK) (VALUES (row(1,NULL::INT))) b(d) ON c <> d;
+----
+NULL
+
+# --- EXCEPT/INTERSECT comparison semantics come from the set operation's output collation even when
+# DuckDB's optimizer has removed the original COLLATE projection. ---
+statement ok
+CREATE TABLE lpts_collate_left(s VARCHAR);
+
+statement ok
+CREATE TABLE lpts_collate_right(s VARCHAR);
+
+statement ok
+INSERT INTO lpts_collate_left VALUES ('a');
+
+statement ok
+INSERT INTO lpts_collate_right VALUES ('A');
+
+query I
+SELECT count(*) FROM ((SELECT s COLLATE NOCASE FROM lpts_collate_left) EXCEPT (SELECT s FROM lpts_collate_right));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT s COLLATE NOCASE FROM lpts_collate_left) INTERSECT (SELECT s FROM lpts_collate_right));
+----
+1
+
+# --- ColumnDataCollection scans retain their original column-id mapping after unused-column pruning. ---
+statement ok
+CREATE TABLE lpts_chunk_projection AS FROM (VALUES (ROW(3)));
+
+query T
+SELECT column_type FROM (DESCRIBE lpts_chunk_projection);
+----
+TUPLE(INTEGER)
+
+# --- A fully pruned ColumnDataCollection is a zero-column relation, but its row multiplicity remains visible. ---
+query I
+SELECT count(*) FROM (DESCRIBE SELECT 1 AS a, 2 AS b, 3 AS c);
+----
+3
+
+# --- Comparison-join operands retain their expression boundaries. ---
+query I
+SELECT count(*)
+FROM (VALUES (0::INTEGER, NULL::INTEGER)) l(a, b)
+JOIN (VALUES (false)) r(c)
+  ON (l.a = l.b OR (l.a IS NULL AND l.b IS NULL)) = r.c;
+----
+0
+
+# Pipeline fusion must not inline a projected integer constant into GROUP BY, where SQL would reinterpret
+# it as an ordinal. This nested lateral shape creates that plan during decorrelation.
+query II
+SELECT *
+FROM (SELECT 42 AS c1) AS ref,
+     (SELECT a + b + 1
+      FROM (SELECT 1) t1(a),
+           (SELECT (SELECT (SELECT ref.c1 + 1)) + 1) t2(b));
+----
+42	46
+
+# Native UNION quantifiers retain group metadata that explicit MARK syntax cannot reconstruct. Keep the
+# portable correlated lowering for that plan shape.
+statement ok
+CREATE TABLE lpts_union_probes(g INTEGER, u UNION(i INTEGER, s VARCHAR));
+
+statement ok
+INSERT INTO lpts_union_probes VALUES (0, union_value(i := 1)), (1, union_value(i := 2)), (2, NULL);
+
+statement ok
+CREATE TABLE lpts_union_candidates(g INTEGER, u UNION(i INTEGER, s VARCHAR));
+
+statement ok
+INSERT INTO lpts_union_candidates VALUES (0, union_value(i := 1)), (1, union_value(i := NULL));
+
+query II rowsort
+SELECT g, u = ANY(SELECT c.u FROM lpts_union_candidates c WHERE c.g = p.g)
+FROM lpts_union_probes p;
+----
+0	true
+1	false
+2	false
+
+# --- Constant ORDER BY keys are omitted inside aggregates and windows as well as top-level ordering. ---
+statement ok
+CREATE TABLE lpts_constant_order(s VARCHAR, i INTEGER);
+
+statement ok
+INSERT INTO lpts_constant_order VALUES ('b', 1), ('a', 2);
+
+query I
+SELECT list(s ORDER BY NULL || s, s) FROM lpts_constant_order;
+----
+[a, b]
+
+query II rowsort
+SELECT s, count(*) OVER (ORDER BY NULL || s GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM lpts_constant_order;
+----
+a	2
+b	2
+
+# --- RANGE endpoints reverse their arithmetic under DESC and fold zero offsets to the order key. ---
+query II rowsort
+SELECT x, sum(x) OVER (ORDER BY x DESC RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING)
+FROM (VALUES (1), (2), (2), (4), (NULL)) t(x);
+----
+1	5
+2	5
+2	5
+4	8
+NULL	NULL
+
+query IIII rowsort
+WITH t(id, k) AS (VALUES (1, 1), (2, 1))
+SELECT id,
+       sum(1) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND CURRENT ROW),
+       sum(1) OVER (ORDER BY k RANGE BETWEEN 0 PRECEDING AND 0 PRECEDING),
+       sum(1) OVER (ORDER BY k RANGE BETWEEN 0 FOLLOWING AND 0 FOLLOWING)
+FROM t;
+----
+1	2	2	2
+2	2	2	2
+
+# Numeric comparison constants rebind to the peer's exact type without explicit CAST wrappers, keeping
+# wide n-ary conjunctions below DuckDB's configured expression-depth limit.
+statement ok
+SET max_expression_depth = 10;
+
+query I
+FROM query('SELECT count(*) FROM lpts_constant_order WHERE i < 1' ||
+           repeat(' OR i < 50 AND i >= 0', 49));
+----
+2
+
+statement ok
+SET max_expression_depth = 1000;
 
 statement ok
 SET lpts_check = false;

@@ -227,6 +227,9 @@ string RemapForMySQLMariaDB(const string &name) {
 } // namespace
 
 string RemapFunctionNameForDialect(const string &duckdb_name, SqlDialect dialect) {
+	if (duckdb_name == "lpts_internal_current_timestamp") {
+		return dialect == SqlDialect::DUCKDB ? "get_current_timestamp" : "current_timestamp";
+	}
 	switch (dialect) {
 	case SqlDialect::POSTGRES:
 		return RemapForPostgres(duckdb_name);

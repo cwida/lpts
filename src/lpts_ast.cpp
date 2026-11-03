@@ -21,9 +21,9 @@ InsertionOrderPreservingMap<string> AstNode::GetExtraInfo() const {
 
 string AstGetNode::ToString(int indent) const {
 	string result = Indent(indent) + "Get";
-	result += " " + catalog + "." + schema + "." + table_name;
+	result += " " + catalog + "." + VecToSeparatedList(schema_path, ".") + "." + table_name;
 	result += snapshot ? " " + snapshot->ToString() : "";
-	result += " (table_index=" + std::to_string(table_index) + ")";
+	result += " (table_index=" + std::to_string(table_index.index) + ")";
 	result += "\n" + Indent(indent + 2) + "columns: [";
 	for (size_t i = 0; i < column_names.size(); i++) {
 		if (i > 0) {
@@ -50,7 +50,8 @@ string AstGetNode::ToString(int indent) const {
 
 InsertionOrderPreservingMap<string> AstGetNode::GetExtraInfo() const {
 	InsertionOrderPreservingMap<string> info;
-	info.insert("Table", catalog + "." + schema + "." + table_name + (snapshot ? " " + snapshot->ToString() : ""));
+	info.insert("Table", catalog + "." + VecToSeparatedList(schema_path, ".") + "." + table_name +
+	                         (snapshot ? " " + snapshot->ToString() : ""));
 	string cols = "[";
 	for (size_t i = 0; i < column_names.size(); i++) {
 		if (i > 0) {
@@ -104,8 +105,8 @@ InsertionOrderPreservingMap<string> AstFilterNode::GetExtraInfo() const {
 
 string AstProjectNode::ToString(int indent) const {
 	string result = Indent(indent) + "Project";
-	result +=
-	    " (table_index=" + std::to_string(table_index) + ", expressions=" + std::to_string(expressions.size()) + ")";
+	result += " (table_index=" + std::to_string(table_index.index) +
+	          ", expressions=" + std::to_string(expressions.size()) + ")";
 	for (size_t i = 0; i < expressions.size(); i++) {
 		result += "\n" + Indent(indent + 2) + cte_column_names[i] + " <- " + expressions[i];
 	}
@@ -397,7 +398,7 @@ string AstDistinctNode::ToString(int indent) const {
 //------------------------------------------------------------------------------
 
 string AstMaterializedCteNode::ToString(int indent) const {
-	string result = Indent(indent) + "MaterializedCte (cte_table_index=" + std::to_string(cte_table_index) + ")";
+	string result = Indent(indent) + "MaterializedCte (cte_table_index=" + std::to_string(cte_table_index.index) + ")";
 	if (children.size() >= 1) {
 		result += "\n" + Indent(indent + 2) + "body:";
 		result += "\n" + children[0]->ToString(indent + 4);
@@ -414,7 +415,7 @@ string AstMaterializedCteNode::ToString(int indent) const {
 //------------------------------------------------------------------------------
 
 string AstCteRefNode::ToString(int indent) const {
-	string result = Indent(indent) + "CteRef (cte_table_index=" + std::to_string(cte_table_index) + ")";
+	string result = Indent(indent) + "CteRef (cte_table_index=" + std::to_string(cte_table_index.index) + ")";
 	if (!cte_column_names.empty()) {
 		result += "\n" + Indent(indent + 2) + "columns: [";
 		for (size_t i = 0; i < cte_column_names.size(); i++) {
@@ -433,7 +434,7 @@ string AstCteRefNode::ToString(int indent) const {
 //------------------------------------------------------------------------------
 
 string AstDelimGetNode::ToString(int indent) const {
-	string result = Indent(indent) + "DelimGet (table_index=" + std::to_string(table_index) + ")";
+	string result = Indent(indent) + "DelimGet (table_index=" + std::to_string(table_index.index) + ")";
 	if (!cte_column_names.empty()) {
 		result += "\n" + Indent(indent + 2) + "exposed: [";
 		for (size_t i = 0; i < cte_column_names.size(); i++) {
@@ -468,7 +469,7 @@ string AstDelimJoinNode::ToString(int indent) const {
 		if (i > 0) {
 			result += ",";
 		}
-		result += std::to_string(delim_table_indices[i]);
+		result += std::to_string(delim_table_indices[i].index);
 	}
 	result += "]";
 	for (const auto &cond : conditions) {
@@ -485,8 +486,8 @@ string AstDelimJoinNode::ToString(int indent) const {
 //------------------------------------------------------------------------------
 
 string AstRecursiveCteNode::ToString(int indent) const {
-	string result = Indent(indent) + "RecursiveCte (cte_table_index=" + std::to_string(cte_table_index) + " ctename='" +
-	                ctename + "' union_all=" + (union_all ? "true" : "false") + ")";
+	string result = Indent(indent) + "RecursiveCte (cte_table_index=" + std::to_string(cte_table_index.index) +
+	                " ctename='" + ctename + "' union_all=" + (union_all ? "true" : "false") + ")";
 	result += "\n" + Indent(indent + 2) + "output_cols: [";
 	for (size_t i = 0; i < output_col_names.size(); i++) {
 		if (i > 0) {

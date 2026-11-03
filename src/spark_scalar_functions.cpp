@@ -11,7 +11,7 @@ namespace duckdb {
 //   Match LocalDate.plusMonths: preserve the day unless the target month is
 //   shorter, then clamp it. Month-end inputs are not sticky (Feb 28 -> Mar 28).
 static date_t AddMonthsSparkImpl(date_t input, int32_t num_months) {
-	if (!Date::IsFinite(input)) {
+	if (!input.IsFinite()) {
 		return input;
 	}
 	int32_t year, month, day;
