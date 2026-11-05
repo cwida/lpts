@@ -1,6 +1,8 @@
 #include "lpts_helpers.hpp"
+#include "lpts_ast.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/tableref/at_clause.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include "duckdb/common/sql_identifier.hpp"
@@ -66,6 +68,44 @@ bool TypeContainsAggregateState(const LogicalType &type) {
 	default:
 		return false;
 	}
+}
+
+bool PlanHasRecursiveCte(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+		return true;
+	}
+	for (const auto &child : op.children) {
+		if (PlanHasRecursiveCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool AstHasRecursiveCte(const AstNode &node) {
+	if (node.NodeType() == "RecursiveCte") {
+		return true;
+	}
+	for (const auto &child : node.children) {
+		if (AstHasRecursiveCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+string BuildRecursiveCheckQuery(string original_sql, string rewritten_sql, const string &verdict_function) {
+	if (!original_sql.empty() && original_sql.back() == ';') {
+		original_sql.pop_back();
+	}
+	if (!rewritten_sql.empty() && rewritten_sql.back() == ';') {
+		rewritten_sql.pop_back();
+	}
+	return "WITH __lpts_orig AS MATERIALIZED (" + original_sql + "), __lpts_rew AS MATERIALIZED (" + rewritten_sql +
+	       "), __lpts_chk AS MATERIALIZED (SELECT " + verdict_function +
+	       "(NOT EXISTS (SELECT * FROM __lpts_orig EXCEPT ALL SELECT * FROM __lpts_rew) AND "
+	       "NOT EXISTS (SELECT * FROM __lpts_rew EXCEPT ALL SELECT * FROM __lpts_orig)) AS ok) "
+	       "SELECT o.* FROM __lpts_orig o CROSS JOIN __lpts_chk c";
 }
 
 string QuoteIdentifier(const string &identifier) {

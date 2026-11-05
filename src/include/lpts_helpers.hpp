@@ -11,6 +11,8 @@
 namespace duckdb {
 
 class AtClause;
+class AstNode;
+class LogicalOperator;
 string RenderSnapshotSuffix(optional_ptr<AtClause> snapshot, SqlDialect dialect);
 
 /// Convert a vector of strings into a separated list (e.g. "a, b, c").
@@ -21,6 +23,12 @@ string JoinConditionsToSQL(const vector<string> &conditions);
 
 /// True when a type or one of its nested children contains an aggregate state.
 bool TypeContainsAggregateState(const LogicalType &type);
+
+/// Round-trip checker helpers for recursive plans, which need separate materialized
+/// executions within one statement rather than the checker's fused UNION plan.
+bool PlanHasRecursiveCte(const LogicalOperator &op);
+bool AstHasRecursiveCte(const AstNode &node);
+string BuildRecursiveCheckQuery(string original_sql, string rewritten_sql, const string &verdict_function);
 
 /// Quote an identifier for SQL output when needed.
 string QuoteIdentifier(const string &identifier);

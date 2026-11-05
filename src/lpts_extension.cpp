@@ -1339,30 +1339,6 @@ static bool PlanHasMultiRowSingleJoin(const LogicalOperator &op) {
 	return false;
 }
 
-static bool PlanHasRecursiveCte(const LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
-		return true;
-	}
-	for (const auto &child : op.children) {
-		if (PlanHasRecursiveCte(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool AstHasRecursiveCte(const AstNode &node) {
-	if (node.NodeType() == "RecursiveCte") {
-		return true;
-	}
-	for (const auto &child : node.children) {
-		if (AstHasRecursiveCte(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 // Optimizer hook (post-optimize): compare the original and LPTS-rewritten results.
 // Recursive plans use separate materialized executions within one statement; other plans use a fused UNION.
 static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
@@ -1529,18 +1505,8 @@ static void LptsCheckOptimize(OptimizerExtensionInput &input, unique_ptr<Logical
 			// skipped unbounded recursive branch, or combine incompatible recursive pipelines.
 			Parser original_parser(input.context);
 			original_parser.ParseQuery(query);
-			string original_sql = original_parser.statements[0]->ToString();
-			if (!original_sql.empty() && original_sql.back() == ';') {
-				original_sql.pop_back();
-			}
-			if (!rewritten_sql.empty() && rewritten_sql.back() == ';') {
-				rewritten_sql.pop_back();
-			}
-			string check_sql = "WITH __lpts_orig AS MATERIALIZED (" + original_sql + "), __lpts_rew AS MATERIALIZED (" +
-			                   rewritten_sql + "), __lpts_chk AS MATERIALIZED (SELECT " + LPTS_CHECK_VERDICT_FUNCTION +
-			                   "(NOT EXISTS (SELECT * FROM __lpts_orig EXCEPT ALL SELECT * FROM __lpts_rew) AND "
-			                   "NOT EXISTS (SELECT * FROM __lpts_rew EXCEPT ALL SELECT * FROM __lpts_orig)) AS ok) "
-			                   "SELECT o.* FROM __lpts_orig o CROSS JOIN __lpts_chk c";
+			string check_sql = BuildRecursiveCheckQuery(original_parser.statements[0]->ToString(),
+			                                            std::move(rewritten_sql), LPTS_CHECK_VERDICT_FUNCTION);
 			plan = PlanQuery(input.context, check_sql, /*native_optimizer=*/true);
 			return;
 		}
