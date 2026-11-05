@@ -32,7 +32,7 @@ string VecToQuotedIdentifierList(const vector<string> &input_list, const string 
 string QualifiedTableName(const string &catalog, const string &schema, const string &table_name);
 
 /// Dialect-aware variants. Backtick dialects use backtick quoting; other dialects
-/// fall back to `KeywordHelper::WriteOptionallyQuoted` (matching the dialect-blind overloads above).
+/// fall back to `SQLIdentifier::ToString` (matching the dialect-blind overloads above).
 string DialectVecToQuotedIdentifierList(const vector<string> &input_list, SqlDialect dialect,
                                         const string &separator = ", ");
 string DialectQualifiedTableName(const string &catalog, const vector<string> &schema_path, const string &table_name,

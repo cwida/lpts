@@ -590,8 +590,8 @@ static void LptsTableFunc(ClientContext &context, TableFunctionInput &data_p, Da
 		return;
 	}
 	auto &bind_data = dynamic_cast<const LptsBindData &>(*data_p.bind_data);
-	output.SetCardinality(1);
-	output.SetValue(0, 0, Value(bind_data.result_sql));
+	output.data[0].Append(Value(bind_data.result_sql));
+	output.CheckCardinality(1);
 	state.done = true;
 }
 
@@ -638,8 +638,8 @@ static void PrintAstTableFunc(ClientContext &context, TableFunctionInput &data_p
 		return;
 	}
 	auto &bind_data = dynamic_cast<const PrintAstBindData &>(*data_p.bind_data);
-	output.SetCardinality(1);
-	output.SetValue(0, 0, Value(bind_data.rendered));
+	output.data[0].Append(Value(bind_data.rendered));
+	output.CheckCardinality(1);
 	state.done = true;
 }
 
@@ -862,9 +862,9 @@ static void LptsExplainSqlOptimize(OptimizerExtensionInput &input, unique_ptr<Lo
 	chunk.Initialize(Allocator::Get(input.context), types);
 	// Key "logical_opt" makes the CLI print the "Optimized Logical Plan" caption, which is
 	// accurate: LPTS serializes the optimized logical plan. Clients see it as explain_value.
-	chunk.SetValue(0, 0, Value("logical_opt"));
-	chunk.SetValue(1, 0, Value(sql));
-	chunk.SetCardinality(1);
+	chunk.data[0].Append(Value("logical_opt"));
+	chunk.data[1].Append(Value(sql));
+	chunk.CheckCardinality(1);
 	collection->Append(chunk);
 
 	TableIndex table_index = input.optimizer.binder.GenerateTableIndex();
@@ -1055,7 +1055,7 @@ static void AccumulateChunkHash(DataChunk &chunk, uint64_t &running_sum) {
 	}
 	Vector hashes(LogicalType::HASH);
 	chunk.Hash(hashes);
-	hashes.Flatten(n);
+	hashes.Flatten();
 	auto hash_data = FlatVector::GetData<hash_t>(hashes);
 	uint64_t local = 0;
 	for (idx_t i = 0; i < n; i++) {
@@ -1091,7 +1091,7 @@ public:
 		if (passthrough) {
 			chunk.Reference(input);
 		} else {
-			chunk.SetCardinality(0);
+			chunk.SetChildCardinality(0);
 		}
 		return OperatorResultType::NEED_MORE_INPUT;
 	}

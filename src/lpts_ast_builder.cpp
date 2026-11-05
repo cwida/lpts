@@ -8,7 +8,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/common_subplan_optimizer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -471,8 +471,7 @@ private:
 			return it->second;
 		}
 		Connection con(*context.db);
-		auto result =
-		    con.Query("SELECT id FROM " + KeywordHelper::WriteOptionallyQuoted(catalog_name) + ".current_snapshot()");
+		auto result = con.Query("SELECT id FROM " + SQLIdentifier::ToString(catalog_name) + ".current_snapshot()");
 		idx_t snap_id = DConstants::INVALID_INDEX;
 		if (!result->HasError() && result->RowCount() > 0) {
 			snap_id = result->Collection().GetValue(0, 0).GetValue<idx_t>();

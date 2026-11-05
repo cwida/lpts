@@ -3,7 +3,7 @@
 #include "duckdb/parser/tableref/at_clause.hpp"
 #include "lpts_sql_scanner.hpp"
 
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -69,7 +69,7 @@ bool TypeContainsAggregateState(const LogicalType &type) {
 }
 
 string QuoteIdentifier(const string &identifier) {
-	return KeywordHelper::WriteOptionallyQuoted(identifier);
+	return SQLIdentifier::ToString(identifier);
 }
 
 string VecToQuotedIdentifierList(const vector<string> &input_list, const string &separator) {

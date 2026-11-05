@@ -48,7 +48,7 @@ bool DialectUsesSchemaQualifiedTableNames(SqlDialect dialect);
 bool DialectUsesSingleQuotedTablePath(SqlDialect dialect);
 
 /// Quote an identifier in the given dialect.
-/// - DUCKDB / POSTGRES: optionally `"name"` (DuckDB's `KeywordHelper::WriteOptionallyQuoted`).
+/// - DUCKDB / POSTGRES: optionally `"name"` (DuckDB's `SQLIdentifier::ToString`).
 /// - SPARK / HIVE / BIGQUERY / MYSQL_MARIADB: always `` `name` `` (safe for reserved words and case).
 /// - TRINO_PRESTO / SNOWFLAKE / REDSHIFT: optionally `"name"` (ANSI identifier quoting).
 string DialectQuoteIdent(const string &name, SqlDialect dialect);
