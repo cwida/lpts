@@ -1,5 +1,5 @@
 # name: test/sql/virtual_columns.test
-# description: path/reader-derived virtual columns (filename / file_row_number / file_index) are refused
+# description: path/reader-derived virtual columns are refused
 # group: [sql]
 
 require lpts
@@ -23,6 +23,11 @@ LPTS_UNSUPPORTED_VIRTUAL_COLUMN
 
 statement error
 SELECT sql FROM lpts_query('SELECT file_row_number FROM ''__TEST_DIR__/vc.parquet''');
+----
+LPTS_UNSUPPORTED_VIRTUAL_COLUMN
+
+statement error
+SELECT sql FROM lpts_query('SELECT file_row_group_number FROM ''__TEST_DIR__/vc.parquet''');
 ----
 LPTS_UNSUPPORTED_VIRTUAL_COLUMN
 

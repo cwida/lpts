@@ -13,20 +13,30 @@ namespace duckdb {
 
 class BoundAggregateExpression;
 class BoundFunctionExpression;
+class BoundSimpleFunction;
 class BoundWindowExpression;
+class ClientContext;
 class Expression;
 class TableFilter;
+class LogicalGet;
 
 class LptsExpressionRenderer {
 public:
 	using BindingResolver = std::function<string(const ColumnBinding &, const char *)>;
 
-	LptsExpressionRenderer(SqlDialect dialect, BindingResolver binding_resolver);
+	LptsExpressionRenderer(ClientContext &context, SqlDialect dialect, BindingResolver binding_resolver);
 
 	string ExpressionToAliasedString(const unique_ptr<Expression> &expression) const;
+	string ExpressionToAliasedString(const Expression &expression) const;
+	static bool IsRemovableConstantOrderKey(const BoundOrderByNode &order);
 	string OrderByToAliasedString(const BoundOrderByNode &order) const;
 	string WindowExpressionToAliasedString(const BoundWindowExpression &window) const;
-	bool TableFilterToSql(const TableFilter &filter, const string &column_name, string &result) const;
+	vector<string> ScanFiltersToSql(const LogicalGet &get, const string &qualifier = "") const;
+	bool RenderStructExtractPath(const string &base_expression, const LogicalType &base_type, const ColumnIndex &index,
+	                             string &result, string &leaf_name) const;
+	bool FilterExpressionToSql(const Expression &expr, string &result) const;
+	bool TableFilterToSql(const TableFilter &filter, const string &column_name, const LogicalType &column_type,
+	                      string &result) const;
 
 	static bool ExpressionContainsColumnRef(const Expression &expr);
 	static string QuantileArgument(const BoundAggregateExpression &aggregate);
@@ -39,23 +49,20 @@ public:
 	static bool IsQuantileAggregate(const string &agg_name);
 	static string StripTablePrefix(const string &cte_column_name);
 	static string StringAggSeparator(const BoundAggregateExpression &aggregate);
+	static string FunctionNameForDialect(const BoundSimpleFunction &function, const string &name, SqlDialect dialect);
 	// For a list_aggregate/list_aggr wrapping string_agg (how array_to_string compiles), returns the
 	// trailing `, '<sep>'` argument recovered from the nested string_agg's bind data; empty otherwise.
 	static string ListAggrStringAggSeparatorArg(const BoundFunctionExpression &func_expr);
 	static string GroupingSetsToClause(const vector<string> &group_names, const vector<GroupingSet> &grouping_sets);
 
 private:
-	// Render a constant whose type contains an UNNAMED struct at some depth (e.g. list_zip's
-	// STRUCT(DATE)[]): such a type cannot be written in SQL, so the value is rebuilt structurally —
-	// row(...) / struct_pack(...) / [...] / map(...) — with leaf values going through the normal
-	// constant path (keeping their type-fidelity CASTs).
-	string RenderConstantContainingUnnamedStruct(const Value &value) const;
 	string WindowFunctionName(const BoundWindowExpression &window) const;
 	string WindowRangeFrameOffsetToAliasedString(const BoundWindowExpression &window,
 	                                             const unique_ptr<Expression> &expr, bool preceding) const;
 	string WindowFrameStartToAliasedString(const BoundWindowExpression &window, string &units) const;
 	string WindowFrameEndToAliasedString(const BoundWindowExpression &window, string &units) const;
 
+	ClientContext &context;
 	SqlDialect dialect;
 	BindingResolver binding_resolver;
 	// While rendering a lambda body, maps a captured BoundReferenceExpression index to the rendered SQL of

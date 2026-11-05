@@ -1,8 +1,11 @@
 #include "lpts_helpers.hpp"
+#include "lpts_ast.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/tableref/at_clause.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "lpts_sql_scanner.hpp"
 
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -43,8 +46,70 @@ string JoinConditionsToSQL(const vector<string> &conditions) {
 	return VecToSeparatedList(conditions, " AND ");
 }
 
+bool TypeContainsAggregateState(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::LEGACY_AGGREGATE_STATE || type.IsAggregateState()) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::LIST:
+		return TypeContainsAggregateState(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return TypeContainsAggregateState(ArrayType::GetChildType(type));
+	case LogicalTypeId::STRUCT:
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsAggregateState(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::MAP:
+		return TypeContainsAggregateState(MapType::KeyType(type)) ||
+		       TypeContainsAggregateState(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+bool PlanHasRecursiveCte(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
+		return true;
+	}
+	for (const auto &child : op.children) {
+		if (PlanHasRecursiveCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool AstHasRecursiveCte(const AstNode &node) {
+	if (node.NodeType() == "RecursiveCte") {
+		return true;
+	}
+	for (const auto &child : node.children) {
+		if (AstHasRecursiveCte(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+string BuildRecursiveCheckQuery(string original_sql, string rewritten_sql, const string &verdict_function) {
+	if (!original_sql.empty() && original_sql.back() == ';') {
+		original_sql.pop_back();
+	}
+	if (!rewritten_sql.empty() && rewritten_sql.back() == ';') {
+		rewritten_sql.pop_back();
+	}
+	return "WITH __lpts_orig AS MATERIALIZED (" + original_sql + "), __lpts_rew AS MATERIALIZED (" + rewritten_sql +
+	       "), __lpts_chk AS MATERIALIZED (SELECT " + verdict_function +
+	       "(NOT EXISTS (SELECT * FROM __lpts_orig EXCEPT ALL SELECT * FROM __lpts_rew) AND "
+	       "NOT EXISTS (SELECT * FROM __lpts_rew EXCEPT ALL SELECT * FROM __lpts_orig)) AS ok) "
+	       "SELECT o.* FROM __lpts_orig o CROSS JOIN __lpts_chk c";
+}
+
 string QuoteIdentifier(const string &identifier) {
-	return KeywordHelper::WriteOptionallyQuoted(identifier);
+	return SQLIdentifier::ToString(identifier);
 }
 
 string VecToQuotedIdentifierList(const vector<string> &input_list, const string &separator) {
@@ -80,8 +145,19 @@ string RenderSnapshotSuffix(optional_ptr<AtClause> snapshot, SqlDialect dialect)
 	if (dialect == SqlDialect::DUCKDB) {
 		return " " + snapshot->ToString();
 	}
-	auto parameter = LowerCopy(snapshot->Unit());
-	auto value = snapshot->ExpressionMutable()->ToString();
+	auto parameter = LowerCopy(snapshot->Unit().GetIdentifierName());
+	auto &expression = *snapshot->ExpressionMutable();
+	auto value = expression.ToString();
+	// DuckDB 2.0 coerces native snapshot versions to UBIGINT in the parsed AT
+	// clause. Spark has no UBIGINT type, and VERSION AS OF already defines the
+	// value's role, so preserve the original expression without that local cast.
+	if (dialect == SqlDialect::SPARK && parameter == "version" &&
+	    expression.GetExpressionClass() == ExpressionClass::CAST) {
+		auto &cast = expression.Cast<CastExpression>();
+		if (!cast.IsTryCast() && StringUtil::CIEquals(cast.TargetType().ToString(), "UBIGINT")) {
+			value = cast.Child().ToString();
+		}
+	}
 	if (dialect == SqlDialect::SPARK && (parameter == "version" || parameter == "timestamp")) {
 		return (parameter == "version" ? string(" VERSION AS OF ") : string(" TIMESTAMP AS OF ")) + value;
 	}
@@ -89,14 +165,14 @@ string RenderSnapshotSuffix(optional_ptr<AtClause> snapshot, SqlDialect dialect)
 	                        "table scan", "no verified time-travel syntax for target dialect");
 }
 
-string DialectQualifiedTableName(const string &catalog, const string &schema, const string &table_name,
+string DialectQualifiedTableName(const string &catalog, const vector<string> &schema_path, const string &table_name,
                                  SqlDialect dialect) {
 	if (DialectUsesSingleQuotedTablePath(dialect)) {
 		string table_path;
 		if (!catalog.empty()) {
 			table_path += catalog;
 		}
-		if (!schema.empty()) {
+		for (const auto &schema : schema_path) {
 			if (!table_path.empty()) {
 				table_path += ".";
 			}
@@ -109,13 +185,20 @@ string DialectQualifiedTableName(const string &catalog, const string &schema, co
 		return DialectQuoteIdent(table_path, dialect);
 	}
 	if (DialectUsesSchemaQualifiedTableNames(dialect)) {
-		if (schema.empty()) {
+		if (schema_path.empty()) {
 			return DialectQuoteIdent(table_name, dialect);
 		}
-		return DialectQuoteIdent(schema, dialect) + "." + DialectQuoteIdent(table_name, dialect);
+		vector<string> path = schema_path;
+		path.push_back(table_name);
+		return DialectVecToQuotedIdentifierList(path, dialect, ".");
 	}
-	return DialectQuoteIdent(catalog, dialect) + "." + DialectQuoteIdent(schema, dialect) + "." +
-	       DialectQuoteIdent(table_name, dialect);
+	vector<string> path;
+	if (!catalog.empty()) {
+		path.push_back(catalog);
+	}
+	path.insert(path.end(), schema_path.begin(), schema_path.end());
+	path.push_back(table_name);
+	return DialectVecToQuotedIdentifierList(path, dialect, ".");
 }
 
 [[noreturn]] void ThrowLptsNotImplemented(const string &code, SqlDialect dialect, const string &feature_kind,

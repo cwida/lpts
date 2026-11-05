@@ -120,7 +120,7 @@ pass without error.
 LPTS is intended to cover all logical operators produced by optimized DuckDB
 SELECT plans. The regression suite round-trips all 22 TPC-H queries, the SQLStorm
 TPC-H corpus (17k queries, zero incorrect results), and DuckDB's own sqllogic test
-corpus (~3300 files run under `lpts_check`, gated in CI-style via `make test`:
+corpus (thousands of files run under `lpts_check`, gated by `make test`:
 zero wrong translations and zero invalid-SQL failures). It exercises joins,
 aggregates, windows, set operations, CTEs, recursive CTEs, lateral joins, table
 functions, DuckLake scans, and inserts.

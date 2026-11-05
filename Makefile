@@ -3,6 +3,7 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Configuration of extension
 EXT_NAME=lpts
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
+OVERRIDE_GIT_DESCRIBE?=v2.0.0
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
@@ -28,5 +29,22 @@ coverage-check: release
 coverage-baseline: release
 	build/release/extension/lpts/lpts_corpus_gate --update-baseline
 
-# `make test` = the extension's own unit tests, then the corpus coverage gate.
+# `make test` runs SQLStorm regressions, unit tests, then the DuckDB corpus gate.
 test: coverage-check
+
+# Keep the exact SQLStorm regressions in their upstream corpus rather than
+# duplicating hundreds of lines of SQL in test/sql/cte.test.
+ifneq ($(OS),Windows_NT)
+.PHONY: sqlstorm-regressions
+sqlstorm-regressions: release
+	build/release/extension/lpts/lpts_sqlstorm_benchmark --tpch_sf 0.001 --timeout 10 \
+		--cases 32742,33660,1137,20918,20200,21010,21797,4020,7445,30619 \
+		--require-success --db /tmp/lpts-sqlstorm-regressions.db --out /tmp/lpts-sqlstorm-regressions.csv
+
+# Linux CI invokes test_release once in its build container and again on the
+# host, where extension-ci-tools skips tests. Keep the benchmark in the container
+# so the host does not reconfigure a build tree created at /duckdb_build_dir.
+ifneq ($(LINUX_CI_IN_DOCKER),0)
+test_release: sqlstorm-regressions
+endif
+endif

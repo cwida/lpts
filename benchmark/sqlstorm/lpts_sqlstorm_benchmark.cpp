@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <map>
 #include <poll.h>
+#include <set>
 #include <signal.h>
 #include <sstream>
 #include <string>
@@ -268,7 +269,7 @@ static bool IsCrashError(const string &error) {
 static bool IsNotImplementedError(const string &error) {
 	return error.find("Not implemented Error:") != string::npos || error.find("not implemented") != string::npos ||
 	       error.find("not yet implemented") != string::npos || error.find("not (yet) supported") != string::npos ||
-	       error.find("Unsupported expression") != string::npos;
+	       error.find("Unsupported expression") != string::npos || error.find("LPTS_UNSUPPORTED_") != string::npos;
 }
 
 static string EscapeSQLLiteral(const string &input) {
@@ -425,7 +426,7 @@ static void ConfigureConnection(Connection &con) {
 
 			WritePhase(write_fd, "duckdb");
 			auto duckdb_start = std::chrono::steady_clock::now();
-			unique_ptr<MaterializedQueryResult> duckdb_result;
+			unique_ptr<QueryResult> duckdb_result;
 			try {
 				duckdb_result = con.Query(sql);
 			} catch (std::exception &ex) {
@@ -449,7 +450,7 @@ static void ConfigureConnection(Connection &con) {
 				if (compare_perf) {
 					string lpts_query_sql = "SELECT sql FROM lpts_query('" + EscapeSQLLiteral(sql) + "')";
 					WritePhase(write_fd, "lpts_generate");
-					unique_ptr<MaterializedQueryResult> lpts_query_result;
+					unique_ptr<QueryResult> lpts_query_result;
 					try {
 						lpts_query_result = con.Query(lpts_query_sql);
 					} catch (std::exception &ex) {
@@ -475,10 +476,10 @@ static void ConfigureConnection(Connection &con) {
 							summary.state = QueryState::LPTS_ERROR;
 						}
 					} else {
-						string lpts_sql = lpts_query_result->GetValue(0, 0).ToString();
+						string lpts_sql = lpts_query_result->Collection().GetValue(0, 0).ToString();
 						WritePhase(write_fd, "lpts_exec");
 						auto lpts_exec_start = std::chrono::steady_clock::now();
-						unique_ptr<MaterializedQueryResult> lpts_exec_result;
+						unique_ptr<QueryResult> lpts_exec_result;
 						try {
 							lpts_exec_result = con.Query(lpts_sql);
 						} catch (std::exception &ex) {
@@ -518,7 +519,7 @@ static void ConfigureConnection(Connection &con) {
 				if (summary.state == QueryState::SUCCESS) {
 					WritePhase(write_fd, "lpts_check");
 					con.Query("SET lpts_check=true");
-					unique_ptr<MaterializedQueryResult> check_result;
+					unique_ptr<QueryResult> check_result;
 					try {
 						check_result = con.Query(sql);
 					} catch (std::exception &ex) {
@@ -724,8 +725,14 @@ struct ForkWorker {
 					return SR_CHILD_DIED;
 				}
 				if (message_type == static_cast<uint8_t>(WorkerMessage::PHASE)) {
-					if (!ReadString(from_child_fd, active_phase)) {
+					string next_phase;
+					if (!ReadString(from_child_fd, next_phase)) {
 						return SR_CHILD_DIED;
+					}
+					// The child may have finished DuckDB just after the deadline. Attribute that
+					// timeout to the phase that consumed the budget, not the one it entered next.
+					if (std::chrono::steady_clock::now() < deadline) {
+						active_phase = std::move(next_phase);
 					}
 					continue;
 				}
@@ -1058,8 +1065,9 @@ static bool WriteCSV(const string &out_csv, const vector<string> &query_files,
 	return true;
 }
 
-int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, double timeout_s, double tpch_sf,
-                         bool compare_perf) {
+int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, const string &database_path,
+                         double timeout_s, double tpch_sf, bool compare_perf, const string &cases,
+                         bool require_success) {
 	try {
 		string sf_str = FormatSF(tpch_sf);
 		string qdir = queries_dir.empty() ? FindQueriesDir() : queries_dir;
@@ -1070,13 +1078,28 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 		}
 
 		auto query_files = CollectQueryFiles(qdir);
+		if (!cases.empty()) {
+			std::set<string> requested;
+			std::istringstream names(cases);
+			string name;
+			while (std::getline(names, name, ',')) {
+				requested.insert(name);
+			}
+			query_files.erase(std::remove_if(query_files.begin(), query_files.end(), [&](const string &path) {
+			                   return requested.erase(QueryName(path)) == 0;
+		                   }), query_files.end());
+			if (!requested.empty()) {
+				Log("ERROR: SQLStorm case not found: " + *requested.begin());
+				return 1;
+			}
+		}
 		if (query_files.empty()) {
 			Log("ERROR: No .sql files found in " + qdir);
 			return 1;
 		}
 
 		string csv_path = out_csv.empty() ? ("benchmark/sqlstorm/lpts_sqlstorm_tpch_sf" + sf_str + ".csv") : out_csv;
-		string db_path = "tpch_sf" + sf_str + "_lpts_sqlstorm.db";
+		string db_path = database_path.empty() ? "tpch_sf" + sf_str + "_lpts_sqlstorm.db" : database_path;
 		bool db_exists = FileExists(db_path);
 
 		Log("LPTS SQLStorm TPC-H benchmark");
@@ -1136,7 +1159,11 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 			}
 
 			if (summary.state == QueryState::TIMEOUT || summary.state == QueryState::DUCKDB_TIMEOUT ||
-			    summary.state == QueryState::LPTS_TIMEOUT || summary.state == QueryState::CRASH) {
+			    summary.state == QueryState::LPTS_TIMEOUT || summary.state == QueryState::CRASH ||
+			    (summary.state == QueryState::DUCKDB_ERROR &&
+			     summary.error.find("INTERNAL Error:") != string::npos)) {
+				// DuckDB invalidates its connection after an INTERNAL error. Reopen it so
+				// the next query is judged independently.
 				worker.Stop();
 			}
 
@@ -1160,6 +1187,10 @@ int RunSQLStormBenchmark(const string &queries_dir, const string &out_csv, doubl
 		if (!WriteCSV(csv_path, query_files, summaries, compare_perf)) {
 			return 1;
 		}
+		if (require_success && stats.success != total) {
+			Log("ERROR: SQLStorm regression failed");
+			return 1;
+		}
 		return 0;
 	} catch (std::exception &ex) {
 		Log(string("Fatal error: ") + ex.what());
@@ -1175,9 +1206,12 @@ static void PrintUsage() {
 	          << "  --queries <dir>    SQLStorm TPC-H queries directory\n"
 	          << "                     (default: benchmark/sqlstorm/SQLStorm/v1.0/tpch/queries)\n"
 	          << "  --out <csv>        Output CSV path (default: benchmark/sqlstorm/lpts_sqlstorm_tpch_sf*.csv)\n"
+	          << "  --db <path>        Benchmark database path (default: tpch_sf*_lpts_sqlstorm.db)\n"
 	          << "  --timeout <sec>    Per-query timeout in seconds (default: 10)\n"
 	          << "  --tpch_sf <float>  TPC-H scale factor (default: 1.0)\n"
 	          << "  --compare_perf     Compare DuckDB execution against generated LPTS SQL execution\n"
+	          << "  --cases <ids>      Run only these comma-separated SQLStorm case IDs\n"
+	          << "  --require-success  Exit nonzero unless every selected case succeeds\n"
 	          << "  -h, --help         Show this help message\n";
 }
 
@@ -1186,9 +1220,12 @@ int main(int argc, char **argv) {
 
 	std::string queries_dir;
 	std::string out_csv;
+	std::string database_path;
 	double timeout_s = 10.0;
 	double tpch_sf = 1.0;
 	bool compare_perf = false;
+	bool require_success = false;
+	std::string cases;
 
 	for (int i = 1; i < argc; ++i) {
 		std::string arg = argv[i];
@@ -1199,12 +1236,18 @@ int main(int argc, char **argv) {
 			queries_dir = argv[++i];
 		} else if (arg == "--out" && i + 1 < argc) {
 			out_csv = argv[++i];
+		} else if (arg == "--db" && i + 1 < argc) {
+			database_path = argv[++i];
 		} else if (arg == "--timeout" && i + 1 < argc) {
 			timeout_s = std::stod(argv[++i]);
 		} else if (arg == "--tpch_sf" && i + 1 < argc) {
 			tpch_sf = std::stod(argv[++i]);
 		} else if (arg == "--compare_perf") {
 			compare_perf = true;
+		} else if (arg == "--cases" && i + 1 < argc) {
+			cases = argv[++i];
+		} else if (arg == "--require-success") {
+			require_success = true;
 		} else {
 			std::cerr << "Unknown option: " << arg << "\n";
 			PrintUsage();
@@ -1212,5 +1255,6 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, timeout_s, tpch_sf, compare_perf);
+	return duckdb::RunSQLStormBenchmark(queries_dir, out_csv, database_path, timeout_s, tpch_sf, compare_perf, cases,
+	                                    require_success);
 }

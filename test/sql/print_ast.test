@@ -42,7 +42,7 @@ statement ok
 INSERT INTO users_pop VALUES (1, 'Alice', 20), (2, 'Bob', 30);
 
 query I
-SELECT ast LIKE '%Project%' AND ast LIKE '%Get%' AND ast LIKE '%age>25%' FROM print_ast_query('SELECT * FROM users_pop WHERE age > 25');
+SELECT ast LIKE '%Project%' AND ast LIKE '%Get%' AND ast LIKE '%age%>%25%' FROM print_ast_query('SELECT * FROM users_pop WHERE age > 25');
 ----
 true
 

@@ -6,10 +6,12 @@ Tests are DuckDB SQLLogicTests under `test/sql/`.
 
 ```bash
 GEN=ninja make unittest   # LPTS's own tests (test/sql/*, fast — use during iteration)
-GEN=ninja make test       # unittest + the DuckDB-corpus coverage gate (~4 min — run before pushing)
+GEN=ninja make test       # SQLStorm regressions + unittest + DuckDB-corpus gate
 ```
 
 (`build/release/test/unittest "test/sql/*"` is the underlying command for the unit tests.)
+On native Unix builds, `make test` also runs ten exact queries from the pinned SQLStorm corpus
+with `--require-success`; the corpus must be initialized as a Git submodule.
 
 ## Run One Test File
 
