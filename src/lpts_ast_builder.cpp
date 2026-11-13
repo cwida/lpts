@@ -1466,7 +1466,7 @@ private:
 					break;
 				}
 			}
-			return get_node;
+			return std::move(get_node);
 		}
 
 		//----------------------------------------------------------------------
@@ -2086,7 +2086,7 @@ private:
 				                      join_node->mark_membership_comparisons, join_node->mark_membership_lhs,
 				                      join_node->mark_membership_rhs, join_node->mark_join_has_equality);
 			}
-			return join_node;
+			return std::move(join_node);
 		}
 
 		//----------------------------------------------------------------------
@@ -2325,7 +2325,7 @@ private:
 					}
 				}
 			}
-			return distinct_node;
+			return std::move(distinct_node);
 		}
 
 		//----------------------------------------------------------------------
