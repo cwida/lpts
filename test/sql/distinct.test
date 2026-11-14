@@ -165,3 +165,37 @@ SELECT DISTINCT ON (g) g, k, k * 2 AS k2 FROM don ORDER BY g, k DESC, v;
 # DISTINCT ON over a join, ordered by a total key — exercises the rewrite below a join/order.
 statement ok
 SELECT DISTINCT ON (u.id) u.id, d.v FROM users u JOIN don d ON u.age = d.k * 3 ORDER BY u.id, d.g;
+
+# --- DISTINCT keeps constant projection columns and remains empty on empty input ---
+statement ok
+CREATE TABLE distinct_constants (id INTEGER);
+
+statement ok
+INSERT INTO distinct_constants VALUES (1), (1), (2);
+
+query ITTTTT rowsort
+SELECT DISTINCT id, CAST(NULL AS VARCHAR) AS machine_key, 'Ready' AS category,
+    'Not Ready' AS state, 'Low' AS lower_bound, 'High' AS upper_bound
+FROM distinct_constants;
+----
+1 NULL Ready Not Ready Low High
+2 NULL Ready Not Ready Low High
+
+statement ok
+SELECT DISTINCT id, CAST(NULL AS VARCHAR) AS machine_key, 'Ready' AS category,
+    'Not Ready' AS state, 'Low' AS lower_bound, 'High' AS upper_bound
+FROM distinct_constants;
+
+statement ok
+CREATE TABLE empty_distinct_constants (id INTEGER);
+
+query ITTTTT rowsort
+SELECT DISTINCT id, CAST(NULL AS VARCHAR) AS machine_key, 'Ready' AS category,
+    'Not Ready' AS state, 'Low' AS lower_bound, 'High' AS upper_bound
+FROM empty_distinct_constants;
+----
+
+statement ok
+SELECT DISTINCT id, CAST(NULL AS VARCHAR) AS machine_key, 'Ready' AS category,
+    'Not Ready' AS state, 'Low' AS lower_bound, 'High' AS upper_bound
+FROM empty_distinct_constants;

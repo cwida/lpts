@@ -1726,15 +1726,12 @@ private:
 				if (!op->children.empty()) {
 					RegisterChildBindingFallbacks(*g, op->children[0]->GetColumnBindings());
 				}
-				// Grouping by a bare constant is a decorrelation artifact (e.g. lateral GROUPING SETS over a
-				// correlated `SELECT 1, 2 ...`, where the projected constants become group keys). It renders
-				// as `GROUP BY 2`, which SQL re-reads as an ordinal (2nd select column) — a different grouping.
-				// Refuse rather than emit that.
-				if (g->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+				// A constant group key is safe for a plain GROUP BY, but a constant introduced by a
+				// decorrelated GROUPING SETS plan cannot be mapped faithfully to static SQL.
+				if (g->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT && agg.grouping_sets.size() > 1) {
 					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_GROUP_BY", dialect, "group_by", "constant",
 					                        "LOGICAL_AGGREGATE_AND_GROUP_BY",
-					                        "grouping by a constant (a correlated/lateral grouping-sets "
-					                        "decorrelation artifact) cannot be reproduced as static SQL");
+						"constant group keys across multiple grouping sets cannot be reproduced as static SQL");
 				}
 				if (g->type == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
@@ -1763,6 +1760,13 @@ private:
 				} else {
 					// Non-column GROUP BY expression (COALESCE, CASE, function, etc.)
 					string expr_str = ExpressionToAliasedString(g);
+					// A bare integer in GROUP BY is parsed as an ordinal in several SQL dialects. Keep
+					// INTEGER constants as expressions so the grouping remains on the literal value.
+					if (g->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+					    g->return_type.id() == LogicalTypeId::INTEGER &&
+					    !g->Cast<BoundConstantExpression>().value.IsNull()) {
+						expr_str = "(" + expr_str + " + 0)";
+					}
 					string alias = g->HasAlias() ? g->GetAlias() : ("grp_" + std::to_string(i));
 					group_names.push_back(expr_str);
 					auto new_col = MakeDedupedColumn(group_table_index, expr_str, std::move(alias), seen_names, i);
