@@ -319,7 +319,7 @@ INSERT INTO constant_group_nonempty VALUES (1), (2), (3);
 query II
 SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_nonempty GROUP BY 'fixed';
 ----
-fixed 3
+fixed	3
 
 statement ok
 SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_nonempty GROUP BY 'fixed';
