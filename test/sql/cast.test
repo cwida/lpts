@@ -218,9 +218,10 @@ SELECT '10000000000000000000000000000000'::BIT::INT;
 statement ok
 SELECT -2::INTEGER * 1073741824::INTEGER;
 
-# the generated INT_MIN literal keeps type INTEGER (not BIGINT)
+# DuckDB 2.0 parses its native minimum INTEGER literal as INTEGER (not BIGINT), so the native
+# constant exporter no longer needs an explicit cast around this folded value.
 query I
-SELECT sql LIKE '%CAST(''-2147483648'' AS INTEGER)%' FROM lpts_query('SELECT ''-2147483648.1''::INTEGER');
+SELECT sql LIKE '%SELECT  -2147483648 AS scalar_0%' FROM lpts_query('SELECT ''-2147483648.1''::INTEGER');
 ----
 true
 

@@ -1,7 +1,7 @@
 #include "sql_dialect.hpp"
 #include "lpts_helpers.hpp"
 
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 
 namespace duckdb {
 
@@ -111,7 +111,7 @@ string DialectQuoteIdent(const string &name, SqlDialect dialect) {
 		out << '`';
 		return out.str();
 	}
-	return KeywordHelper::WriteOptionallyQuoted(name);
+	return SQLIdentifier::ToString(name);
 }
 
 } // namespace duckdb

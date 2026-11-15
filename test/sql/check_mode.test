@@ -4,6 +4,17 @@
 
 require lpts
 
+# A mismatch is an ordinary query error; it must not invalidate the connection.
+statement error
+SELECT lpts_internal_check_verdict(false);
+----
+LPTS check failed
+
+query I
+SELECT 42;
+----
+42
+
 statement ok
 CREATE TABLE t(a INTEGER, b VARCHAR, c INTEGER);
 
@@ -153,3 +164,24 @@ SELECT count(*) FROM lpts_query('SELECT a FROM t WHERE a >= 2');
 
 statement ok
 SET lpts_check = false;
+
+# Profiling cannot report the original query faithfully for a combined check plan.
+# A strict check must fail explicitly instead of silently skipping verification.
+statement ok
+SET lpts_check = true;
+
+statement ok
+SET enable_profiling = 'no_output';
+
+statement error
+SELECT 1;
+----
+LPTS check cannot run while profiling is enabled
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT 1;
+----
+1

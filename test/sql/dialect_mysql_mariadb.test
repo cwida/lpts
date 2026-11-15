@@ -83,7 +83,7 @@ SELECT sql LIKE '%CAST(id AS SMALLINT)%' AS mysql_preserves_smallint_cast FROM l
 true
 
 statement error
-SELECT sql FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql FROM lpts_query('SELECT list_transform(vals, lambda x: x + 1) AS plus FROM events');
 ----
 LPTS_UNSUPPORTED_FUNCTION
 

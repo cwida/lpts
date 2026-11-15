@@ -61,7 +61,7 @@ string RenderAstTree(const AstNode &root) {
 	CreateAstTreeRecursive(tree, root, 0, 0);
 
 	TextTreeRenderer renderer;
-	std::stringstream ss;
+	StringTreeRenderer ss;
 	renderer.ToStream(tree, ss);
 	return ss.str();
 }

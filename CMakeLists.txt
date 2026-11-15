@@ -35,29 +35,40 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-set(LPTS_BENCHMARK_LINK_LIBS
-    duckdb_static
-    duckdb_generated_extension_loader
-    ${EXTENSION_NAME}
-    tpch_extension
-    core_functions_extension
-    parquet_extension
-    duckdb_static)
+set(LPTS_BENCHMARK_LINK_LIBS duckdb_static ${EXTENSION_NAME} tpch_extension
+                             core_functions_extension parquet_extension)
 
 if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
-    list(APPEND LPTS_BENCHMARK_LINK_LIBS jemalloc_extension)
+  list(APPEND LPTS_BENCHMARK_LINK_LIBS jemalloc_extension)
 endif()
 
 if(NOT EMSCRIPTEN AND NOT WIN32)
-    add_executable(lpts_sqlstorm_benchmark benchmark/sqlstorm/lpts_sqlstorm_benchmark.cpp)
-    target_link_libraries(lpts_sqlstorm_benchmark ${LPTS_BENCHMARK_LINK_LIBS})
+  add_executable(lpts_sqlstorm_benchmark
+                 benchmark/sqlstorm/lpts_sqlstorm_benchmark.cpp)
+  target_link_libraries(lpts_sqlstorm_benchmark ${LPTS_BENCHMARK_LINK_LIBS})
+  # DuckDB 2.0 generates the static-extension registry per executable. These
+  # targets are created in sibling extension directories after this one, so link
+  # their archives above and generate this executable's registry directly.
+  set(LPTS_BENCHMARK_EXTENSION_LOADER
+      ${CMAKE_CURRENT_BINARY_DIR}/lpts_sqlstorm_benchmark_static_extension_loader.c
+  )
+  duckdb_write_static_extension_loader(${LPTS_BENCHMARK_EXTENSION_LOADER} lpts
+                                       tpch core_functions parquet)
+  target_sources(
+    lpts_sqlstorm_benchmark
+    PRIVATE
+      ${LPTS_BENCHMARK_EXTENSION_LOADER}
+      ${DUCKDB_MODULE_BASE_DIR}/extension/loader/static_extension_autoregister.cpp
+  )
 endif()
 
-# Standalone driver for the DuckDB-sqllogic-corpus coverage gate (`make coverage-check`). It only spawns
-# `unittest` subprocesses and parses their LPTS verdict logs, so it links no DuckDB code.
+# Standalone driver for the DuckDB-sqllogic-corpus coverage gate (`make
+# coverage-check`). It only spawns `unittest` subprocesses and parses their LPTS
+# verdict logs, so it links no DuckDB code.
 if(NOT EMSCRIPTEN)
-    add_executable(lpts_corpus_gate test/corpus_gate/lpts_corpus_gate.cpp)
-    set_target_properties(lpts_corpus_gate PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    find_package(Threads REQUIRED)
-    target_link_libraries(lpts_corpus_gate Threads::Threads)
+  add_executable(lpts_corpus_gate test/corpus_gate/lpts_corpus_gate.cpp)
+  set_target_properties(lpts_corpus_gate PROPERTIES CXX_STANDARD 17
+                                                    CXX_STANDARD_REQUIRED ON)
+  find_package(Threads REQUIRED)
+  target_link_libraries(lpts_corpus_gate Threads::Threads)
 endif()

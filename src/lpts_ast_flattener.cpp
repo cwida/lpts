@@ -28,11 +28,11 @@ private:
 	/// consumed when flattening AstCteRefNode.
 	/// For RecursiveCteNode: stores {recursive_cte_name, stripped_col_names} so that
 	/// self-referencing CteRef nodes inside the recursive step resolve to the recursive CTE.
-	unordered_map<idx_t, pair<string, vector<string>>> cte_index_to_body_info;
+	unordered_map<TableIndex, pair<string, vector<string>>> cte_index_to_body_info;
 
 	/// Maps AstDelimGetNode::table_index → name of the outer left CTE to SELECT DISTINCT from.
 	/// Populated when flattening AstDelimJoinNode (before the right subtree); consumed by AstDelimGetNode.
-	unordered_map<idx_t, string> delim_get_source_cte;
+	unordered_map<TableIndex, string> delim_get_source_cte;
 
 	static string InlineJoinKeyword(JoinType join_type, const string &context) {
 		switch (join_type) {
@@ -76,6 +76,10 @@ private:
 			}
 		}
 		return true;
+	}
+
+	static bool IsBareUnsignedInteger(const string &sql) {
+		return !sql.empty() && sql.find_first_not_of("0123456789") == string::npos;
 	}
 
 	static bool IsQualifiedColumnToken(const string &s) {
@@ -235,6 +239,8 @@ private:
 		}
 		if (!conditions.empty()) {
 			sql += " ON " + VecToSeparatedList(conditions, " AND ");
+		} else {
+			sql += " ON TRUE";
 		}
 		return sql;
 	}
@@ -263,13 +269,36 @@ private:
 	// if expressed as flat CTEs. Instead, the entire step is serialized as a
 	// nested subquery with all column aliases expressed inline.
 	//--------------------------------------------------------------------------
-	string AstToInlineSQL(const AstNode &ast_node) const {
-		std::map<idx_t, string> inline_delim_sources;
+	string AstToInlineSQL(const AstNode &ast_node) {
+		std::map<TableIndex, string> inline_delim_sources;
 		return AstToInlineSQL(ast_node, inline_delim_sources);
 	}
 
-	string AstToInlineSQL(const AstNode &ast_node, std::map<idx_t, string> &inline_delim_sources) const {
+	string AstToInlineSQL(const AstNode &ast_node, std::map<TableIndex, string> &inline_delim_sources) {
 		const string &type = ast_node.NodeType();
+		if (type == "MaterializedCte") {
+			const auto &mat = static_cast<const AstMaterializedCteNode &>(ast_node);
+			D_ASSERT(ast_node.children.size() == 2);
+			const string body_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
+			const auto body_columns = ast_node.children[0]->OutputColumnNames();
+			const string local_name = "__lpts_step_cte_" + std::to_string(mat.cte_table_index.index);
+			auto previous = cte_index_to_body_info.find(mat.cte_table_index);
+			const bool had_previous = previous != cte_index_to_body_info.end();
+			pair<string, vector<string>> saved;
+			if (had_previous) {
+				saved = previous->second;
+			}
+			cte_index_to_body_info[mat.cte_table_index] = {local_name, body_columns};
+			const string outer_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
+			if (had_previous) {
+				cte_index_to_body_info[mat.cte_table_index] = std::move(saved);
+			} else {
+				cte_index_to_body_info.erase(mat.cte_table_index);
+			}
+			return "WITH " + local_name + " (" + VecToSeparatedList(body_columns) + ") AS " +
+			       (mat.force_materialization ? "MATERIALIZED " : "") + "(" + body_sql + ") SELECT * FROM (" +
+			       outer_sql + ")";
+		}
 
 		if (type == "Get") {
 			const AstGetNode &get = static_cast<const AstGetNode &>(ast_node);
@@ -290,7 +319,7 @@ private:
 			}
 			sql += " FROM ";
 			if (!get.catalog.empty()) {
-				sql += DialectQualifiedTableName(get.catalog, get.schema, get.table_name, dialect) +
+				sql += DialectQualifiedTableName(get.catalog, get.schema_path, get.table_name, dialect) +
 				       RenderSnapshotSuffix(get.snapshot.get(), dialect);
 			} else if (get.snapshot) {
 				sql += DialectQuoteIdent(get.table_name, dialect) + RenderSnapshotSuffix(get.snapshot.get(), dialect);
@@ -333,7 +362,7 @@ private:
 			auto it = cte_index_to_body_info.find(cte_ref.cte_table_index);
 			if (it == cte_index_to_body_info.end()) {
 				throw InternalException("AstToInlineSQL: CteRef references unknown CTE index %llu",
-				                        (unsigned long long)cte_ref.cte_table_index);
+				                        (unsigned long long)cte_ref.cte_table_index.index);
 			}
 			const string &src_name = it->second.first;
 			const vector<string> &src_cols = it->second.second;
@@ -359,7 +388,7 @@ private:
 				vector<string> pruned;
 				pruned.reserve(filter.projection_map.size());
 				for (auto idx : filter.projection_map) {
-					pruned.push_back(child_cols[idx]);
+					pruned.push_back(child_cols[idx.GetIndex()]);
 				}
 				select_list = VecToSeparatedList(pruned);
 			}
@@ -437,8 +466,8 @@ private:
 			D_ASSERT(ast_node.children.size() == 2);
 			string left_sql = AstToInlineSQL(*ast_node.children[0], inline_delim_sources);
 
-			std::map<idx_t, string> saved_sources;
-			for (const idx_t table_index : join.delim_table_indices) {
+			std::map<TableIndex, string> saved_sources;
+			for (const TableIndex table_index : join.delim_table_indices) {
 				auto existing = inline_delim_sources.find(table_index);
 				if (existing != inline_delim_sources.end()) {
 					saved_sources[table_index] = existing->second;
@@ -446,7 +475,7 @@ private:
 				inline_delim_sources[table_index] = left_sql;
 			}
 			string right_sql = AstToInlineSQL(*ast_node.children[1], inline_delim_sources);
-			for (const idx_t table_index : join.delim_table_indices) {
+			for (const TableIndex table_index : join.delim_table_indices) {
 				auto saved = saved_sources.find(table_index);
 				if (saved != saved_sources.end()) {
 					inline_delim_sources[table_index] = saved->second;
@@ -465,7 +494,7 @@ private:
 			if (it == inline_delim_sources.end()) {
 				throw NotImplementedException(
 				    "LPTS_UNSUPPORTED_RECURSIVE_STEP: DelimGet table_index=%llu has no inline DELIM_JOIN source",
-				    (unsigned long long)delim_get.table_index);
+				    (unsigned long long)delim_get.table_index.index);
 			}
 			string sql = "SELECT DISTINCT ";
 			for (size_t i = 0; i < delim_get.source_col_names.size(); i++) {
@@ -512,8 +541,11 @@ private:
 		if (type == "Order") {
 			const AstOrderNode &o = static_cast<const AstOrderNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
-			return "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ") ORDER BY " +
-			       VecToSeparatedList(o.order_items);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			if (!o.order_items.empty()) {
+				sql += " ORDER BY " + VecToSeparatedList(o.order_items);
+			}
+			return sql;
 		}
 
 		if (type == "Limit") {
@@ -532,8 +564,11 @@ private:
 		if (type == "TopN") {
 			const AstTopNNode &topn = static_cast<const AstTopNNode &>(ast_node);
 			D_ASSERT(ast_node.children.size() == 1);
-			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) +
-			             ") ORDER BY " + VecToSeparatedList(topn.order_items) + " LIMIT " + std::to_string(topn.limit);
+			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			if (!topn.order_items.empty()) {
+				sql += " ORDER BY " + VecToSeparatedList(topn.order_items);
+			}
+			sql += " LIMIT " + std::to_string(topn.limit);
 			if (topn.offset > 0) {
 				sql += " OFFSET " + std::to_string(topn.offset);
 			}
@@ -542,10 +577,42 @@ private:
 
 		if (type == "Union") {
 			const AstUnionNode &u = static_cast<const AstUnionNode &>(ast_node);
-			D_ASSERT(ast_node.children.size() == 2);
+			if (ast_node.children.empty()) {
+				throw InternalException("LPTS UNION: missing input");
+			}
+			if (ast_node.children.size() == 1) {
+				const auto child_columns = ast_node.children[0]->OutputColumnNames();
+				if (child_columns.size() < u.cte_column_names.size()) {
+					throw InternalException("LPTS UNION: single input has fewer columns than output");
+				}
+				vector<string> select_items;
+				for (idx_t i = 0; i < u.cte_column_names.size(); i++) {
+					select_items.push_back(DialectQuoteIdent(child_columns[i], dialect) + " AS " +
+					                       DialectQuoteIdent(u.cte_column_names[i], dialect));
+				}
+				return string(u.is_union_all ? "SELECT " : "SELECT DISTINCT ") + VecToSeparatedList(select_items) +
+				       " FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
+			}
 			string union_kw = u.is_union_all ? " UNION ALL " : " UNION ";
-			return "(" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")" + union_kw + "(" +
-			       AstToInlineSQL(*ast_node.children[1], inline_delim_sources) + ")";
+			string union_sql;
+			for (const auto &child : ast_node.children) {
+				if (!union_sql.empty()) {
+					union_sql += union_kw;
+				}
+				union_sql += "(" + AstToInlineSQL(*child, inline_delim_sources) + ")";
+			}
+			if (u.cte_column_names.empty()) {
+				return union_sql;
+			}
+			vector<string> aliases;
+			aliases.reserve(u.cte_column_names.size());
+			for (const auto &name : u.cte_column_names) {
+				aliases.push_back(DialectQuoteIdent(name, dialect));
+			}
+			// An inline UNION has no CTE header to rename the left branch's output columns to the
+			// LogicalSetOperation bindings. Add the equivalent positional boundary so a parent join/filter
+			// resolves the union bindings, not stale aliases from the first branch.
+			return "SELECT * FROM (" + union_sql + ") _union(" + VecToSeparatedList(aliases) + ")";
 		}
 
 		throw NotImplementedException(
@@ -679,6 +746,13 @@ private:
 			return nullptr;
 		}
 
+		// Do not inline one projection into another when either can throw. Inlining a constant-producing
+		// child can turn a runtime validation error into a binder error (for example, a dynamic JSON path
+		// that becomes constant after substitution), changing the statement's planning semantics.
+		if (proj_top && proj_bottom && (proj_top->can_throw || proj_bottom->can_throw)) {
+			return nullptr;
+		}
+
 		// An UNGROUPED aggregate (no GROUP BY keys, e.g. an implicit single-group `count_star()` from a
 		// HAVING-without-GROUP-BY) collapses its input to exactly one row purely by virtue of being an
 		// aggregate. If we fuse a projection on top of it that drops every aggregate output (e.g.
@@ -737,8 +811,8 @@ private:
 		vector<string> visible;                // visible column names, in order.
 		string from_clause;
 		if (absorb_get) {
-			from_clause =
-			    DialectQualifiedTableName(absorb_get->catalog, absorb_get->schema, absorb_get->table_name, dialect);
+			from_clause = DialectQualifiedTableName(absorb_get->catalog, absorb_get->schema_path,
+			                                        absorb_get->table_name, dialect);
 			from_clause += RenderSnapshotSuffix(absorb_get->snapshot.get(), dialect);
 			for (size_t i = 0; i < absorb_get->cte_column_names.size(); i++) {
 				// Struct field-extraction columns are raw SQL expressions, emitted verbatim; plain columns
@@ -776,7 +850,7 @@ private:
 				vector<string> pruned;
 				pruned.reserve(filter_n->projection_map.size());
 				for (auto idx : filter_n->projection_map) {
-					pruned.push_back(visible[idx]);
+					pruned.push_back(visible[idx.GetIndex()]);
 				}
 				visible = std::move(pruned);
 			}
@@ -792,6 +866,11 @@ private:
 			visible = std::move(nv);
 		}
 		if (agg_n) {
+			for (const auto &group : agg_n->group_by_columns) {
+				if (IsBareUnsignedInteger(SubstituteColumnTokens(group, col_map))) {
+					return nullptr;
+				}
+			}
 			group_by_text = SubstituteColumnTokens(agg_n->group_by_clause, col_map);
 			unordered_map<string, string> nm;
 			vector<string> nv;
@@ -819,7 +898,7 @@ private:
 				vector<string> pruned;
 				pruned.reserve(having_n->projection_map.size());
 				for (auto idx : having_n->projection_map) {
-					pruned.push_back(visible[idx]);
+					pruned.push_back(visible[idx.GetIndex()]);
 				}
 				visible = std::move(pruned);
 			}
@@ -840,10 +919,10 @@ private:
 				nv.clear();
 				nv.reserve(order_n->projection_map.size());
 				for (auto idx : order_n->projection_map) {
-					if (idx >= project_outputs.size()) {
+					if (idx.GetIndex() >= project_outputs.size()) {
 						throw InternalException(
 						    "LPTS ORDER: projection map index %llu out of bounds for %llu projection columns",
-						    (unsigned long long)idx, (unsigned long long)project_outputs.size());
+						    (unsigned long long)idx.GetIndex(), (unsigned long long)project_outputs.size());
 					}
 					nv.push_back(project_outputs[idx]);
 				}
@@ -908,8 +987,9 @@ private:
 		if (type == "MaterializedCte") {
 			const AstMaterializedCteNode &mat = static_cast<const AstMaterializedCteNode &>(ast_node);
 			LPTS_DEBUG_PRINT("[LPTS-CTE] MaterializedCte: flattening body (cte_table_index=" +
-			                 std::to_string(mat.cte_table_index) + ")");
+			                 std::to_string(mat.cte_table_index.index) + ")");
 			unique_ptr<CteNode> body_last = FlattenNode(*ast_node.children[0]);
+			body_last->materialized = mat.force_materialization;
 			cte_index_to_body_info[mat.cte_table_index] = {body_last->cte_name, body_last->cte_column_list};
 			cte_nodes.push_back(std::move(body_last));
 			LPTS_DEBUG_PRINT("[LPTS-CTE] MaterializedCte: body stored as '" +
@@ -924,7 +1004,7 @@ private:
 			auto it = cte_index_to_body_info.find(cte_ref_node.cte_table_index);
 			if (it == cte_index_to_body_info.end()) {
 				throw InternalException("LPTS: CteRef references unknown materialized CTE index %llu",
-				                        (unsigned long long)cte_ref_node.cte_table_index);
+				                        (unsigned long long)cte_ref_node.cte_table_index.index);
 			}
 			const string &body_lpts_name = it->second.first;
 			const vector<string> &body_lpts_cols = it->second.second;
@@ -932,7 +1012,7 @@ private:
 			LPTS_DEBUG_PRINT("[LPTS-CTE] CteRef: scan_" + std::to_string(my_index) + " -> SELECT FROM '" +
 			                 body_lpts_name + "'");
 			// scan_N(ref_col1, ...) AS (SELECT body_col1, ... FROM body_lpts_name)
-			return make_uniq<GetNode>(my_index, cte_ref_node.cte_column_names, "", "", body_lpts_name, 0,
+			return make_uniq<GetNode>(my_index, cte_ref_node.cte_column_names, "", vector<string>(), body_lpts_name, 0,
 			                          vector<string>(), body_lpts_cols);
 		}
 
@@ -952,8 +1032,8 @@ private:
 			cte_nodes.push_back(std::move(left_cte));
 
 			// 2. Register the outer CTE as the source for ALL DELIM_GETs in the inner subtree.
-			for (const idx_t dti : dj.delim_table_indices) {
-				LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: registering delim_ti=" + std::to_string(dti) + " -> '" +
+			for (const TableIndex dti : dj.delim_table_indices) {
+				LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: registering delim_ti=" + std::to_string(dti.index) + " -> '" +
 				                 left_cte_name + "'");
 				delim_get_source_cte[dti] = left_cte_name;
 			}
@@ -992,7 +1072,7 @@ private:
 			if (it == delim_get_source_cte.end()) {
 				throw NotImplementedException("LPTS_UNSUPPORTED_DELIM_GET: nested table_index=%llu is not implemented "
 				                              "without a parent DelimJoin source",
-				                              (unsigned long long)dg.table_index);
+				                              (unsigned long long)dg.table_index.index);
 			}
 			const string &source_cte_name = it->second;
 			const size_t my_index = node_count++;
@@ -1054,8 +1134,8 @@ private:
 			const size_t scan_index = node_count++;
 			LPTS_DEBUG_PRINT("[LPTS-CTE] RecursiveCte: scan_" + std::to_string(scan_index) + " -> SELECT FROM '" +
 			                 rec_name + "'");
-			return make_uniq<GetNode>(scan_index, rec.output_col_names, "", "", rec_name, 0, vector<string>(),
-			                          stripped_cols);
+			return make_uniq<GetNode>(scan_index, rec.output_col_names, "", vector<string>(), rec_name, 0,
+			                          vector<string>(), stripped_cols);
 		}
 
 		// Pipeline fusion: try to collapse a chain of single-child pipeline operators
@@ -1091,11 +1171,12 @@ private:
 			//   DuckDB:   catalog.schema.table  (e.g. memory.main.users)
 			//   Postgres: table                 (e.g. users)
 			string catalog_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.catalog;
-			string schema_out = DialectUsesUnqualifiedTableNames(dialect) ? "" : get.schema;
+			vector<string> schema_path_out =
+			    DialectUsesUnqualifiedTableNames(dialect) ? vector<string>() : get.schema_path;
 			string input_cte_name = children_names.empty() ? string() : children_names[0];
-			auto get_node = make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
-			                                   get.table_index, get.table_filters, get.column_names, input_cte_name,
-			                                   get.table_function_output_count);
+			auto get_node = make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_path_out,
+			                                   get.table_name, get.table_index.index, get.table_filters,
+			                                   get.column_names, input_cte_name, get.table_function_output_count);
 			get_node->table_function_alias = get.table_function_alias;
 			get_node->snapshot = get.snapshot ? get.snapshot->Copy() : nullptr;
 			get_node->column_is_expression = get.column_is_expression;
@@ -1116,7 +1197,7 @@ private:
 				filter_columns.clear();
 				filter_columns.reserve(filter.projection_map.size());
 				for (auto idx : filter.projection_map) {
-					filter_columns.push_back(children_column_lists[0][idx]);
+					filter_columns.push_back(children_column_lists[0][idx.GetIndex()]);
 				}
 			}
 			auto node =
@@ -1128,7 +1209,7 @@ private:
 		if (type == "Project") {
 			const AstProjectNode &proj = static_cast<const AstProjectNode &>(ast_node);
 			auto node = make_uniq<ProjectNode>(my_index, proj.cte_column_names, children_names[0], proj.expressions,
-			                                   proj.table_index);
+			                                   proj.table_index.index);
 			node->spark_broadcast_hint = cte_nodes.back()->spark_broadcast_hint;
 			return unique_ptr<CteNode>(std::move(node));
 		}
@@ -1168,6 +1249,7 @@ private:
 			join_node->mark_membership_lhs = join.mark_membership_lhs;
 			join_node->mark_membership_rhs = join.mark_membership_rhs;
 			join_node->mark_join_has_equality = join.mark_join_has_equality;
+			join_node->native_mark_syntax_supported = join.native_mark_syntax_supported;
 			return join_node;
 		}
 
@@ -1242,7 +1324,7 @@ private:
 			                                    children_column_lists[1].begin() + s.cte_column_names.size());
 			return make_uniq<CteSetOperationNode>(my_index, s.cte_column_names, children_names[0], children_names[1],
 			                                      s.op_name, std::move(left_select_columns),
-			                                      std::move(right_select_columns), s.is_all);
+			                                      std::move(right_select_columns), s.output_collations, s.is_all);
 		}
 
 		if (type == "Order") {
@@ -1300,7 +1382,7 @@ public:
 			    make_uniq<InsertNode>(final_index, ins.target_table, last_cte->cte_name, ins.action_type);
 			cte_nodes.push_back(std::move(last_cte));
 			return make_uniq<CteList>(std::move(cte_nodes), std::move(insert_node), has_recursive_cte, dialect,
-			                          emit_spark_hints);
+			                          emit_spark_hints, root.plan_is_repeatable);
 		}
 
 		// Regular SELECT: FlattenNode handles the entire subtree bottom-up.
@@ -1311,8 +1393,14 @@ public:
 		const vector<string> &cte_cols = (type == "Project")
 		                                     ? static_cast<const AstProjectNode &>(root).cte_column_names
 		                                     : last_cte->cte_column_list;
+		const idx_t visible_count =
+		    root.visible_output_count == DConstants::INVALID_INDEX ? cte_cols.size() : root.visible_output_count;
+		if (visible_count > cte_cols.size()) {
+			throw InternalException("LPTS: final query has fewer columns than its logical output");
+		}
 
-		for (const string &cte_col : cte_cols) {
+		for (idx_t i = 0; i < visible_count; i++) {
+			const string &cte_col = cte_cols[i];
 			// Strip exactly one leading "t<digits>_" prefix (a generated table prefix) to recover the
 			// user-visible name (t1_name → name, t3_count_star → count_star). Bare names such as user
 			// aliases (e.g. "total_rev") have no such prefix and are left untouched.
@@ -1330,11 +1418,13 @@ public:
 		}
 
 		const size_t final_index = node_count++;
-		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, last_cte->cte_column_list,
+		vector<string> visible_cte_cols(last_cte->cte_column_list.begin(),
+		                                last_cte->cte_column_list.begin() + visible_count);
+		auto final_node = make_uniq<FinalReadNode>(final_index, last_cte->cte_name, std::move(visible_cte_cols),
 		                                           std::move(final_column_list));
 		cte_nodes.push_back(std::move(last_cte));
 		return make_uniq<CteList>(std::move(cte_nodes), std::move(final_node), has_recursive_cte, dialect,
-		                          emit_spark_hints);
+		                          emit_spark_hints, root.plan_is_repeatable);
 	}
 };
 

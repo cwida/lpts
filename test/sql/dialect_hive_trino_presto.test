@@ -68,7 +68,7 @@ SELECT sql LIKE '%split(%' AS hive_string_split FROM lpts_query('SELECT string_s
 true
 
 query I
-SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS hive_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS hive_lambda_arrow FROM lpts_query('SELECT list_transform(vals, lambda x: x + 1) AS plus FROM events');
 ----
 true
 
@@ -124,7 +124,7 @@ SELECT sql LIKE '%split(%' AS trino_string_split FROM lpts_query('SELECT string_
 true
 
 query I
-SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS trino_lambda_arrow FROM lpts_query('SELECT list_transform(vals, x -> x + 1) AS plus FROM events');
+SELECT sql LIKE '%transform(vals, x -> (x + 1))%' AS trino_lambda_arrow FROM lpts_query('SELECT list_transform(vals, lambda x: x + 1) AS plus FROM events');
 ----
 true
 

@@ -326,19 +326,20 @@ SELECT sql FROM lpts_normalize_query('SELECT COUNT(*) FROM dl.products VERSION A
 SELECT COUNT(*) FROM dl.products p AT (VERSION => 2) JOIN dl.products q AT (VERSION => 3) ON p.product_id = q.product_id
 
 query I
-SELECT sql LIKE '%AT (VERSION => 2)%' AS spark_input_pin_survives_planning
+SELECT sql LIKE '%AT (VERSION => CAST(2 AS UBIGINT))%' AS spark_input_pin_survives_planning
 FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
 ----
 true
 
 query I
-SELECT sql LIKE '%AT (VERSION => 2)%' AS aliased_spark_input_pin_survives_planning
+SELECT sql LIKE '%AT (VERSION => CAST(2 AS UBIGINT))%' AS aliased_spark_input_pin_survives_planning
 FROM lpts_query('SELECT p.name AS n FROM dl.products VERSION AS OF 2 AS p WHERE p.product_id > 1');
 ----
 true
 
 query I
-SELECT sql LIKE '%AT (VERSION => 2)%' AND sql LIKE '%AT (VERSION => 3)%' AS both_pins_survive_planning
+SELECT sql LIKE '%AT (VERSION => CAST(2 AS UBIGINT))%' AND
+       sql LIKE '%AT (VERSION => CAST(3 AS UBIGINT))%' AS both_pins_survive_planning
 FROM lpts_query('SELECT COUNT(*) AS c FROM dl.products VERSION AS OF 2 p, dl.products VERSION AS OF 3 q WHERE p.product_id = q.product_id');
 ----
 true
@@ -412,7 +413,7 @@ statement ok
 SET lpts_dialect = 'duckdb';
 
 query I
-SELECT sql LIKE '%AT (VERSION => 2)%' AS duckdb_snapshot_preserved
+SELECT sql LIKE '%AT (VERSION => CAST(2 AS UBIGINT))%' AS duckdb_snapshot_preserved
 FROM lpts_query('SELECT COUNT(*) AS row_count FROM dl.products VERSION AS OF 2');
 ----
 true

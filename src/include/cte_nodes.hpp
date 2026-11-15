@@ -174,12 +174,14 @@ public:
 	vector<string> cte_column_list;
 	/// True when this CTE is small enough to broadcast in Spark joins.
 	bool spark_broadcast_hint = false;
+	/// Preserve a LogicalMaterializedCTE boundary in dialects that support the hint.
+	bool materialized = false;
 };
 
 class GetNode : public CteNode {
 	// Attributes.
 	string catalog;
-	string schema;
+	vector<string> schema_path;
 	string table_name;
 	size_t table_index;
 	vector<string> table_filters;
@@ -197,12 +199,12 @@ public:
 	~GetNode() override = default;
 	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
-	explicit GetNode(const size_t index, vector<string> cte_column_names, string _catalog, string _schema,
+	explicit GetNode(const size_t index, vector<string> cte_column_names, string _catalog, vector<string> _schema_path,
 	                 string _table_name, const size_t _table_index, vector<string> _table_filters,
 	                 vector<string> _column_names, string _input_cte_name = string(),
 	                 idx_t _table_function_output_count = DConstants::INVALID_INDEX)
 	    : CteNode(index, "t" + std::to_string(index) + "_scan", std::move(cte_column_names)),
-	      catalog(std::move(_catalog)), schema(std::move(_schema)), table_name(std::move(_table_name)),
+	      catalog(std::move(_catalog)), schema_path(std::move(_schema_path)), table_name(std::move(_table_name)),
 	      table_index(_table_index), table_filters(std::move(_table_filters)), column_names(std::move(_column_names)),
 	      input_cte_name(std::move(_input_cte_name)), table_function_output_count(_table_function_output_count) {
 	}
@@ -290,6 +292,7 @@ public:
 	vector<string> mark_membership_lhs;
 	vector<string> mark_membership_rhs;
 	bool mark_join_has_equality = false;
+	bool native_mark_syntax_supported = true;
 	~JoinNode() override = default;
 	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	// Constructor.
@@ -388,17 +391,19 @@ class CteSetOperationNode : public CteNode {
 	string op_name;
 	vector<string> left_select_columns;
 	vector<string> right_select_columns;
+	vector<string> output_collations;
 	const bool is_all;
 
 public:
 	~CteSetOperationNode() override = default;
 	CteSetOperationNode(const size_t index, vector<string> cte_column_names, string _left_cte_name,
 	                    string _right_cte_name, string _op_name, vector<string> _left_select_columns,
-	                    vector<string> _right_select_columns, const bool all)
+	                    vector<string> _right_select_columns, vector<string> _output_collations, const bool all)
 	    : CteNode(index, "t" + std::to_string(index) + "_setop", std::move(cte_column_names)),
 	      left_cte_name(std::move(_left_cte_name)), right_cte_name(std::move(_right_cte_name)),
 	      op_name(std::move(_op_name)), left_select_columns(std::move(_left_select_columns)),
-	      right_select_columns(std::move(_right_select_columns)), is_all(all) {
+	      right_select_columns(std::move(_right_select_columns)), output_collations(std::move(_output_collations)),
+	      is_all(all) {
 	}
 	string ToQuery(SqlDialect dialect) override;
 };
@@ -562,13 +567,14 @@ class CteList {
 	bool has_recursive_cte;            ///< True if any node is a RecursiveCteNode.
 	SqlDialect dialect;                ///< Dialect propagated into every node's ToQuery().
 	bool emit_spark_hints;             ///< Emit Spark optimizer hints when supported.
+	bool plan_is_repeatable;           ///< DuckDB proved the complete source plan repeatable.
 
 public:
 	// Constructor.
 	CteList(vector<unique_ptr<CteNode>> _nodes, unique_ptr<RootNode> _final_node, bool _has_recursive_cte = false,
-	        SqlDialect _dialect = SqlDialect::DUCKDB, bool _emit_spark_hints = false)
+	        SqlDialect _dialect = SqlDialect::DUCKDB, bool _emit_spark_hints = false, bool _plan_is_repeatable = false)
 	    : nodes(std::move(_nodes)), final_node(std::move(_final_node)), has_recursive_cte(_has_recursive_cte),
-	      dialect(_dialect), emit_spark_hints(_emit_spark_hints) {
+	      dialect(_dialect), emit_spark_hints(_emit_spark_hints), plan_is_repeatable(_plan_is_repeatable) {
 	}
 	/// Serialize the CTE list into a SQL query string.
 	/// If `use_newlines` is true, the string uses newlines between CTEs for readability.

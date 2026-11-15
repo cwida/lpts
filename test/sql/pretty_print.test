@@ -28,15 +28,27 @@ SELECT sql LIKE 'WITH
 t0_scan (a, d) AS (
     SELECT  a, d
     FROM    memory.main.t
-    WHERE   (a>0)
+    WHERE   ((a) > (0))
 )
-SELECT    d, sum(a) AS sum_a
+SELECT    d, "system".main.sum(a) AS sum_a
 FROM      t0_scan
 GROUP BY  d
-HAVING    ((sum(a)) > (CAST(''1'' AS HUGEINT)))
-ORDER BY  sum(a) ASC NULLS LAST
+HAVING    (("system".main.sum(a)) > (1))
+ORDER BY  "system".main.sum(a) ASC NULLS LAST
 LIMIT     5;'
 FROM lpts_query('SELECT d, sum(a) AS total FROM t WHERE a > 0 GROUP BY d HAVING sum(a) > 1 ORDER BY total LIMIT 5');
+----
+true
+
+# DuckDB 2.0's native ConstantExpression renders exact 128-bit integer literals without a lossy intermediate
+# cast. Preserve both endpoints of the signed/unsigned domains.
+query I
+SELECT sql LIKE '%-170141183460469231731687303715884105728 AS scalar_0%'
+       AND sql LIKE '%340282366920938463463374607431768211455 AS scalar_1%'
+FROM lpts_query($$
+SELECT CAST('-170141183460469231731687303715884105728' AS HUGEINT),
+       CAST('340282366920938463463374607431768211455' AS UHUGEINT)
+$$);
 ----
 true
 

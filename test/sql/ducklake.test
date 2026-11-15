@@ -154,3 +154,86 @@ SELECT COUNT(*) FROM dl.products AT (VERSION => 2);
 
 statement ok
 SELECT name, true AS mul FROM dl.table_insertions('products', 1, 4) UNION ALL SELECT name, false AS mul FROM dl.table_deletions('products', 1, 4);
+
+# ==========================================
+# Attached-catalog common-subplan compaction
+# ==========================================
+
+statement ok
+SET lpts_enable_data_dependent_optimizers=false;
+
+# The conservative LPTS pipeline must invoke its explicit common-subplan
+# compaction and identify the two inlined DuckLake aggregate branches as the
+# same source computation.
+query I
+SELECT (length(sql) - length(replace(sql, 'dl.main.products', ''))) / length('dl.main.products')
+FROM lpts_query($$
+    WITH product_counts AS NOT MATERIALIZED (
+        SELECT name, count(*) AS cnt FROM dl.products GROUP BY name
+    )
+    SELECT a.name, a.cnt, b.cnt
+    FROM product_counts a JOIN product_counts b ON a.name = b.name
+$$);
+----
+1
+
+query III rowsort
+WITH product_counts AS NOT MATERIALIZED (
+    SELECT name, count(*) AS cnt FROM dl.products GROUP BY name
+)
+SELECT a.name, a.cnt, b.cnt
+FROM product_counts a JOIN product_counts b ON a.name = b.name;
+----
+Gadget	1	1
+Gizmo	1	1
+Widget	1	1
+
+# Different source relations are not interchangeable.
+query I
+SELECT
+    (sql LIKE '%dl.main.products%')::INTEGER
+    + (sql LIKE '%dl.main.categories%')::INTEGER
+FROM lpts_query($$
+    SELECT name AS label FROM dl.products
+    UNION ALL
+    SELECT cat_name AS label FROM dl.categories
+$$);
+----
+2
+
+# Snapshot identity is part of the scan. Sharing current and historical reads
+# would silently mix database states.
+query I
+SELECT (length(sql) - length(replace(sql, 'dl.main.products', ''))) / length('dl.main.products')
+FROM lpts_query($$
+    SELECT name FROM dl.products
+    UNION ALL
+    SELECT name FROM dl.products AT (VERSION => 2)
+$$);
+----
+2
+
+# Filters are part of the canonical subtree identity.
+query I
+SELECT (length(sql) - length(replace(sql, 'dl.main.products', ''))) / length('dl.main.products')
+FROM lpts_query($$
+    SELECT name FROM dl.products WHERE price < 10
+    UNION ALL
+    SELECT name FROM dl.products WHERE price >= 10
+$$);
+----
+2
+
+# DuckDB's repeatability classification prevents volatile expressions from
+# being shared even when the surrounding relation is identical.
+query I
+SELECT (length(sql) - length(replace(sql, 'random()', ''))) / length('random()')
+FROM lpts_query($$
+    WITH random_values AS NOT MATERIALIZED (
+        SELECT product_id, random() AS value FROM dl.products
+    )
+    SELECT a.product_id, a.value, b.value
+    FROM random_values a JOIN random_values b USING (product_id)
+$$);
+----
+2

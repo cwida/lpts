@@ -44,6 +44,14 @@ class AstNode {
 public:
 	virtual ~AstNode() = default;
 
+	/// True when DuckDB classifies the complete logical plan as repeatable. Only
+	/// meaningful on the root node; the CTE serializer uses it to decide whether
+	/// repeated read subplans may be shared.
+	bool plan_is_repeatable = false;
+	/// Visible column count of the complete logical query. Internal ORDER BY keys may be
+	/// carried through intermediate nodes but must not appear in the final SELECT.
+	idx_t visible_output_count = DConstants::INVALID_INDEX;
+
 	/// Child nodes forming the tree structure.
 	vector<unique_ptr<AstNode>> children;
 
@@ -68,10 +76,10 @@ protected:
 class AstGetNode : public AstNode {
 public:
 	string catalog;
-	string schema;
+	vector<string> schema_path;
 	string table_name;
 	unique_ptr<AtClause> snapshot;
-	size_t table_index;
+	TableIndex table_index;
 	vector<string> column_names;     ///< Physical column names (e.g. "age", "name").
 	vector<string> cte_column_names; ///< CTE-scoped names (e.g. "t0_age", "t0_name").
 	vector<string> table_filters;    ///< Pushdown filters (as SQL strings).
@@ -85,10 +93,10 @@ public:
 	/// identifier. Empty means "all plain identifiers".
 	vector<bool> column_is_expression;
 
-	AstGetNode(string catalog, string schema, string table_name, size_t table_index, vector<string> column_names,
-	           vector<string> cte_column_names, vector<string> table_filters,
+	AstGetNode(string catalog, vector<string> schema_path, string table_name, TableIndex table_index,
+	           vector<string> column_names, vector<string> cte_column_names, vector<string> table_filters,
 	           idx_t table_function_output_count = DConstants::INVALID_INDEX)
-	    : catalog(std::move(catalog)), schema(std::move(schema)), table_name(std::move(table_name)),
+	    : catalog(std::move(catalog)), schema_path(std::move(schema_path)), table_name(std::move(table_name)),
 	      table_index(table_index), column_names(std::move(column_names)),
 	      cte_column_names(std::move(cte_column_names)), table_filters(std::move(table_filters)),
 	      table_function_output_count(table_function_output_count) {
@@ -110,9 +118,9 @@ public:
 	vector<string> conditions; ///< Filter expressions (e.g. "age > 25").
 	/// COLUMN_LIFETIME projection_map: when non-empty, the filter prunes its child's columns to this
 	/// subset (indices into the child's output). Empty means pass every child column through.
-	vector<idx_t> projection_map;
+	vector<ProjectionIndex> projection_map;
 
-	explicit AstFilterNode(vector<string> conditions, vector<idx_t> projection_map = {})
+	explicit AstFilterNode(vector<string> conditions, vector<ProjectionIndex> projection_map = {})
 	    : conditions(std::move(conditions)), projection_map(std::move(projection_map)) {
 	}
 
@@ -129,7 +137,7 @@ public:
 		vector<string> pruned;
 		pruned.reserve(projection_map.size());
 		for (auto idx : projection_map) {
-			pruned.push_back(child_cols[idx]);
+			pruned.push_back(child_cols[idx.GetIndex()]);
 		}
 		return pruned;
 	}
@@ -142,13 +150,15 @@ public:
 	vector<string> expressions;      ///< Projected expressions / column references (child CTE names).
 	vector<string> cte_column_names; ///< CTE-scoped output names (e.g. "t1_name").
 	idx_t visible_column_count;      ///< Number of columns visible after pipeline fusion.
-	size_t table_index;
+	TableIndex table_index;
 	bool is_window; ///< True when this projection carries window (OVER) expressions; a fusion boundary.
+	bool can_throw; ///< True when evaluating one of the projected expressions can raise a runtime error.
 
-	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, size_t table_index,
-	               bool is_window = false, idx_t visible_column_count = DConstants::INVALID_INDEX)
+	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, TableIndex table_index,
+	               bool is_window = false, idx_t visible_column_count = DConstants::INVALID_INDEX,
+	               bool can_throw = false)
 	    : expressions(std::move(expressions)), cte_column_names(std::move(cte_column_names)), table_index(table_index),
-	      is_window(is_window) {
+	      is_window(is_window), can_throw(can_throw) {
 		this->visible_column_count =
 		    visible_column_count == DConstants::INVALID_INDEX ? this->cte_column_names.size() : visible_column_count;
 		D_ASSERT(this->visible_column_count <= this->cte_column_names.size());
@@ -215,6 +225,7 @@ public:
 	vector<string> mark_membership_lhs;
 	vector<string> mark_membership_rhs;
 	bool mark_join_has_equality = false;
+	bool native_mark_syntax_supported = true;
 	bool is_asof; ///< True for DuckDB ASOF JOIN.
 
 	AstJoinNode(JoinType join_type, vector<string> conditions, vector<string> cte_column_names,
@@ -297,10 +308,12 @@ class AstSetOperationNode : public AstNode {
 public:
 	string op_name;
 	bool is_all;
-	vector<string> cte_column_names; ///< Output column names derived from the left-hand side.
+	vector<string> cte_column_names;  ///< Output column names derived from the left-hand side.
+	vector<string> output_collations; ///< DuckDB comparison collation for each output column, or empty.
 
-	AstSetOperationNode(string op_name, bool is_all, vector<string> cte_column_names)
-	    : op_name(std::move(op_name)), is_all(is_all), cte_column_names(std::move(cte_column_names)) {
+	AstSetOperationNode(string op_name, bool is_all, vector<string> cte_column_names, vector<string> output_collations)
+	    : op_name(std::move(op_name)), is_all(is_all), cte_column_names(std::move(cte_column_names)),
+	      output_collations(std::move(output_collations)) {
 	}
 
 	string ToString(int indent = 0) const override;
@@ -336,11 +349,12 @@ public:
 /// ORDER BY node — wraps child with ORDER BY clause.
 class AstOrderNode : public AstNode {
 public:
-	vector<string> order_items;      ///< e.g. "t1_age DESC", "t0_name ASC"
-	vector<string> cte_column_names; ///< passthrough from child.
-	vector<idx_t> projection_map;    ///< COLUMN_LIFETIME pruning map, when ORDER drops child columns.
+	vector<string> order_items;             ///< e.g. "t1_age DESC", "t0_name ASC"
+	vector<string> cte_column_names;        ///< passthrough from child.
+	vector<ProjectionIndex> projection_map; ///< COLUMN_LIFETIME pruning map, when ORDER drops child columns.
 
-	AstOrderNode(vector<string> order_items, vector<string> cte_column_names, vector<idx_t> projection_map = {})
+	AstOrderNode(vector<string> order_items, vector<string> cte_column_names,
+	             vector<ProjectionIndex> projection_map = {})
 	    : order_items(std::move(order_items)), cte_column_names(std::move(cte_column_names)),
 	      projection_map(std::move(projection_map)) {
 	}
@@ -428,9 +442,11 @@ public:
 /// Used to correctly order Phase-2 flattening so CTE_REF nodes can look up the body CTE name.
 class AstMaterializedCteNode : public AstNode {
 public:
-	idx_t cte_table_index; ///< table_index from LogicalMaterializedCTE (key for CTE_REF lookup).
+	TableIndex cte_table_index; ///< table_index from LogicalMaterializedCTE (key for CTE_REF lookup).
+	bool force_materialization; ///< True only for an explicit SQL AS MATERIALIZED boundary.
 
-	explicit AstMaterializedCteNode(idx_t cte_table_index_p) : cte_table_index(cte_table_index_p) {
+	AstMaterializedCteNode(TableIndex cte_table_index_p, bool force_materialization_p)
+	    : cte_table_index(cte_table_index_p), force_materialization(force_materialization_p) {
 	}
 
 	string ToString(int indent = 0) const override;
@@ -447,10 +463,10 @@ public:
 /// Has no children. The body CTE name is resolved in Phase 2 via cte_table_index.
 class AstCteRefNode : public AstNode {
 public:
-	idx_t cte_table_index;           ///< Matches AstMaterializedCteNode::cte_table_index.
+	TableIndex cte_table_index;      ///< Matches AstMaterializedCteNode::cte_table_index.
 	vector<string> cte_column_names; ///< Output column names for this CTE scan (e.g. "tN_supplier_no").
 
-	AstCteRefNode(idx_t cte_table_index_p, vector<string> cte_column_names_p)
+	AstCteRefNode(TableIndex cte_table_index_p, vector<string> cte_column_names_p)
 	    : cte_table_index(cte_table_index_p), cte_column_names(std::move(cte_column_names_p)) {
 	}
 
@@ -469,12 +485,13 @@ public:
 /// matching this node's cte_table_index.
 class AstRecursiveCteNode : public AstNode {
 public:
-	idx_t cte_table_index;           ///< table_index from LogicalRecursiveCTE.
+	TableIndex cte_table_index;      ///< table_index from LogicalRecursiveCTE.
 	string ctename;                  ///< User-given CTE name (informational only).
 	bool union_all;                  ///< True → UNION ALL, false → UNION.
 	vector<string> output_col_names; ///< LPTS-prefixed output names (e.g. ["t1_n"]) for parent nodes.
 
-	AstRecursiveCteNode(idx_t cte_table_index_p, string ctename_p, bool union_all_p, vector<string> output_col_names_p)
+	AstRecursiveCteNode(TableIndex cte_table_index_p, string ctename_p, bool union_all_p,
+	                    vector<string> output_col_names_p)
 	    : cte_table_index(cte_table_index_p), ctename(std::move(ctename_p)), union_all(union_all_p),
 	      output_col_names(std::move(output_col_names_p)) {
 	}
@@ -493,11 +510,11 @@ public:
 /// Has no children. The source CTE name is registered by the parent AstDelimJoinNode in Phase 2.
 class AstDelimGetNode : public AstNode {
 public:
-	idx_t table_index;               ///< Unique table index for this DELIM_GET.
+	TableIndex table_index;          ///< Unique table index for this DELIM_GET.
 	vector<string> cte_column_names; ///< Exposed column names (e.g. "tN_p_partkey").
 	vector<string> source_col_names; ///< Column names to SELECT from the left CTE (e.g. "t3_p_partkey").
 
-	AstDelimGetNode(idx_t table_index_p, vector<string> cte_column_names_p, vector<string> source_col_names_p)
+	AstDelimGetNode(TableIndex table_index_p, vector<string> cte_column_names_p, vector<string> source_col_names_p)
 	    : table_index(table_index_p), cte_column_names(std::move(cte_column_names_p)),
 	      source_col_names(std::move(source_col_names_p)) {
 	}
@@ -517,9 +534,9 @@ public:
 class AstDelimJoinNode : public AstNode {
 public:
 	JoinType join_type;
-	vector<string> conditions;         ///< Join conditions as strings.
-	vector<string> cte_column_names;   ///< Output column names.
-	vector<idx_t> delim_table_indices; ///< table_indices of ALL AstDelimGetNodes in the right subtree.
+	vector<string> conditions;              ///< Join conditions as strings.
+	vector<string> cte_column_names;        ///< Output column names.
+	vector<TableIndex> delim_table_indices; ///< table_indices of ALL AstDelimGetNodes in the right subtree.
 
 	string mark_expression; ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" or empty.
 
@@ -538,7 +555,7 @@ public:
 	bool mark_join_has_equality = false;
 
 	AstDelimJoinNode(JoinType join_type_p, vector<string> conditions_p, vector<string> cte_column_names_p,
-	                 vector<idx_t> delim_table_indices_p, string mark_expression_p = "")
+	                 vector<TableIndex> delim_table_indices_p, string mark_expression_p = "")
 	    : join_type(join_type_p), conditions(std::move(conditions_p)), cte_column_names(std::move(cte_column_names_p)),
 	      delim_table_indices(std::move(delim_table_indices_p)), mark_expression(std::move(mark_expression_p)) {
 	}
