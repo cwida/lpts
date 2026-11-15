@@ -339,3 +339,24 @@ SELECT 2 AS priority, COUNT(*) AS n FROM constant_group_nonempty GROUP BY GROUPI
 ----
 2	3
 2	3
+
+# Decimal and DOUBLE quantile parameters can select different discrete ranks.
+query I
+SELECT quantile_disc(d, 0.9) FROM range(100) tbl(d);
+----
+89
+
+query I
+SELECT quantile_disc(d, 0.9::DOUBLE) FROM range(100) tbl(d);
+----
+90
+
+query T
+SELECT quantile_disc(d, [0.9]) FROM range(100) tbl(d);
+----
+[89]
+
+query I
+SELECT quantile_disc(d, -0.9) FROM range(100) tbl(d);
+----
+10
