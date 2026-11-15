@@ -1720,11 +1720,8 @@ private:
 				if (!op->children.empty()) {
 					RegisterChildBindingFallbacks(*g, op->children[0]->GetColumnBindings());
 				}
-				if (g->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT && agg.grouping_sets.size() > 1) {
-					ThrowLptsNotImplemented(
-					    "LPTS_UNSUPPORTED_GROUP_BY", dialect, "group_by", "constant", "LOGICAL_AGGREGATE_AND_GROUP_BY",
-					    "constant group keys across multiple grouping sets cannot be reproduced as static SQL");
-				}
+				// A bare integer in GROUP BY is parsed as an output ordinal. Wrap literal
+				// grouping keys in a constant expression so their value stays a key.
 				if (g->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
 					auto it = column_map.find(MappableColumnBinding(bcr.Binding()));

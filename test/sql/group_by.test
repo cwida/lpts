@@ -333,3 +333,9 @@ SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_empty GROUP BY 'fixed'
 
 statement ok
 SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_empty GROUP BY 'fixed';
+
+query II rowsort
+SELECT 2 AS priority, COUNT(*) AS n FROM constant_group_nonempty GROUP BY GROUPING SETS (((2 + 0)), ());
+----
+2	3
+2	3
