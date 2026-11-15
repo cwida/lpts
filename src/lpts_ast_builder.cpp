@@ -723,8 +723,9 @@ private:
 		return true;
 	}
 
-	static string QuantileArgument(const BoundAggregateExpression &aggregate, bool force_list = false) {
-		return LptsExpressionRenderer::QuantileArgument(aggregate, force_list);
+	static string QuantileArgument(const BoundAggregateExpression &aggregate, bool force_list = false,
+	                               bool preserve_type = false) {
+		return LptsExpressionRenderer::QuantileArgument(aggregate, force_list, preserve_type);
 	}
 
 	// Render a table-function parameter Value as a re-parseable, type-faithful SQL literal by routing it
@@ -1841,7 +1842,7 @@ private:
 				if (quantile_from_bind) {
 					const auto arg_type = ba.GetChildren()[1]->GetReturnType().id();
 					child_exprs[1] =
-					    QuantileArgument(ba, arg_type == LogicalTypeId::LIST || arg_type == LogicalTypeId::ARRAY);
+					    QuantileArgument(ba, arg_type == LogicalTypeId::LIST || arg_type == LogicalTypeId::ARRAY, true);
 				}
 				// Join child expressions with commas
 				for (size_t ci = 0; ci < child_exprs.size(); ++ci) {

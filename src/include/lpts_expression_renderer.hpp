@@ -39,7 +39,8 @@ public:
 	                      string &result) const;
 
 	static bool ExpressionContainsColumnRef(const Expression &expr);
-	static string QuantileArgument(const BoundAggregateExpression &aggregate, bool force_list = false);
+	static string QuantileArgument(const BoundAggregateExpression &aggregate, bool force_list = false,
+	                               bool preserve_type = false);
 	// True when the quantile was bound descending (`WITHIN GROUP (ORDER BY x DESC)`, or a negative quantile
 	// such as `quantile_disc(x, -0.5)` which DuckDB stores as abs(p) + desc). The renderer must emit an
 	// explicit `ORDER BY <value> DESC` so the round-trip matches.
