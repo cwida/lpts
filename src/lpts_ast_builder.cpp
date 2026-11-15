@@ -1721,9 +1721,9 @@ private:
 					RegisterChildBindingFallbacks(*g, op->children[0]->GetColumnBindings());
 				}
 				if (g->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT && agg.grouping_sets.size() > 1) {
-					ThrowLptsNotImplemented("LPTS_UNSUPPORTED_GROUP_BY", dialect, "group_by", "constant",
-					                        "LOGICAL_AGGREGATE_AND_GROUP_BY",
-					                        "constant group keys across multiple grouping sets cannot be reproduced as static SQL");
+					ThrowLptsNotImplemented(
+					    "LPTS_UNSUPPORTED_GROUP_BY", dialect, "group_by", "constant", "LOGICAL_AGGREGATE_AND_GROUP_BY",
+					    "constant group keys across multiple grouping sets cannot be reproduced as static SQL");
 				}
 				if (g->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 					BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
