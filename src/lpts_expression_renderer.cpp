@@ -1863,7 +1863,9 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const Expression &expr)
 						expr_str << ", ";
 					}
 					if (is_struct_pack && i < StructType::GetChildCount(func_expr.GetReturnType())) {
-						expr_str << "\"" << StructType::GetChildName(func_expr.GetReturnType(), i) << "\" := ";
+						expr_str << SQLQuotedIdentifier::ToString(
+						                StructType::GetChildName(func_expr.GetReturnType(), i))
+						         << " := ";
 					} else if (!native_named_arguments.empty() && i >= positional_argument_count) {
 						expr_str << SQLIdentifier(native_named_arguments[i - positional_argument_count]) << " := ";
 					} else if (uses_named_arguments && i > 0 && func_expr.GetChildren()[i]->HasAlias() &&

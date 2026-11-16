@@ -20,6 +20,10 @@ INSERT INTO ts VALUES
     (2, NULL, NULL),
     (3, {'a': NULL, 'b': false}, {'x': {'y': NULL, 'z': 'q'}});
 
+# Named STRUCT fields must escape embedded identifier quotes during rendering.
+statement ok
+SELECT struct_pack("field""quote" := COUNT(*)) FROM ts GROUP BY id;
+
 # DuckDB pushes the field access into the scan, so LPTS must emit struct_extract(info, 'a')
 # rather than the whole struct. Each query below is round-trip-checked by lpts_check.
 
