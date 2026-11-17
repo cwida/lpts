@@ -429,16 +429,17 @@ class LimitNode : public CteNode {
 	string offset_str; ///< e.g. "5"  or "" if no OFFSET
 	bool limit_needs_child_scalar;
 	bool offset_needs_child_scalar;
+	bool is_percentage;
 
 public:
 	~LimitNode() override = default;
 	bool BuildSelectParts(SqlDialect dialect, SelectParts &out) const override;
 	LimitNode(const size_t index, vector<string> cte_column_names, string _child_cte_name, string _limit_str,
-	          string _offset_str, bool _limit_needs_child_scalar, bool _offset_needs_child_scalar)
+	          string _offset_str, bool _limit_needs_child_scalar, bool _offset_needs_child_scalar, bool _is_percentage)
 	    : CteNode(index, "t" + std::to_string(index) + "_limit", std::move(cte_column_names)),
 	      child_cte_name(std::move(_child_cte_name)), limit_str(std::move(_limit_str)),
 	      offset_str(std::move(_offset_str)), limit_needs_child_scalar(_limit_needs_child_scalar),
-	      offset_needs_child_scalar(_offset_needs_child_scalar) {
+	      offset_needs_child_scalar(_offset_needs_child_scalar), is_percentage(_is_percentage) {
 	}
 	string ToQuery(SqlDialect dialect) override;
 };
