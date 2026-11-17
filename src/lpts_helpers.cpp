@@ -44,6 +44,31 @@ string JoinConditionsToSQL(const vector<string> &conditions) {
 	return VecToSeparatedList(conditions, " AND ");
 }
 
+bool TypeContainsVariant(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::VARIANT:
+		return true;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsVariant(type.id() == LogicalTypeId::ARRAY ? ArrayType::GetChildType(type)
+		                                                             : ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::UNION:
+	case LogicalTypeId::TUPLE: {
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsVariant(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeContainsVariant(MapType::KeyType(type)) || TypeContainsVariant(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
 bool TypeContainsAggregateState(const LogicalType &type) {
 	if (type.id() == LogicalTypeId::LEGACY_AGGREGATE_STATE || type.IsAggregateState()) {
 		return true;

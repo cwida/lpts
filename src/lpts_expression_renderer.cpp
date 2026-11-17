@@ -56,30 +56,6 @@ static const vector<Value> &NestedSequenceChildren(const Value &value) {
 // integer 1. Since the round-trip bag-hash is type-sensitive, these need an explicit CAST to pin the type.
 // Types whose literal already self-describes (INTEGER, DOUBLE, VARCHAR, BOOLEAN, DATE/TIME/TS, BLOB, ...)
 // do not, so we leave them bare to keep the generated SQL readable.
-// VARIANT (anywhere in the type, including inside LIST/ARRAY/STRUCT/MAP) has no faithful re-parseable SQL
-// literal, so a value of such a type is untranslatable.
-static bool TypeContainsVariant(const LogicalType &type) {
-	switch (type.id()) {
-	case LogicalTypeId::VARIANT:
-		return true;
-	case LogicalTypeId::LIST:
-	case LogicalTypeId::ARRAY:
-		return TypeContainsVariant(NestedSequenceChildType(type));
-	case LogicalTypeId::STRUCT: {
-		for (const auto &child : StructType::GetChildTypes(type)) {
-			if (TypeContainsVariant(child.second)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case LogicalTypeId::MAP:
-		return TypeContainsVariant(MapType::KeyType(type)) || TypeContainsVariant(MapType::ValueType(type));
-	default:
-		return false;
-	}
-}
-
 static bool TypeContainsEmptyEnum(const LogicalType &type) {
 	if (type.id() == LogicalTypeId::ENUM && EnumType::GetSize(type) == 0) {
 		return true;
@@ -1309,10 +1285,11 @@ string LptsExpressionRenderer::ExpressionToAliasedString(const unique_ptr<Expres
 
 string LptsExpressionRenderer::ExpressionToAliasedString(const Expression &expr) const {
 	auto expression = &expr;
-	// VARIANT has no faithful, re-parseable SQL literal (Value::ToSQLString emits a `VARIANT(...)` form that
-	// does not round-trip), so any expression whose type contains VARIANT (directly or nested in a
-	// list/struct/map) is untranslatable — fail rather than emit a value that differs from the original.
-	if (TypeContainsVariant(expression->GetReturnType())) {
+	// Native casts and column expressions retain their VARIANT semantics in SQL.
+	// Only materialized values require a literal that DuckDB cannot reconstruct.
+	if (TypeContainsVariant(expression->GetReturnType()) &&
+	    (!IsDuckDBDialect(dialect) || (expression->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+	                                   !expression->Cast<BoundConstantExpression>().GetValue().IsNull()))) {
 		ThrowLptsNotImplemented("LPTS_UNSUPPORTED_TYPE", dialect, "type", "VARIANT", "expression",
 		                        "VARIANT values have no faithful SQL literal");
 	}
