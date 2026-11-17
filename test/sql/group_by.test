@@ -308,3 +308,55 @@ statement error
 SELECT sql FROM lpts_query('SELECT x, a, b FROM (VALUES (1), (2)) t2(x), LATERAL (SELECT count(*), count(a) FROM (SELECT 1, 2 WHERE 1 = x) t(a, b) GROUP BY GROUPING SETS ((), (b), (a, b))) t3(a, b)');
 ----
 LPTS_UNSUPPORTED_GROUP_BY
+
+# --- Constant grouping keys preserve grouped empty-input semantics ---
+statement ok
+CREATE TABLE constant_group_nonempty (k INTEGER);
+
+statement ok
+INSERT INTO constant_group_nonempty VALUES (1), (2), (3);
+
+query II
+SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_nonempty GROUP BY 'fixed';
+----
+fixed	3
+
+statement ok
+SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_nonempty GROUP BY 'fixed';
+
+statement ok
+CREATE TABLE constant_group_empty (k INTEGER);
+
+query II
+SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_empty GROUP BY 'fixed';
+----
+
+statement ok
+SELECT 'fixed' AS kind, COUNT(*) AS n FROM constant_group_empty GROUP BY 'fixed';
+
+query II rowsort
+SELECT 2 AS priority, COUNT(*) AS n FROM constant_group_nonempty GROUP BY GROUPING SETS (((2 + 0)), ());
+----
+2	3
+2	3
+
+# Decimal and DOUBLE quantile parameters can select different discrete ranks.
+query I
+SELECT quantile_disc(d, 0.9) FROM range(100) tbl(d);
+----
+89
+
+# DuckDB can choose a different boundary rank for DOUBLE on different builds;
+# lpts_check verifies the emitted query agrees with the local engine.
+statement ok
+SELECT quantile_disc(d, 0.9::DOUBLE) FROM range(100) tbl(d);
+
+query T
+SELECT quantile_disc(d, [0.9]) FROM range(100) tbl(d);
+----
+[89]
+
+query I
+SELECT quantile_disc(d, -0.9) FROM range(100) tbl(d);
+----
+10

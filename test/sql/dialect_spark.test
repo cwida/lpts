@@ -358,3 +358,31 @@ query I
 SELECT sql LIKE '%strftime(%' AS duckdb_strftime FROM lpts_query('SELECT strftime(ts, ''%Y'') AS yr FROM events');
 ----
 true
+
+# Constant group keys use Spark-safe expressions and retain literal spelling.
+statement ok
+SET lpts_dialect = 'spark';
+
+statement ok
+CREATE TABLE grouping_literal_spark (id INTEGER);
+
+statement ok
+INSERT INTO grouping_literal_spark VALUES (1), (2);
+
+query I
+SELECT sql LIKE '%DISTINCT%' AND sql LIKE '%CAST(NULL AS STRING)%' AND sql LIKE '%''Ready''%'
+    AND sql LIKE '%''Not Ready''%' AND sql LIKE '%''Low''%' AND sql LIKE '%''High''%'
+FROM lpts_query('SELECT DISTINCT id, CAST(NULL AS VARCHAR) AS machine_key, ''Ready'' AS category,
+    ''Not Ready'' AS state, ''Low'' AS lower_bound, ''High'' AS upper_bound, 2 AS priority
+FROM grouping_literal_spark');
+----
+true
+
+query I
+SELECT sql LIKE '%GROUP BY  COALESCE(2, 2)%'
+FROM lpts_query('SELECT 2 AS priority, COUNT(*) AS n FROM grouping_literal_spark GROUP BY (2 + 0)');
+----
+true
+
+statement ok
+SET lpts_dialect = 'duckdb';

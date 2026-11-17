@@ -653,14 +653,18 @@ struct QuantileBindDataLayout {
 };
 } // namespace
 
-static string QuantileArgumentFromBindInfo(const FunctionData &bind_info) {
+static string QuantileArgumentFromBindInfo(const FunctionData &bind_info, bool force_list = false,
+                                           bool preserve_type = false) {
 	const auto &bind_data = reinterpret_cast<const QuantileBindDataLayout &>(bind_info);
-	if (bind_data.quantiles.size() == 1) {
-		return bind_data.quantiles[0].val.ToSQLString();
+	auto render_value = [preserve_type](const Value &value) {
+		return preserve_type ? ConstantExpression::FromValue(value)->ToString() : value.ToSQLString();
+	};
+	if (bind_data.quantiles.size() == 1 && !force_list) {
+		return render_value(bind_data.quantiles[0].val);
 	}
 	vector<string> values;
 	for (const auto &quantile : bind_data.quantiles) {
-		values.push_back(quantile.val.ToSQLString());
+		values.push_back(render_value(quantile.val));
 	}
 	return "[" + VecToSeparatedList(values) + "]";
 }
@@ -699,8 +703,9 @@ static string ReservoirQuantileArgumentsFromBindInfo(const FunctionData &bind_in
 	return quantile_arg + ", " + to_string(bind_data.sample_size);
 }
 
-string LptsExpressionRenderer::QuantileArgument(const BoundAggregateExpression &aggregate) {
-	return QuantileArgumentFromBindInfo(*aggregate.BindInfo());
+string LptsExpressionRenderer::QuantileArgument(const BoundAggregateExpression &aggregate, bool force_list,
+                                                bool preserve_type) {
+	return QuantileArgumentFromBindInfo(*aggregate.BindInfo(), force_list, preserve_type);
 }
 
 bool LptsExpressionRenderer::QuantileDesc(const BoundAggregateExpression &aggregate) {

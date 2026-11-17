@@ -723,8 +723,9 @@ private:
 		return true;
 	}
 
-	static string QuantileArgument(const BoundAggregateExpression &aggregate) {
-		return LptsExpressionRenderer::QuantileArgument(aggregate);
+	static string QuantileArgument(const BoundAggregateExpression &aggregate, bool force_list = false,
+	                               bool preserve_type = false) {
+		return LptsExpressionRenderer::QuantileArgument(aggregate, force_list, preserve_type);
 	}
 
 	// Render a table-function parameter Value as a re-parseable, type-faithful SQL literal by routing it
@@ -1834,11 +1835,23 @@ private:
 					}
 					child_exprs.push_back(std::move(child_sql));
 				}
+				// DuckDB 2.0 casts quantile children to DOUBLE after binding; the bind data retains
+				// the original decimal precision that determines discrete quantile ranks.
+				const bool quantile_from_bind = dialect == SqlDialect::DUCKDB && IsQuantileAggregate(agg_name) &&
+				                                child_exprs.size() == 2 && ba.BindInfo();
+				if (quantile_from_bind) {
+					const auto arg_type = ba.GetChildren()[1]->GetReturnType().id();
+					child_exprs[1] =
+					    QuantileArgument(ba, arg_type == LogicalTypeId::LIST || arg_type == LogicalTypeId::ARRAY, true);
+				}
 				// Join child expressions with commas
 				for (size_t ci = 0; ci < child_exprs.size(); ++ci) {
 					if (ci > 0)
 						agg_str << ", ";
 					agg_str << child_exprs[ci];
+				}
+				if (quantile_from_bind && QuantileDesc(ba)) {
+					agg_str << " ORDER BY " << child_exprs[0] << " DESC";
 				}
 				if (agg_name == "string_agg" && child_exprs.size() == 1) {
 					string separator = StringAggSeparator(ba);
