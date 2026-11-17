@@ -41,12 +41,7 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/common/enums/set_scope.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "duckdb/common/types/variant_iterator.hpp"
-#include "duckdb/common/vector/array_vector.hpp"
-#include "duckdb/common/vector/list_vector.hpp"
-#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/function/scalar/variant_utils.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -1047,40 +1042,6 @@ static void LptsCheckSetCallback(ClientContext &context, SetScope scope, Value &
 	GetCheckMode(context).enabled = !parameter.IsNull() && parameter.GetValue<bool>();
 }
 
-// VARIANT hashes otherwise include storage dictionaries and unused fields retained by extraction.
-// Rebuilding through the logical iterator preserves payload types while discarding that storage history.
-static Vector CanonicalizeCheckVector(const Vector &input, idx_t count) {
-	Vector result(input.GetType(), count);
-	if (input.GetType().id() == LogicalTypeId::VARIANT) {
-		VariantUtils::ToVariant(VariantIterator(input), count, result);
-		return result;
-	}
-	// Own the nested buffers before replacing their children; the checker passes input through unchanged.
-	result.Append(input, count);
-	switch (input.GetType().InternalType()) {
-	case PhysicalType::STRUCT:
-		for (auto &child : StructVector::GetEntries(result)) {
-			if (TypeContainsVariant(child.GetType())) {
-				child.Reference(CanonicalizeCheckVector(child, count));
-			}
-		}
-		break;
-	case PhysicalType::LIST: {
-		auto &child = ListVector::GetChildMutable(result);
-		child.Reference(CanonicalizeCheckVector(child, child.size()));
-		break;
-	}
-	case PhysicalType::ARRAY: {
-		auto &child = ArrayVector::GetChildMutable(result);
-		child.Reference(CanonicalizeCheckVector(child, child.size()));
-		break;
-	}
-	default:
-		throw InternalException("Unexpected nested VARIANT type in LPTS checker");
-	}
-	return result;
-}
-
 // Hash all rows of `chunk` order-independently into `running_sum`. DataChunk::Hash gives a
 // per-row hash that is NULL-aware and column-position-sensitive; summing the per-row hashes is
 // commutative (so tuple order is irrelevant) and duplicate-sensitive.
@@ -1096,7 +1057,8 @@ static void AccumulateChunkHash(DataChunk &chunk, uint64_t &running_sum) {
 	Vector hashes(LogicalType::HASH);
 	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 		auto &input = chunk.data[col];
-		auto hash_input = TypeContainsVariant(input.GetType()) ? CanonicalizeCheckVector(input, n) : Vector::Ref(input);
+		auto hash_input =
+		    TypeContainsVariant(input.GetType()) ? CanonicalizeVariantVector(input, n) : Vector::Ref(input);
 		if (col == 0) {
 			VectorOperations::Hash(hash_input, hashes, n);
 		} else {
