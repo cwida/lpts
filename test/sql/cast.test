@@ -258,3 +258,95 @@ true
 
 statement ok
 SELECT list_reduce(c, lambda x, y: x + y) FROM test_vector_types(NULL::INT[]) t(c) WHERE len(c) > 0;
+
+# Native VARIANT expressions over columns need no VARIANT value literal.
+statement ok
+CREATE TABLE variant_source(k INT,v VARCHAR);
+
+statement ok
+INSERT INTO variant_source VALUES (1,'one'),(2,'two'),(NULL,NULL);
+
+statement ok
+SELECT CAST(k AS VARIANT),variant_typeof(CAST(k AS VARIANT)) FROM variant_source;
+
+statement ok
+SELECT variant_typeof(CAST(k AS VARIANT)),SUM(k) FROM variant_source
+GROUP BY variant_typeof(CAST(k AS VARIANT));
+
+statement ok
+SELECT k::VARIANT,COUNT(*) FROM variant_source GROUP BY k::VARIANT;
+
+statement ok
+SELECT struct_pack(value := CAST(k AS VARIANT)),[CAST(k AS VARIANT)] FROM variant_source;
+
+statement ok
+CREATE TABLE stored_variants AS SELECT k,CAST(v AS VARIANT) value FROM variant_source;
+
+statement ok
+SELECT value,variant_typeof(value) FROM stored_variants;
+
+statement ok
+SELECT * FROM stored_variants WHERE variant_typeof(value)='VARCHAR';
+
+statement ok
+SELECT value.missing_field FROM stored_variants;
+
+statement ok
+SELECT CAST(NULL AS VARIANT);
+
+statement ok
+SELECT CASE WHEN k IS NULL THEN NULL::VARIANT ELSE k::VARIANT END FROM variant_source;
+
+# Folded non-NULL VARIANT values still have no faithful inline SQL literal.
+statement error
+SELECT * FROM lpts_query('SELECT 1::VARIANT');
+----
+LPTS_UNSUPPORTED_TYPE
+
+# Field extraction from shredded VARIANTs retains storage-dependent dictionaries.
+# lpts_check must compare logical values, including VARIANTs nested inside other types.
+statement ok
+SET variant_minimum_shredding_size=0;
+
+statement ok
+CREATE TABLE shredded_variants(j VARIANT);
+
+statement ok
+INSERT INTO shredded_variants
+SELECT CASE WHEN i%3=0 THEN
+  {'kind':'commit','did':'c'||(i%4),'commit':{'collection':'coll'||(i%2),'operation':'create'}}::VARIANT
+ELSE {'kind':'identity','did':'d'||(i%5)}::VARIANT END FROM range(4096)t(i);
+
+statement ok
+CHECKPOINT;
+
+query TII rowsort
+SELECT j.commit.collection AS event,COUNT(*) AS count,COUNT(DISTINCT j.did) AS users
+FROM shredded_variants WHERE j.kind='commit' AND j.commit.operation='create'
+GROUP BY event;
+----
+coll0	683	2
+coll1	683	2
+
+statement ok
+SELECT j.commit.collection, j.did, j.commit.missing FROM shredded_variants WHERE j.kind='commit';
+
+statement ok
+SELECT struct_pack(value := j.commit.collection),[j.did,j.commit.missing],
+       [j.did,j.commit.missing]::VARIANT[2],map(['value'],[j.commit.collection]),
+       union_value(value := j.did)
+FROM shredded_variants WHERE j.kind='commit';
+
+# Preserve different payload types, SQL NULLs, object NULLs and nested objects/arrays.
+statement ok
+CREATE TABLE mixed_variants AS
+SELECT CASE i%6 WHEN 0 THEN i::TINYINT::VARIANT WHEN 1 THEN i::BIGINT::VARIANT
+  WHEN 2 THEN NULL::VARIANT WHEN 3 THEN {'b':[i,i+1],'a':NULL}::VARIANT
+  WHEN 4 THEN (i::DECIMAL(10,2))::VARIANT ELSE ('value'||i)::VARIANT END AS j
+FROM range(60)t(i);
+
+statement ok
+CHECKPOINT;
+
+statement ok
+SELECT j,variant_typeof(j),struct_pack(value := j),[j] FROM mixed_variants;

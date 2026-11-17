@@ -41,6 +41,7 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/common/enums/set_scope.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -1041,9 +1042,8 @@ static void LptsCheckSetCallback(ClientContext &context, SetScope scope, Value &
 	GetCheckMode(context).enabled = !parameter.IsNull() && parameter.GetValue<bool>();
 }
 
-// Hash all rows of `chunk` order-independently into `running_sum`. DataChunk::Hash gives a
-// per-row hash that is NULL-aware and column-position-sensitive; summing the per-row hashes is
-// commutative (so tuple order is irrelevant) and duplicate-sensitive (so it is true bag equality).
+// Hash rows order-independently, canonicalizing only VARIANT storage before
+// DuckDB's per-column hash sequence. Summing row hashes is duplicate-sensitive.
 static void AccumulateChunkHash(DataChunk &chunk, uint64_t &running_sum) {
 	const idx_t n = chunk.size();
 	if (n == 0) {
@@ -1054,8 +1054,17 @@ static void AccumulateChunkHash(DataChunk &chunk, uint64_t &running_sum) {
 		return;
 	}
 	Vector hashes(LogicalType::HASH);
-	chunk.Hash(hashes);
-	hashes.Flatten();
+	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+		auto &input = chunk.data[col];
+		auto hash_input =
+		    TypeContainsVariant(input.GetType()) ? CanonicalizeVariantVector(input, n) : Vector::Ref(input);
+		if (col == 0) {
+			VectorOperations::Hash(hash_input, hashes, n);
+		} else {
+			VectorOperations::CombineHash(hashes, hash_input, n);
+		}
+	}
+	hashes.Flatten(n);
 	auto hash_data = FlatVector::GetData<hash_t>(hashes);
 	uint64_t local = 0;
 	for (idx_t i = 0; i < n; i++) {

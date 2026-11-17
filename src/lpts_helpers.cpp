@@ -1,5 +1,10 @@
 #include "lpts_helpers.hpp"
 #include "lpts_ast.hpp"
+#include "duckdb/common/types/variant_iterator.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
+#include "duckdb/function/scalar/variant_utils.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/tableref/at_clause.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -44,6 +49,65 @@ string JoinConditionsToSQL(const vector<string> &conditions) {
 		return "TRUE";
 	}
 	return VecToSeparatedList(conditions, " AND ");
+}
+
+// Rebuild VARIANT values without storage dictionaries or unused fields retained by extraction.
+// Payload types and values are preserved, including inside nested types.
+Vector CanonicalizeVariantVector(const Vector &input, idx_t count) {
+	Vector result(input.GetType(), count);
+	if (input.GetType().id() == LogicalTypeId::VARIANT) {
+		VariantUtils::ToVariant(VariantIterator(input), count, result);
+		return result;
+	}
+	// Own nested buffers before replacing their children; callers retain the original vector.
+	result.Append(input, count);
+	switch (input.GetType().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructVector::GetEntries(result)) {
+			if (TypeContainsVariant(child.GetType())) {
+				child.Reference(CanonicalizeVariantVector(child, count));
+			}
+		}
+		break;
+	case PhysicalType::LIST: {
+		auto &child = ListVector::GetChildMutable(result);
+		child.Reference(CanonicalizeVariantVector(child, child.size()));
+		break;
+	}
+	case PhysicalType::ARRAY: {
+		auto &child = ArrayVector::GetChildMutable(result);
+		child.Reference(CanonicalizeVariantVector(child, child.size()));
+		break;
+	}
+	default:
+		throw InternalException("Unexpected nested VARIANT type");
+	}
+	return result;
+}
+
+bool TypeContainsVariant(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::VARIANT:
+		return true;
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+		return TypeContainsVariant(type.id() == LogicalTypeId::ARRAY ? ArrayType::GetChildType(type)
+		                                                             : ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::UNION:
+	case LogicalTypeId::TUPLE: {
+		for (const auto &child : StructType::GetChildTypes(type)) {
+			if (TypeContainsVariant(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::MAP:
+		return TypeContainsVariant(MapType::KeyType(type)) || TypeContainsVariant(MapType::ValueType(type));
+	default:
+		return false;
+	}
 }
 
 bool TypeContainsAggregateState(const LogicalType &type) {
