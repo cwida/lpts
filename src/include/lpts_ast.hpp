@@ -375,13 +375,14 @@ public:
 	string offset_str; ///< e.g. "5", or empty if no OFFSET.
 	bool limit_needs_child_scalar;
 	bool offset_needs_child_scalar;
+	bool is_percentage;
 	vector<string> cte_column_names; ///< passthrough from child.
 
 	AstLimitNode(string limit_str, string offset_str, bool limit_needs_child_scalar, bool offset_needs_child_scalar,
-	             vector<string> cte_column_names)
+	             vector<string> cte_column_names, bool is_percentage)
 	    : limit_str(std::move(limit_str)), offset_str(std::move(offset_str)),
 	      limit_needs_child_scalar(limit_needs_child_scalar), offset_needs_child_scalar(offset_needs_child_scalar),
-	      cte_column_names(std::move(cte_column_names)) {
+	      is_percentage(is_percentage), cte_column_names(std::move(cte_column_names)) {
 	}
 
 	string ToString(int indent = 0) const override;

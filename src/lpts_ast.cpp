@@ -349,7 +349,7 @@ string AstOrderNode::ToString(int indent) const {
 string AstLimitNode::ToString(int indent) const {
 	string result = Indent(indent) + "Limit";
 	if (!limit_str.empty()) {
-		result += " LIMIT=" + limit_str;
+		result += " LIMIT=" + limit_str + (is_percentage ? " PERCENT" : "");
 	}
 	if (!offset_str.empty()) {
 		result += " OFFSET=" + offset_str;

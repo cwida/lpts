@@ -229,3 +229,50 @@ statement error
 SELECT sql FROM lpts_query('SELECT r, o FROM range(10) WITH ORDINALITY AS _(r, o)');
 ----
 LPTS_UNSUPPORTED_WINDOW
+
+# Percentage limits retain their unit through pipeline merging and nested CTEs.
+query I
+SELECT i FROM range(10)t(i) ORDER BY i LIMIT 30 PERCENT;
+----
+0
+1
+2
+
+query I
+SELECT i FROM range(10)t(i) ORDER BY i LIMIT 30 PERCENT OFFSET 2;
+----
+2
+3
+4
+
+query I
+SELECT i FROM range(10)t(i) ORDER BY i LIMIT 0 PERCENT;
+----
+
+query I
+SELECT i FROM range(4)t(i) ORDER BY i LIMIT 100 PERCENT;
+----
+0
+1
+2
+3
+
+query I
+WITH x AS MATERIALIZED(SELECT i FROM range(10)t(i) ORDER BY i LIMIT 50 PERCENT)
+SELECT i FROM x ORDER BY i DESC LIMIT 40 PERCENT;
+----
+4
+3
+
+statement ok
+CREATE TABLE percentage(p DOUBLE);
+
+statement ok
+INSERT INTO percentage VALUES(30);
+
+query I
+SELECT i FROM range(10)t(i) ORDER BY i LIMIT (SELECT p FROM percentage) %;
+----
+0
+1
+2
