@@ -941,6 +941,9 @@ bool LimitNode::BuildSelectParts(SqlDialect dialect, SelectParts &out) const {
 	if (!limit_str.empty()) {
 		out.limit =
 		    limit_needs_child_scalar ? ("(SELECT first(" + limit_str + ") FROM " + child_cte_name + ")") : limit_str;
+		if (is_percentage) {
+			out.limit += " %";
+		}
 	}
 	if (!offset_str.empty()) {
 		out.offset =

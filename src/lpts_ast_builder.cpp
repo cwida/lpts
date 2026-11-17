@@ -2254,10 +2254,19 @@ private:
 		case LogicalOperatorType::LOGICAL_LIMIT: {
 			const LogicalLimit &limit_op = op->Cast<LogicalLimit>();
 			string limit_str;
+			bool is_percentage = limit_op.limit_val.Type() == LimitNodeType::CONSTANT_PERCENTAGE ||
+			                     limit_op.limit_val.Type() == LimitNodeType::EXPRESSION_PERCENTAGE;
+			if (is_percentage && !IsDuckDBDialect(dialect)) {
+				ThrowLptsNotImplemented("LPTS_UNSUPPORTED_OPERATOR", dialect, "limit", "PERCENT", "LOGICAL_LIMIT",
+				                        "Percentage limits require DuckDB syntax");
+			}
 			bool limit_needs_child_scalar = false;
 			if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
 				limit_str = std::to_string(limit_op.limit_val.GetConstantValue());
-			} else if (limit_op.limit_val.Type() == LimitNodeType::EXPRESSION_VALUE) {
+			} else if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_PERCENTAGE) {
+				limit_str = Value::DOUBLE(limit_op.limit_val.GetConstantPercentage()).ToSQLString();
+			} else if (limit_op.limit_val.Type() == LimitNodeType::EXPRESSION_VALUE ||
+			           limit_op.limit_val.Type() == LimitNodeType::EXPRESSION_PERCENTAGE) {
 				auto &limit_expr = const_cast<BoundLimitNode &>(limit_op.limit_val).GetExpression();
 				limit_str = ExpressionToAliasedString(limit_expr);
 				limit_needs_child_scalar = ExpressionContainsColumnRef(*limit_expr);
@@ -2281,7 +2290,7 @@ private:
 			}
 			vector<string> cte_column_names = OutputColumnNames(*op, "limit output");
 			return make_uniq<AstLimitNode>(std::move(limit_str), std::move(offset_str), limit_needs_child_scalar,
-			                               offset_needs_child_scalar, std::move(cte_column_names));
+			                               offset_needs_child_scalar, std::move(cte_column_names), is_percentage);
 		}
 
 		//----------------------------------------------------------------------

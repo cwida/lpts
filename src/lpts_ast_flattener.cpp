@@ -553,7 +553,7 @@ private:
 			D_ASSERT(ast_node.children.size() == 1);
 			string sql = "SELECT * FROM (" + AstToInlineSQL(*ast_node.children[0], inline_delim_sources) + ")";
 			if (!l.limit_str.empty()) {
-				sql += " LIMIT " + l.limit_str;
+				sql += " LIMIT " + l.limit_str + (l.is_percentage ? " %" : "");
 			}
 			if (!l.offset_str.empty()) {
 				sql += " OFFSET " + l.offset_str;
@@ -936,7 +936,7 @@ private:
 			}
 		}
 		if (limit_n) {
-			limit_out = limit_n->limit_str;
+			limit_out = limit_n->limit_str + (limit_n->is_percentage ? " %" : "");
 			offset_out = limit_n->offset_str;
 		}
 
@@ -1337,7 +1337,7 @@ private:
 			const AstLimitNode &l = static_cast<const AstLimitNode &>(ast_node);
 			const auto &cols = l.cte_column_names.empty() ? children_column_lists[0] : l.cte_column_names;
 			return make_uniq<LimitNode>(my_index, cols, children_names[0], l.limit_str, l.offset_str,
-			                            l.limit_needs_child_scalar, l.offset_needs_child_scalar);
+			                            l.limit_needs_child_scalar, l.offset_needs_child_scalar, l.is_percentage);
 		}
 
 		if (type == "TopN") {
