@@ -21,6 +21,12 @@ string VecToSeparatedList(const vector<string> &input_list, const string &separa
 /// Convert a join condition list to SQL, using TRUE for conditionless joins.
 string JoinConditionsToSQL(const vector<string> &conditions);
 
+/// True when a type or one of its nested children contains VARIANT.
+bool TypeContainsVariant(const LogicalType &type);
+
+/// Rebuild a vector whose type contains VARIANT without its physical storage history.
+Vector CanonicalizeVariantVector(const Vector &input, idx_t count);
+
 /// True when a type or one of its nested children contains an aggregate state.
 bool TypeContainsAggregateState(const LogicalType &type);
 
