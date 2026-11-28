@@ -2328,12 +2328,12 @@ private:
 			vector<string> cte_column_names = OutputColumnNames(*op, "distinct output");
 			const idx_t output_column_count = cte_column_names.size();
 			auto distinct_node = make_uniq<AstDistinctNode>(std::move(cte_column_names));
-			// When the dedup key (distinct_targets) is a PROPER SUBSET of the output columns, plain
-			// SELECT DISTINCT would dedup on too many columns. This covers `DISTINCT ON (targets)` and
-			// `SELECT DISTINCT a ... ORDER BY b` (DuckDB dedups on `a` but carries `b` for the ORDER BY).
-			// Render it as a row_number() filter partitioned by the targets. When targets are empty or
-			// cover all output columns, a plain SELECT DISTINCT is correct (and more readable).
-			if (!distinct_op.distinct_targets.empty() && distinct_op.distinct_targets.size() < output_column_count) {
+			// DISTINCT ON targets can differ from the projected values even
+			// when they have the same arity, for example after collation binding.
+			// Plain DISTINCT can also have fewer targets than output columns
+			// when the child carries an extra column for ORDER BY.
+			if (!distinct_op.distinct_targets.empty() && (distinct_op.distinct_type == DistinctType::DISTINCT_ON ||
+			                                              distinct_op.distinct_targets.size() < output_column_count)) {
 				distinct_node->is_distinct_on = true;
 				for (const unique_ptr<Expression> &target : distinct_op.distinct_targets) {
 					distinct_node->distinct_on_targets.push_back(ExpressionToAliasedString(target));

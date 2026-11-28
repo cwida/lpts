@@ -166,6 +166,17 @@ SELECT DISTINCT ON (g) g, k, k * 2 AS k2 FROM don ORDER BY g, k DESC, v;
 statement ok
 SELECT DISTINCT ON (u.id) u.id, d.v FROM users u JOIN don d ON u.age = d.k * 3 ORDER BY u.id, d.g;
 
+# A DISTINCT ON key can differ from the projected value at the same position.
+statement ok
+CREATE TABLE distinct_collation (value VARCHAR);
+INSERT INTO distinct_collation VALUES ('A'), ('a'), ('B');
+
+query T
+SELECT DISTINCT ON (value COLLATE NOCASE) value FROM distinct_collation ORDER BY value;
+----
+A
+B
+
 # --- DISTINCT keeps constant projection columns and remains empty on empty input ---
 statement ok
 CREATE TABLE distinct_constants (id INTEGER);
